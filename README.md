@@ -584,7 +584,11 @@ steps:
 
   - if: runner.os == 'Linux'
     run: |
-      sudo -E "$CORONARIUM_BIN" run \
+      # `sudo -E` preserves env *except* PATH (sudo always replaces
+      # it with secure_path). `env "PATH=$PATH"` re-injects the
+      # runner user's PATH so the supervised child can find tools
+      # installed outside /usr/bin (pnpm, cargo, rustup toolchains).
+      sudo -E env "PATH=$PATH" "$CORONARIUM_BIN" run \
         --policy  "$CORONARIUM_POLICY" \
         --mode    "$CORONARIUM_MODE" \
         --log     "$CORONARIUM_LOG" \
