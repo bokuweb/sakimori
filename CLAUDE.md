@@ -207,6 +207,24 @@ and registry clients. To add a new ecosystem:
    `.github/workflows/ci.yml`.
 6. Bump the "supported" table in README.
 
+## Pre-commit gate (non-negotiable)
+
+Every commit pushed to a branch — by a human or an agent — must pass
+all three of the following, with no warnings or failures:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+This is the same set CI runs, just locally. Fix the cause; don't
+push red and don't `#[allow(...)]` away a clippy lint without a
+comment explaining why the lint is wrong for that code. If a test
+is genuinely flaky (e.g. nanos-based tmpdir collisions under
+parallel runs) re-run once and, if it still fails, fix the flake
+in a separate commit rather than ignoring it.
+
 ## Testing conventions
 
 - **Test-first whenever possible.** Handler traits are specifically

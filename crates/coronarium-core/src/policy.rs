@@ -354,16 +354,20 @@ mod tests {
     #[test]
     fn env_is_active_only_when_configured() {
         assert!(!EnvPolicy::default().is_active());
-        assert!(EnvPolicy {
-            default: EnvDefault::Clear,
-            ..Default::default()
-        }
-        .is_active());
-        assert!(EnvPolicy {
-            deny: vec!["X".into()],
-            ..Default::default()
-        }
-        .is_active());
+        assert!(
+            EnvPolicy {
+                default: EnvDefault::Clear,
+                ..Default::default()
+            }
+            .is_active()
+        );
+        assert!(
+            EnvPolicy {
+                deny: vec!["X".into()],
+                ..Default::default()
+            }
+            .is_active()
+        );
     }
 
     #[test]

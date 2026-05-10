@@ -19,12 +19,20 @@ when acting on the repo.
 2. **Write tests first.** The codebase intentionally designs IO
    behind traits (Prompter, Notifier, EventSource, ViolationHandler)
    so unit tests can pin behaviour without spawning real processes.
-3. Run the fast local loop:
+3. **Mandatory before every commit / PR push.** All three must
+   pass cleanly — no warnings, no skipped tests, no "I'll fix it
+   in a follow-up". If any of them fail, fix the cause before
+   committing; do not push red.
    ```bash
-   cargo test -p coronarium-core           # pure-Rust core
-   cargo clippy --workspace --all-targets -- -D warnings
    cargo fmt --all -- --check
+   cargo clippy --workspace --all-targets -- -D warnings
+   cargo test --workspace
    ```
+   Tip: run `cargo fmt --all` (without `--check`) first to apply
+   the formatter, then re-run with `--check` to confirm. Clippy is
+   gated with `-D warnings` so a new lint blocks merge — don't
+   silence with `#[allow(...)]` unless the lint is genuinely wrong
+   for the code in question, and explain why in a comment.
 4. Open a PR, let CI cover the Linux+Windows+consumer-smoke runs.
 5. Tag `v0.X.Y` on main to release; `release.yml` owns the rest.
 
