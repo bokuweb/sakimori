@@ -1,0 +1,28 @@
+# Example policy. Copy to .github/sakimori.yml in your repo.
+#
+# Key default: every section is `deny` unless you say otherwise. Run
+# with `--mode audit` the first time so you can see what your job
+# actually needs before flipping to `--mode block`.
+
+mode: audit
+
+network:
+  # default: deny   # <- implicit
+  allow:
+    - target: api.github.com
+      ports: [443]
+    - target: objects.githubusercontent.com
+      ports: [443]
+    - target: 140.82.112.0/20
+      ports: [22, 443]
+
+file:
+  # default: deny would break most builds — most people want:
+  default: allow
+  deny:
+    - /etc/shadow
+    - /root/.ssh
+
+process:
+  deny_exec:
+    - /usr/bin/nc

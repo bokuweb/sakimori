@@ -1,7 +1,7 @@
-name: coronarium-proxy
+name: sakimori-proxy
 description: >
   Route every HTTPS request from subsequent steps through the
-  coronarium proxy, which silently filters too-young versions out of
+  sakimori proxy, which silently filters too-young versions out of
   crates.io / npm / pypi / nuget metadata responses. Gives your CI
   the pnpm-style "minimumReleaseAge" auto-fallback semantics for
   every ecosystem, not just npm.
@@ -9,7 +9,7 @@ description: >
 inputs:
   min-age:
     description: >
-      Minimum package age (same grammar as `coronarium deps check`,
+      Minimum package age (same grammar as `sakimori deps check`,
       e.g. `7d`, `12h`). Versions younger than this are invisible to
       the resolver.
     required: false
@@ -27,7 +27,7 @@ inputs:
     default: "false"
   version:
     description: >
-      coronarium release tag to download. Defaults to the floating
+      sakimori release tag to download. Defaults to the floating
       `v0` tag, which always tracks the newest `v0.x.y`.
     required: false
     default: "v0"
@@ -51,13 +51,13 @@ runs:
           Windows) arch_triple="x86_64-pc-windows-msvc" ;;
           *) echo "::error::unsupported runner OS: $RUNNER_OS"; exit 1 ;;
         esac
-        tmp="${RUNNER_TEMP:-/tmp}/coronarium-proxy"
+        tmp="${RUNNER_TEMP:-/tmp}/sakimori-proxy"
         mkdir -p "$tmp"
-        url="https://github.com/bokuweb/coronarium/releases/download/${{ inputs.version }}/coronarium-${arch_triple}.tar.gz"
+        url="https://github.com/bokuweb/sakimori/releases/download/${{ inputs.version }}/sakimori-${arch_triple}.tar.gz"
         echo "Downloading $url"
         curl -fsSL "$url" | tar -xz -C "$tmp"
-        bin="$tmp/coronarium"
-        [ -x "$bin" ] || { echo "::error::coronarium binary missing after unpack"; ls -la "$tmp"; exit 1; }
+        bin="$tmp/sakimori"
+        [ -x "$bin" ] || { echo "::error::sakimori binary missing after unpack"; ls -la "$tmp"; exit 1; }
 
         # Generate the CA. First run creates it; subsequent runs on
         # the same cached workspace would re-use it, which is fine.
@@ -89,13 +89,13 @@ runs:
           fi
           sleep 0.1
         done
-        # Last-resort probe using coronarium doctor.
+        # Last-resort probe using sakimori doctor.
         if ! "$bin" doctor --listen "${{ inputs.listen }}" >/dev/null 2>&1; then
           echo "::warning::proxy liveness probe didn't confirm TCP port"
           sed -n '1,60p' "$tmp/proxy.log" || true
         fi
 
-        ca="$XDG_CONFIG_HOME/coronarium/ca.pem"
+        ca="$XDG_CONFIG_HOME/sakimori/ca.pem"
         [ -f "$ca" ] || { echo "::error::CA missing at $ca"; cat "$tmp/proxy.log" || true; exit 1; }
         echo "ca_cert=$ca" >> "$GITHUB_OUTPUT"
 
@@ -116,11 +116,11 @@ runs:
           echo "REQUESTS_CA_BUNDLE=$ca"
           echo "SSL_CERT_FILE=$ca"
           # Stash for the post-step cleanup.
-          echo "CORONARIUM_PROXY_TMP=$tmp"
+          echo "SAKIMORI_PROXY_TMP=$tmp"
         } >> "$GITHUB_ENV"
-        echo "coronarium-proxy: listening on $proxy_url, CA at $ca"
+        echo "sakimori-proxy: listening on $proxy_url, CA at $ca"
 
     # No post-step: composite actions don't support them, and
     # GitHub's ephemeral runners tear down the VM at end-of-job which
     # kills the proxy for us. Self-hosted users who need cleanup can
-    # add a final step that `kill $(cat $CORONARIUM_PROXY_TMP/proxy.pid)`.
+    # add a final step that `kill $(cat $SAKIMORI_PROXY_TMP/proxy.pid)`.

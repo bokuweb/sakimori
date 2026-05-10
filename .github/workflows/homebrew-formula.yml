@@ -3,7 +3,7 @@ name: homebrew-formula
 # Runs after `release.yml` has published a new GitHub Release. We
 # download each platform's .tar.gz.sha256 sidecar, rewrite the
 # `version`, `url`, and `sha256` lines in
-# `HomebrewFormula/coronarium.rb`, and commit to main.
+# `HomebrewFormula/sakimori.rb`, and commit to main.
 #
 # Separated from release.yml so a broken formula update doesn't
 # cancel the binary release itself, and so we can manually
@@ -63,7 +63,7 @@ jobs:
           set -euo pipefail
           tag="${{ steps.tag.outputs.tag }}"
           for t in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
-            url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/coronarium-${t}.tar.gz.sha256"
+            url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/sakimori-${t}.tar.gz.sha256"
             echo "fetch $url"
             sha=$(curl -fsSL "$url" | awk '{print $1}')
             if [ -z "$sha" ]; then
@@ -79,7 +79,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/update-homebrew-formula.py \
-              --file HomebrewFormula/coronarium.rb \
+              --file HomebrewFormula/sakimori.rb \
               --version '${{ steps.tag.outputs.ver }}' \
               --tag '${{ steps.tag.outputs.tag }}' \
               --sha-aarch64-apple-darwin        '${{ steps.sha.outputs.aarch64_apple_darwin }}' \
@@ -88,14 +88,14 @@ jobs:
               --sha-x86_64-unknown-linux-musl   '${{ steps.sha.outputs.x86_64_unknown_linux_musl }}'
 
           echo "--- rewritten formula ---"
-          cat HomebrewFormula/coronarium.rb
+          cat HomebrewFormula/sakimori.rb
 
       - name: Commit if changed
         run: |
           set -euo pipefail
-          git config user.name 'coronarium-homebrew-bot'
+          git config user.name 'sakimori-homebrew-bot'
           git config user.email 'homebrew-bot@users.noreply.github.com'
-          git add HomebrewFormula/coronarium.rb
+          git add HomebrewFormula/sakimori.rb
           if git diff --cached --quiet; then
             echo "Formula already at ${{ steps.tag.outputs.tag }}; nothing to commit."
             exit 0

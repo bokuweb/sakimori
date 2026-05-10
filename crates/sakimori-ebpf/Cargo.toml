@@ -1,0 +1,31 @@
+[package]
+name = "sakimori-ebpf"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+# This crate is compiled for `bpfel-unknown-none` via a dedicated build
+# invocation (see `xtask` / CI). It is **not** part of the main workspace so
+# that `cargo build` on a normal host target does not attempt to compile it.
+
+[dependencies]
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
+sakimori-common = { path = "../sakimori-common", default-features = false, features = ["ebpf"] }
+
+[[bin]]
+name = "sakimori"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 3
+debug = false
+panic = "abort"
+overflow-checks = false
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1
+
+[workspace]

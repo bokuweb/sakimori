@@ -1,0 +1,33 @@
+[package]
+name = "sakimori"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sakimori"
+path = "src/main.rs"
+
+[dependencies]
+sakimori-common = { path = "../sakimori-common", features = ["user"] }
+sakimori-core = { path = "../sakimori-core" }
+sakimori-proxy = { path = "../sakimori-proxy" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+bytemuck = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+ipnet = { workspace = true }
+hickory-resolver = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { workspace = true }
+aya-log = { workspace = true }
+nix = { workspace = true }

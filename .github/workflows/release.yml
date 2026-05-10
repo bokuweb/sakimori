@@ -29,7 +29,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
       - name: Build userspace binary
-        run: cargo build --release -p coronarium --target ${{ matrix.target }}
+        run: cargo build --release -p sakimori --target ${{ matrix.target }}
 
       # eBPF object (arch-independent ELF but rebuilt per runner for reproducibility)
       - uses: dtolnay/rust-toolchain@nightly
@@ -40,7 +40,7 @@ jobs:
           sudo apt-get install -y llvm-19-dev libclang-19-dev
           cargo install bpf-linker --locked
       - name: Build eBPF object
-        working-directory: crates/coronarium-ebpf
+        working-directory: crates/sakimori-ebpf
         env:
           RUSTUP_TOOLCHAIN: nightly
         run: cargo build --release --target bpfel-unknown-none -Z build-std=core
@@ -48,11 +48,11 @@ jobs:
       - name: Package tarball
         run: |
           set -euo pipefail
-          name="coronarium-${{ matrix.target }}"
+          name="sakimori-${{ matrix.target }}"
           staging="staging/${name}"
           mkdir -p "${staging}"
-          cp target/${{ matrix.target }}/release/coronarium "${staging}/coronarium"
-          cp crates/coronarium-ebpf/target/bpfel-unknown-none/release/coronarium "${staging}/coronarium.bpf.o"
+          cp target/${{ matrix.target }}/release/sakimori "${staging}/sakimori"
+          cp crates/sakimori-ebpf/target/bpfel-unknown-none/release/sakimori "${staging}/sakimori.bpf.o"
           cp README.md LICENSE-MIT LICENSE-APACHE "${staging}/" 2>/dev/null || true
           tar -czf "${name}.tar.gz" -C staging "${name}"
           sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
@@ -61,8 +61,8 @@ jobs:
         with:
           name: release-${{ matrix.target }}
           path: |
-            coronarium-${{ matrix.target }}.tar.gz
-            coronarium-${{ matrix.target }}.tar.gz.sha256
+            sakimori-${{ matrix.target }}.tar.gz
+            sakimori-${{ matrix.target }}.tar.gz.sha256
 
   build-macos:
     # Build both Apple Silicon and Intel targets on a single macos-14
@@ -81,18 +81,18 @@ jobs:
           set -euo pipefail
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
             echo "=== ${target} ==="
-            cargo build --release -p coronarium --target "${target}"
+            cargo build --release -p sakimori --target "${target}"
           done
       - name: Package tarballs
         run: |
           set -euo pipefail
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
-            name="coronarium-${target}"
+            name="sakimori-${target}"
             staging="staging/${name}"
             mkdir -p "${staging}"
-            cp "target/${target}/release/coronarium" "${staging}/coronarium"
+            cp "target/${target}/release/sakimori" "${staging}/sakimori"
             cp README.md "${staging}/" 2>/dev/null || true
-            cp packaging/macos/dev.coronarium.watch.plist "${staging}/" 2>/dev/null || true
+            cp packaging/macos/dev.sakimori.watch.plist "${staging}/" 2>/dev/null || true
             cp packaging/macos/README.md "${staging}/macos-README.md" 2>/dev/null || true
             tar -czf "${name}.tar.gz" -C staging "${name}"
             shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
@@ -101,8 +101,8 @@ jobs:
         with:
           name: release-macos
           path: |
-            coronarium-*-apple-darwin.tar.gz
-            coronarium-*-apple-darwin.tar.gz.sha256
+            sakimori-*-apple-darwin.tar.gz
+            sakimori-*-apple-darwin.tar.gz.sha256
 
   build-windows:
     runs-on: windows-latest
@@ -111,17 +111,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build coronarium-win
-        working-directory: crates/coronarium-win
+      - name: Build sakimori-win
+        working-directory: crates/sakimori-win
         run: cargo build --release
 
       - name: Package tarball
         shell: pwsh
         run: |
-          $name = "coronarium-$env:TARGET"
+          $name = "sakimori-$env:TARGET"
           $staging = "staging\$name"
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
-          Copy-Item "crates\coronarium-win\target\release\coronarium-win.exe" "$staging\coronarium-win.exe"
+          Copy-Item "crates\sakimori-win\target\release\sakimori-win.exe" "$staging\sakimori-win.exe"
           Copy-Item README.md "$staging\" -ErrorAction SilentlyContinue
           tar -czf "$name.tar.gz" -C staging $name
           $hash = (Get-FileHash "$name.tar.gz" -Algorithm SHA256).Hash.ToLower()
@@ -132,8 +132,8 @@ jobs:
         with:
           name: release-x86_64-pc-windows-msvc
           path: |
-            coronarium-x86_64-pc-windows-msvc.tar.gz
-            coronarium-x86_64-pc-windows-msvc.tar.gz.sha256
+            sakimori-x86_64-pc-windows-msvc.tar.gz
+            sakimori-x86_64-pc-windows-msvc.tar.gz.sha256
 
   publish:
     needs: [build-linux, build-macos, build-windows]
@@ -152,7 +152,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          notes="Release ${TAG}. Assets: Linux (coronarium + coronarium.bpf.o) and Windows (coronarium-win.exe) per target."
+          notes="Release ${TAG}. Assets: Linux (sakimori + sakimori.bpf.o) and Windows (sakimori-win.exe) per target."
           gh release create "${TAG}" \
             --title "${TAG}" \
             --notes "${notes}" \

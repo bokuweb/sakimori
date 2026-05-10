@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build `typosquat-data/top.json` — the coronarium typosquat
+Build `typosquat-data/top.json` — the sakimori typosquat
 reference list. Fetches the current top-N package names from each
 ecosystem's public "most downloaded" surface and emits a compact
 JSON the proxy consumes at runtime.
@@ -44,7 +44,7 @@ even at 4,000-row comparisons.
       }
     }
 
-Ecosystem keys match `coronarium_core::deps::Ecosystem::label`.
+Ecosystem keys match `sakimori_core::deps::Ecosystem::label`.
 """
 
 from __future__ import annotations
@@ -64,11 +64,11 @@ import urllib.request
 # measurable on tight hot paths.
 TARGET_COUNT = 1000
 
-UA = "coronarium-typosquat-mirror/0.1 (https://github.com/bokuweb/coronarium)"
+UA = "sakimori-typosquat-mirror/0.1 (https://github.com/bokuweb/sakimori)"
 
 
 def http_get(url: str, accept: str = "application/json") -> bytes:
-    """Plain GET with a coronarium user-agent and a 60s timeout.
+    """Plain GET with a sakimori user-agent and a 60s timeout.
     Raises the same exceptions urllib does — caller logs + fails."""
     print(f"  GET {url}", file=sys.stderr)
     req = urllib.request.Request(url, headers={"user-agent": UA, "accept": accept})

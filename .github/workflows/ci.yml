@@ -26,11 +26,11 @@ jobs:
           # (notably `typenum` via aws-lc-rs for the proxy), and that's
           # a user's problem to resolve in their manifest, not a smoke-
           # test failure mode for the tool itself.
-          target/release/coronarium deps check --min-age 1h --no-cache Cargo.lock
+          target/release/sakimori deps check --min-age 1h --no-cache Cargo.lock
       - name: deps check (should fail — absurdly high threshold)
         run: |
           set +e
-          target/release/coronarium deps check --min-age 3650d --no-cache Cargo.lock >/tmp/deps.txt
+          target/release/sakimori deps check --min-age 3650d --no-cache Cargo.lock >/tmp/deps.txt
           rc=$?
           set -e
           if [ "$rc" = "0" ]; then
@@ -41,12 +41,12 @@ jobs:
           echo "✓ deps check correctly reported violations (rc=$rc)"
       - name: deps check json shape
         run: |
-          target/release/coronarium deps check --min-age 1h --no-cache --format json Cargo.lock \
+          target/release/sakimori deps check --min-age 1h --no-cache --format json Cargo.lock \
             | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['violations']==0; assert d['checked']>100; print(f\"ok violations=0 checked={d['checked']}\")"
 
       - name: deps check — PyPI fixture (requirements.txt)
         run: |
-          target/release/coronarium deps check \
+          target/release/sakimori deps check \
             --min-age 1d --no-cache --format json tests/fixtures/requirements.txt \
             | python3 -c "
           import json, sys
@@ -59,7 +59,7 @@ jobs:
           "
       - name: deps check — NuGet fixture (packages.lock.json)
         run: |
-          target/release/coronarium deps check \
+          target/release/sakimori deps check \
             --min-age 1d --no-cache --format json tests/fixtures/packages.lock.json \
             | python3 -c "
           import json, sys
@@ -72,7 +72,7 @@ jobs:
           "
       - name: deps check — npm fixture (package-lock.json)
         run: |
-          target/release/coronarium deps check \
+          target/release/sakimori deps check \
             --min-age 1d --no-cache --format json tests/fixtures/package-lock.json \
             | python3 -c "
           import json, sys
@@ -86,7 +86,7 @@ jobs:
       - name: deps check — all 4 ecosystems in one invocation
         run: |
           set +e
-          target/release/coronarium deps check --min-age 3650d --no-cache \
+          target/release/sakimori deps check --min-age 3650d --no-cache \
             Cargo.lock \
             tests/fixtures/requirements.txt \
             tests/fixtures/packages.lock.json \
@@ -116,11 +116,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release -p coronarium
+      - run: cargo build --release -p sakimori
       - name: Generate CA + start proxy in background
         run: |
           set -euo pipefail
-          # First run creates the CA in $XDG_CONFIG_HOME/coronarium.
+          # First run creates the CA in $XDG_CONFIG_HOME/sakimori.
           export XDG_CONFIG_HOME="$RUNNER_TEMP/xdg"
           mkdir -p "$XDG_CONFIG_HOME"
           echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME" >>"$GITHUB_ENV"
@@ -128,7 +128,7 @@ jobs:
           # probe below. Very-old packages will see 0 drops and that's
           # fine — the per-ecosystem assertions pick actively-updated
           # ones.
-          ./target/release/coronarium proxy start \
+          ./target/release/sakimori proxy start \
               --listen 127.0.0.1:18910 \
               --min-age 365d \
               > "$RUNNER_TEMP/proxy.log" 2>&1 &
@@ -141,7 +141,7 @@ jobs:
             sleep 0.1
           done
           ss -ltn | grep -q ':18910' || { echo "::error::proxy never opened the port"; cat "$RUNNER_TEMP/proxy.log"; exit 1; }
-          echo "CA=$XDG_CONFIG_HOME/coronarium/ca.pem" >>"$GITHUB_ENV"
+          echo "CA=$XDG_CONFIG_HOME/sakimori/ca.pem" >>"$GITHUB_ENV"
       - name: crates.io sparse index — rewrite drops recent versions
         run: |
           set -euo pipefail
@@ -254,7 +254,7 @@ jobs:
           sudo apt-get install -y llvm-19-dev libclang-19-dev
           cargo install bpf-linker --locked
       - name: Build eBPF object
-        working-directory: crates/coronarium-ebpf
+        working-directory: crates/sakimori-ebpf
         env:
           # Override the repo-root rust-toolchain.toml (which pins stable).
           RUSTUP_TOOLCHAIN: nightly
@@ -262,8 +262,8 @@ jobs:
           cargo build --release --target bpfel-unknown-none -Z build-std=core
       - uses: actions/upload-artifact@v4
         with:
-          name: coronarium-bpf
-          path: crates/coronarium-ebpf/target/bpfel-unknown-none/release/coronarium
+          name: sakimori-bpf
+          path: crates/sakimori-ebpf/target/bpfel-unknown-none/release/sakimori
 
   smoke:
     needs: [userspace, ebpf]
@@ -280,12 +280,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       # Build the userspace binary natively on this runner's arch.
-      - name: Build coronarium (${{ matrix.arch }})
-        run: cargo build --release -p coronarium
+      - name: Build sakimori (${{ matrix.arch }})
+        run: cargo build --release -p sakimori
       # eBPF object is arch-independent (bpfel-unknown-none) — reuse.
       - uses: actions/download-artifact@v4
         with:
-          name: coronarium-bpf
+          name: sakimori-bpf
           path: bpf
       - name: Inspect kernel / bpf capabilities
         run: |
@@ -295,15 +295,15 @@ jobs:
       - name: Prepare binary
         run: |
           mkdir -p bin
-          cp target/release/coronarium bin/coronarium
-          chmod +x bin/coronarium
+          cp target/release/sakimori bin/sakimori
+          chmod +x bin/sakimori
           ls -la bpf bin
       - name: policy dry-run
         run: |
-          ./bin/coronarium check-policy -p examples/coronarium.yml
+          ./bin/sakimori check-policy -p examples/sakimori.yml
       - name: audit-mode e2e (captures exec/open/connect with mixed ALLOW+DENY)
         env:
-          CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium
+          SAKIMORI_BPF_OBJ: ${{ github.workspace }}/bpf/sakimori
           RUST_LOG: info
         run: |
           # Policy is *audit* mode (nothing is actually blocked) but
@@ -335,29 +335,29 @@ jobs:
           #   - cat os-release→ open deny
           #   - curl example  → connect deny
           #   - plain echo    → plain ALLOW exec, for contrast
-          sudo -E ./bin/coronarium run \
+          sudo -E ./bin/sakimori run \
             --policy /tmp/audit.yml \
-            --log /tmp/coronarium.log.json \
-            --html /tmp/coronarium-report.html \
+            --log /tmp/sakimori.log.json \
+            --html /tmp/sakimori-report.html \
             -- /bin/sh -c '
-              echo hello from coronarium;
+              echo hello from sakimori;
               /usr/bin/whoami >/dev/null 2>&1 || true;
               cat /etc/os-release >/dev/null 2>&1 || true;
               curl -s -o /dev/null -m 5 https://example.com || true;
               curl -s -o /dev/null -m 5 https://1.1.1.1 || true;
             ' \
-            2> /tmp/coronarium.stderr
+            2> /tmp/sakimori.stderr
           echo "--- stderr ---"
-          cat /tmp/coronarium.stderr
-          if grep -q "running in passthrough" /tmp/coronarium.stderr; then
+          cat /tmp/sakimori.stderr
+          if grep -q "running in passthrough" /tmp/sakimori.stderr; then
             echo "::error::eBPF attach failed; programs did not load"
             exit 1
           fi
           echo "--- audit log ---"
-          cat /tmp/coronarium.log.json
+          cat /tmp/sakimori.log.json
           python3 - <<'PY'
           import json, sys
-          log = json.load(open("/tmp/coronarium.log.json"))
+          log = json.load(open("/tmp/sakimori.log.json"))
           kinds = {}
           denied_kinds = {}
           for s in log.get("samples", []):
@@ -383,7 +383,7 @@ jobs:
           PY
       - name: block-mode e2e (kernel actually denies egress)
         env:
-          CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium
+          SAKIMORI_BPF_OBJ: ${{ github.workspace }}/bpf/sakimori
           RUST_LOG: info
         run: |
           cat > /tmp/block.yml <<'EOF'
@@ -391,22 +391,22 @@ jobs:
           network: {}
           EOF
           set +e
-          sudo -E ./bin/coronarium run \
+          sudo -E ./bin/sakimori run \
             --policy /tmp/block.yml \
-            --log /tmp/coronarium-block.log.json \
+            --log /tmp/sakimori-block.log.json \
             -- /bin/sh -c '
               curl -sS -o /dev/null -m 5 http://93.184.216.34 2> /tmp/curl.stderr
               echo "curl_rc=$?" > /tmp/child.result
             '
           coro_rc=$?
           set -e
-          echo "--- coronarium rc=${coro_rc} ---"
+          echo "--- sakimori rc=${coro_rc} ---"
           cat /tmp/child.result
           cat /tmp/curl.stderr
-          cat /tmp/coronarium-block.log.json
+          cat /tmp/sakimori-block.log.json
           python3 - <<'PY'
           import json, re, sys
-          log = json.load(open("/tmp/coronarium-block.log.json"))
+          log = json.load(open("/tmp/sakimori-block.log.json"))
           if log['denied'] == 0:
               print("::error::block: no denied events recorded in JSON log")
               sys.exit(1)
@@ -432,12 +432,12 @@ jobs:
           print(f"OK: {log['denied']} denied events, curl rc={curl_rc}, stderr confirms kernel-level block")
           PY
           if [ "$coro_rc" = "0" ]; then
-            echo "::error::coronarium exit=0 despite denied>0"
+            echo "::error::sakimori exit=0 despite denied>0"
             exit 1
           fi
       - name: file block e2e (kernel kills on denied open)
         env:
-          CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium
+          SAKIMORI_BPF_OBJ: ${{ github.workspace }}/bpf/sakimori
           RUST_LOG: info
         run: |
           cat > /tmp/file-block.yml <<'EOF'
@@ -450,13 +450,13 @@ jobs:
               - /etc/shadow
           EOF
           set +e
-          sudo -E ./bin/coronarium run \
+          sudo -E ./bin/sakimori run \
             --policy /tmp/file-block.yml \
             --log /tmp/file-block.log.json \
             -- /bin/sh -c 'cat /etc/shadow 2>/tmp/cat.stderr; echo cat_rc=$? > /tmp/cat.result'
           coro_rc=$?
           set -e
-          echo "--- coronarium rc=${coro_rc} ---"
+          echo "--- sakimori rc=${coro_rc} ---"
           echo "--- cat result ---"
           cat /tmp/cat.result 2>/dev/null || echo "(no result file — process was killed before writing)"
           echo "--- cat stderr ---"
@@ -469,14 +469,14 @@ jobs:
           if [ -f /tmp/cat.result ]; then
             rc=$(grep -oE 'cat_rc=[0-9]+' /tmp/cat.result | cut -d= -f2)
             echo "cat_rc=$rc"
-            # cat killed by SIGKILL → 137; coronarium also surfaces violation.
+            # cat killed by SIGKILL → 137; sakimori also surfaces violation.
             if [ "$rc" = "0" ]; then
               echo "::error::cat succeeded reading /etc/shadow — kernel block didn't fire"
               exit 1
             fi
           fi
           if [ "$coro_rc" = "0" ]; then
-            echo "::error::coronarium exit=0 despite denied open in block mode"
+            echo "::error::sakimori exit=0 despite denied open in block mode"
             exit 1
           fi
           # Cross-check: the JSON log should have at least one denied open.
@@ -496,7 +496,7 @@ jobs:
           PY
       - name: file-prefix audit (flags /etc/shadow reads as denied)
         env:
-          CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium
+          SAKIMORI_BPF_OBJ: ${{ github.workspace }}/bpf/sakimori
           RUST_LOG: info
         run: |
           cat > /tmp/file.yml <<'EOF'
@@ -508,13 +508,13 @@ jobs:
             deny:
               - /etc/shadow
           EOF
-          sudo -E ./bin/coronarium run \
+          sudo -E ./bin/sakimori run \
             --policy /tmp/file.yml \
-            --log /tmp/coronarium-file.log.json \
+            --log /tmp/sakimori-file.log.json \
             -- /bin/sh -c 'cat /etc/shadow >/dev/null 2>&1 || true; cat /etc/hostname >/dev/null'
           python3 - <<'PY'
           import json, sys
-          log = json.load(open("/tmp/coronarium-file.log.json"))
+          log = json.load(open("/tmp/sakimori-file.log.json"))
           shadow_denied = any(
               s.get("kind") == "open"
               and s.get("denied") is True
@@ -536,10 +536,10 @@ jobs:
           network: {}
           EOF
           set +e
-          sudo -E env CORONARIUM_BPF_OBJ=/does/not/exist \
-            ./bin/coronarium run \
+          sudo -E env SAKIMORI_BPF_OBJ=/does/not/exist \
+            ./bin/sakimori run \
               --policy /tmp/block-strict.yml \
-              --log /tmp/coronarium-strict.log.json \
+              --log /tmp/sakimori-strict.log.json \
               -- /bin/true 2> /tmp/strict.stderr
           rc=$?
           set -e
@@ -548,14 +548,14 @@ jobs:
             echo "::error::block mode silently passed through despite BPF attach failure"
             exit 1
           fi
-          grep -q "::error title=coronarium::" /tmp/strict.stderr \
+          grep -q "::error title=sakimori::" /tmp/strict.stderr \
             || { echo "::error::missing GitHub Actions error annotation"; exit 1; }
           grep -q "refusing passthrough" /tmp/strict.stderr \
             || { echo "::error::missing refuse-passthrough explanation"; exit 1; }
           echo "✓ block mode correctly refused to run without BPF"
       - name: process.deny_exec audit (flags /usr/bin/whoami)
         env:
-          CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium
+          SAKIMORI_BPF_OBJ: ${{ github.workspace }}/bpf/sakimori
           RUST_LOG: info
         run: |
           cat > /tmp/exec.yml <<'EOF'
@@ -568,13 +568,13 @@ jobs:
             deny_exec:
               - /usr/bin/whoami
           EOF
-          sudo -E ./bin/coronarium run \
+          sudo -E ./bin/sakimori run \
             --policy /tmp/exec.yml \
-            --log /tmp/coronarium-exec.log.json \
+            --log /tmp/sakimori-exec.log.json \
             -- /bin/sh -c '/usr/bin/whoami >/dev/null'
           python3 - <<'PY'
           import json, sys
-          log = json.load(open("/tmp/coronarium-exec.log.json"))
+          log = json.load(open("/tmp/sakimori-exec.log.json"))
           hit = any(
               s.get("kind") == "exec"
               and s.get("denied") is True
@@ -590,10 +590,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coronarium-report-${{ matrix.arch }}
+          name: sakimori-report-${{ matrix.arch }}
           path: |
-            /tmp/coronarium-report.html
-            /tmp/coronarium.log.json
-            /tmp/coronarium-block.log.json
-            /tmp/coronarium-file.log.json
-            /tmp/coronarium-exec.log.json
+            /tmp/sakimori-report.html
+            /tmp/sakimori.log.json
+            /tmp/sakimori-block.log.json
+            /tmp/sakimori-file.log.json
+            /tmp/sakimori-exec.log.json

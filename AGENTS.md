@@ -55,7 +55,7 @@ when acting on the repo.
 - Don't delete branches that aren't yours (`git push --delete`).
 - Don't edit the `v0` floating tag. Let `release.yml` own it.
 - Don't upgrade `aya` / `aya-ebpf` without a paired bump in
-  `coronarium-ebpf/Cargo.toml` and a full Linux smoke run.
+  `sakimori-ebpf/Cargo.toml` and a full Linux smoke run.
 - Don't add a new registry integration without a fixture and a
   per-ecosystem CI assertion.
 
@@ -63,7 +63,7 @@ when acting on the repo.
 
 If adding a new package ecosystem to `deps check`:
 
-- [ ] Parser under `crates/coronarium-core/src/deps/lockfile/<name>.rs`
+- [ ] Parser under `crates/sakimori-core/src/deps/lockfile/<name>.rs`
 - [ ] Registry client under `.../registry/<name>.rs`
 - [ ] Wire both into `deps::lockfile::detect` and `deps::check`
 - [ ] Fixture at `tests/fixtures/` (a small, real, stable lockfile)

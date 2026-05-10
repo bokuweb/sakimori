@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Rewrite `HomebrewFormula/coronarium.rb` to point at a new release
+Rewrite `HomebrewFormula/sakimori.rb` to point at a new release
 tag. Called from `.github/workflows/homebrew-formula.yml` after a
 `v*` release is published; the workflow computes the sha256 of
 each platform's tarball and passes them in via flags.
@@ -56,7 +56,7 @@ def rewrite(text: str, args: argparse.Namespace) -> str:
     #    positionally, so the `on_arm` / `on_intel` blocks each
     #    get their correct tarball.
     urls_iter = iter(
-        f'url "https://github.com/bokuweb/coronarium/releases/download/{args.tag}/coronarium-{t}.tar.gz"'
+        f'url "https://github.com/bokuweb/sakimori/releases/download/{args.tag}/sakimori-{t}.tar.gz"'
         for t, _ in TARGETS
     )
 

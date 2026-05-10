@@ -1,4 +1,4 @@
-# coronarium
+# sakimori
 
 **Cross-platform supply-chain guard for every package manager on your
 machine.** Silently blocks too-young versions, known-malicious packages
@@ -7,9 +7,9 @@ touching your build tools.
 
 ```bash
 # Three commands, once.
-$ coronarium proxy install-ca       # trust the proxy's root CA
-$ coronarium proxy install-daemon   # auto-run in the background
-$ coronarium install-gate install   # route your shell through it
+$ sakimori proxy install-ca       # trust the proxy's root CA
+$ sakimori proxy install-daemon   # auto-run in the background
+$ sakimori install-gate install   # route your shell through it
 
 # Business as usual, permanently safer.
 $ npm install react
@@ -48,7 +48,7 @@ to solve this for npm only — versions younger than the threshold
 become invisible to the resolver, which silently falls back to the
 newest older one.
 
-**coronarium brings the same behaviour to all four major ecosystems**
+**sakimori brings the same behaviour to all four major ecosystems**
 (crates.io, npm, pypi, nuget) and any package manager that talks to
 them, by sitting as an HTTPS proxy and rewriting the registry's
 metadata responses in-flight. No resolver integration. No config in
@@ -59,7 +59,7 @@ your package manifests.
 ```
             ┌───────────────────┐       ┌────────────────────┐
             │  npm / cargo /    │       │                    │
-  user ───► │  pip / uv /       │ ─────►│  coronarium proxy  │ ──► real registry
+  user ───► │  pip / uv /       │ ─────►│  sakimori proxy  │ ──► real registry
             │  dotnet / poetry  │  HTTPS│  (localhost:8910)  │     (metadata + tarball)
             └───────────────────┘       └─────────┬──────────┘
                                                   │
@@ -97,55 +97,55 @@ Pick whichever fits your setup.
 ### Homebrew (macOS / Linux)
 
 ```bash
-brew install bokuweb/coronarium/coronarium
+brew install bokuweb/sakimori/sakimori
 # ↑ the repo-is-its-own-tap convention; no separate `brew tap` needed.
 ```
 
 Auto-updated on every release via the `homebrew-formula.yml`
 workflow — the formula lives at
-[`HomebrewFormula/coronarium.rb`](HomebrewFormula/coronarium.rb)
+[`HomebrewFormula/sakimori.rb`](HomebrewFormula/sakimori.rb)
 in this repo.
 
 ### Pre-built binary (macOS / Linux / Windows)
 
 ```bash
 # macOS (Apple Silicon)
-curl -fsSL https://github.com/bokuweb/coronarium/releases/latest/download/coronarium-aarch64-apple-darwin.tar.gz \
+curl -fsSL https://github.com/bokuweb/sakimori/releases/latest/download/sakimori-aarch64-apple-darwin.tar.gz \
   | sudo tar -xz -C /usr/local/bin
 
 # macOS (Intel)
-curl -fsSL https://github.com/bokuweb/coronarium/releases/latest/download/coronarium-x86_64-apple-darwin.tar.gz \
+curl -fsSL https://github.com/bokuweb/sakimori/releases/latest/download/sakimori-x86_64-apple-darwin.tar.gz \
   | sudo tar -xz -C /usr/local/bin
 
 # Linux (x86_64 musl static)
-curl -fsSL https://github.com/bokuweb/coronarium/releases/latest/download/coronarium-x86_64-unknown-linux-musl.tar.gz \
+curl -fsSL https://github.com/bokuweb/sakimori/releases/latest/download/sakimori-x86_64-unknown-linux-musl.tar.gz \
   | sudo tar -xz -C /usr/local/bin
 
 # Windows (PowerShell)
-Invoke-WebRequest -Uri https://github.com/bokuweb/coronarium/releases/latest/download/coronarium-x86_64-pc-windows-msvc.tar.gz -OutFile c.tgz
+Invoke-WebRequest -Uri https://github.com/bokuweb/sakimori/releases/latest/download/sakimori-x86_64-pc-windows-msvc.tar.gz -OutFile c.tgz
 tar -xzf c.tgz -C "$env:USERPROFILE\.local\bin"
 ```
 
 Every release also ships a `.sha256` sidecar. The archive contains
-the `coronarium` binary (Linux also ships `coronarium.bpf.o` for the
+the `sakimori` binary (Linux also ships `sakimori.bpf.o` for the
 supervised-run mode).
 
 ### Docker / OCI
 
 ```bash
 docker run --rm -p 8910:8910 \
-    -v coronarium-conf:/etc/coronarium-xdg \
-    ghcr.io/bokuweb/coronarium-proxy:v0 \
+    -v sakimori-conf:/etc/sakimori-xdg \
+    ghcr.io/bokuweb/sakimori-proxy:v0 \
     --listen 0.0.0.0:8910 --min-age 7d
 ```
 
-Mount `/etc/coronarium-xdg` as a volume to persist the generated
+Mount `/etc/sakimori-xdg` as a volume to persist the generated
 root CA across container restarts. See [Docker image](#docker-image).
 
 ### From source
 
 ```bash
-cargo install --git https://github.com/bokuweb/coronarium coronarium
+cargo install --git https://github.com/bokuweb/sakimori sakimori
 ```
 
 The Linux eBPF supervised-run mode additionally needs
@@ -163,19 +163,19 @@ Three commands, once per machine. Each is idempotent.
 #    trust store. macOS uses `security`, Linux uses
 #    `update-ca-certificates`, Windows uses elevated
 #    `Import-Certificate` (triggers one UAC prompt).
-coronarium proxy install-ca
+sakimori proxy install-ca
 
 # 2. Register the proxy as a background service so it's always up.
-#    macOS: ~/Library/LaunchAgents/com.coronarium.proxy.plist
-#    Linux: ~/.config/systemd/user/coronarium-proxy.service
-#    Windows: Task Scheduler /coronarium-proxy
-coronarium proxy install-daemon
+#    macOS: ~/Library/LaunchAgents/com.sakimori.proxy.plist
+#    Linux: ~/.config/systemd/user/sakimori-proxy.service
+#    Windows: Task Scheduler /sakimori-proxy
+sakimori proxy install-daemon
 # Follow the printed `launchctl bootstrap …` / `systemctl --user enable --now`
 # / `schtasks.exe /Create …` line.
 
 # 3. Append HTTPS_PROXY + CA bundle env vars to your shell rc.
 #    Detects zsh / bash / fish / PowerShell from $SHELL (or your OS).
-coronarium install-gate install
+sakimori install-gate install
 ```
 
 Open a new shell — everything's wired:
@@ -183,17 +183,17 @@ Open a new shell — everything's wired:
 ```
 $ env | grep -E 'HTTPS_PROXY|CARGO_HTTP_CAINFO'
 HTTPS_PROXY=http://127.0.0.1:8910
-CARGO_HTTP_CAINFO=/Users/you/.config/coronarium/ca.pem
+CARGO_HTTP_CAINFO=/Users/you/.config/sakimori/ca.pem
 
-$ coronarium doctor
-coronarium doctor
+$ sakimori doctor
+sakimori doctor
 ────────────────────────────────────────────────────────────
-✓ CA certificate               /Users/you/.config/coronarium/ca.pem (644 bytes)
-✓ CA private key               /Users/you/.config/coronarium/ca.key
+✓ CA certificate               /Users/you/.config/sakimori/ca.pem (644 bytes)
+✓ CA private key               /Users/you/.config/sakimori/ca.key
 ✓ Proxy reachable              accepted TCP on 127.0.0.1:8910
 ✓ $HTTPS_PROXY                 http://127.0.0.1:8910
 ✓ install-gate rc              /Users/you/.zshrc
-✓ Daemon unit                  /Users/you/Library/LaunchAgents/com.coronarium.proxy.plist
+✓ Daemon unit                  /Users/you/Library/LaunchAgents/com.sakimori.proxy.plist
 ────────────────────────────────────────────────────────────
 6 check(s): 0 fail, 0 warn
 ```
@@ -220,10 +220,10 @@ safer. Same shape on the other three ecosystems.
 Reverse each step (same flags):
 
 ```bash
-coronarium install-gate uninstall    # strip block from shell rc
-coronarium proxy uninstall-daemon    # remove launchd / systemd / Task Scheduler unit
-coronarium proxy uninstall-ca        # remove CA from system trust store
-rm -rf ~/.config/coronarium          # delete CA + key (optional)
+sakimori install-gate uninstall    # strip block from shell rc
+sakimori proxy uninstall-daemon    # remove launchd / systemd / Task Scheduler unit
+sakimori proxy uninstall-ca        # remove CA from system trust store
+rm -rf ~/.config/sakimori          # delete CA + key (optional)
 ```
 
 ---
@@ -237,7 +237,7 @@ wraps this for background use; run it directly when you want logs
 on stdout or you're running the proxy yourself in Docker.
 
 ```
-coronarium proxy start [OPTIONS]
+sakimori proxy start [OPTIONS]
 
 Options:
   --listen <ADDR>              [default: 127.0.0.1:8910]
@@ -258,7 +258,7 @@ Options:
                                denied regardless of --min-age.
                                Live API, per-version cached.
   --osv-mirror                 Same blocking rule as --osv, but
-                               consumed from the coronarium-hosted
+                               consumed from the sakimori-hosted
                                pre-filtered snapshot. O(1) in-memory
                                lookup after a single ~10-minute
                                background refresh. ~10 min behind
@@ -269,8 +269,8 @@ Options:
                                entries the mirror hasn't indexed.
   --osv-mirror-url <URL>       Override mirror URL (e.g. self-hosted).
   --config-dir <PATH>          Override CA / config directory.
-                               Defaults to $XDG_CONFIG_HOME/coronarium
-                               on Unix, %LOCALAPPDATA%\coronarium on
+                               Defaults to $XDG_CONFIG_HOME/sakimori
+                               on Unix, %LOCALAPPDATA%\sakimori on
                                Windows.
 ```
 
@@ -288,12 +288,12 @@ Add / remove the root CA from the OS trust store. Cross-platform:
 | Linux | copy to `/usr/local/share/ca-certificates/` + `update-ca-certificates` | `sudo` |
 | Windows | `Import-Certificate -CertStoreLocation Cert:\LocalMachine\Root` | UAC via `Start-Process -Verb RunAs` |
 
-If you're not elevated, coronarium prints the exact shell command
+If you're not elevated, sakimori prints the exact shell command
 and exits — no silent reruns with privileges.
 
 ```
-coronarium proxy install-ca [--config-dir <PATH>]
-coronarium proxy uninstall-ca [--config-dir <PATH>]
+sakimori proxy install-ca [--config-dir <PATH>]
+sakimori proxy uninstall-ca [--config-dir <PATH>]
 ```
 
 ### `proxy install-daemon` / `uninstall-daemon`
@@ -303,17 +303,17 @@ background at login and restarts on failure.
 
 | OS | Unit | Location |
 |---|---|---|
-| macOS | launchd plist (`KeepAlive`, `RunAtLoad`, `Background` ProcessType) | `~/Library/LaunchAgents/com.coronarium.proxy.plist` |
-| Linux | systemd `--user` unit (`Restart=on-failure`, `WantedBy=default.target`) | `~/.config/systemd/user/coronarium-proxy.service` |
-| Windows | Task Scheduler v1.4 XML (`LogonTrigger`, `RestartOnFailure 99×1m`, `Hidden`) | `%LOCALAPPDATA%\coronarium\coronarium-proxy.task.xml` |
+| macOS | launchd plist (`KeepAlive`, `RunAtLoad`, `Background` ProcessType) | `~/Library/LaunchAgents/com.sakimori.proxy.plist` |
+| Linux | systemd `--user` unit (`Restart=on-failure`, `WantedBy=default.target`) | `~/.config/systemd/user/sakimori-proxy.service` |
+| Windows | Task Scheduler v1.4 XML (`LogonTrigger`, `RestartOnFailure 99×1m`, `Hidden`) | `%LOCALAPPDATA%\sakimori\sakimori-proxy.task.xml` |
 
 ```
-coronarium proxy install-daemon [OPTIONS]
+sakimori proxy install-daemon [OPTIONS]
 
 Options:
   --listen <ADDR>         [default: 127.0.0.1:8910]
   --min-age <DURATION>    [default: 7d]
-  --binary <PATH>         Override the coronarium binary path baked
+  --binary <PATH>         Override the sakimori binary path baked
                           into the unit. Defaults to the canonical
                           path of the currently-running executable.
 ```
@@ -326,12 +326,12 @@ that to start the service.
 
 Edit the user's shell rc file so every new shell exports
 `HTTPS_PROXY` + CA-bundle env vars pointing at the proxy. Idempotent
-via `# >>> coronarium install-gate >>>` sentinels.
+via `# >>> sakimori install-gate >>>` sentinels.
 
 ```
-coronarium install-gate shellenv [--listen <ADDR>] [--shell {bash,zsh,fish,powershell}]
-coronarium install-gate install  [--rc <PATH>]     [--shell ...]
-coronarium install-gate uninstall [--rc <PATH>]    [--shell ...]
+sakimori install-gate shellenv [--listen <ADDR>] [--shell {bash,zsh,fish,powershell}]
+sakimori install-gate install  [--rc <PATH>]     [--shell ...]
+sakimori install-gate uninstall [--rc <PATH>]    [--shell ...]
 ```
 
 Environment variables set (per shell):
@@ -368,18 +368,18 @@ One-command diagnostic. Checks:
 Exits `0` on no failures (warnings are informational), `1` otherwise.
 
 ```
-coronarium doctor [--listen <ADDR>] [--config-dir <PATH>] [--rc <PATH>]
+sakimori doctor [--listen <ADDR>] [--config-dir <PATH>] [--rc <PATH>]
 ```
 
 Sample output when the proxy is down:
 
 ```
-✓ CA certificate               /Users/you/.config/coronarium/ca.pem (644 bytes)
-✓ CA private key               /Users/you/.config/coronarium/ca.key
+✓ CA certificate               /Users/you/.config/sakimori/ca.pem (644 bytes)
+✓ CA private key               /Users/you/.config/sakimori/ca.key
 ✗ Proxy reachable              no listener on 127.0.0.1:8910: Connection refused
-  ↳ start it: `coronarium proxy start` (or, for background: `coronarium proxy install-daemon`)
+  ↳ start it: `sakimori proxy start` (or, for background: `sakimori proxy install-daemon`)
 ! $HTTPS_PROXY                 unset in this shell
-  ↳ run `coronarium install-gate install` and open a new shell
+  ↳ run `sakimori install-gate install` and open a new shell
 ```
 
 ### `deps check`
@@ -389,17 +389,17 @@ for a **pre-install CI step** that fails the build before the
 malicious package is even fetched.
 
 ```bash
-coronarium deps check --min-age 7d Cargo.lock package-lock.json
+sakimori deps check --min-age 7d Cargo.lock package-lock.json
 
 # Different thresholds per ecosystem? Run twice.
-coronarium deps check --min-age 14d Cargo.lock
-coronarium deps check --min-age  3d package-lock.json
+sakimori deps check --min-age 14d Cargo.lock
+sakimori deps check --min-age  3d package-lock.json
 
 # Ignore first-party packages.
-coronarium deps check --min-age 7d --ignore '@my-org/*' package-lock.json
+sakimori deps check --min-age 7d --ignore '@my-org/*' package-lock.json
 
 # Machine-readable output for CI gating.
-coronarium deps check --min-age 7d --format json Cargo.lock
+sakimori deps check --min-age 7d --format json Cargo.lock
 ```
 
 Supported lockfile formats:
@@ -419,8 +419,8 @@ Exit codes:
 | 1 | at least one violation |
 | 2 | parse or I/O error |
 
-Cache location: `$XDG_CACHE_HOME/coronarium/deps-cache.json`
-(`%LOCALAPPDATA%\coronarium\…` on Windows). Publish dates are
+Cache location: `$XDG_CACHE_HOME/sakimori/deps-cache.json`
+(`%LOCALAPPDATA%\sakimori\…` on Windows). Publish dates are
 immutable, so there's no TTL.
 
 ### `deps watch`
@@ -430,13 +430,13 @@ launchd at login.
 
 ```bash
 # One-off (Ctrl-C to quit)
-coronarium deps watch ~/code --min-age 7d
+sakimori deps watch ~/code --min-age 7d
 
 # With modal prompts (Keep / Revert via osascript)
-coronarium deps watch ~/code --min-age 7d --action prompt
+sakimori deps watch ~/code --min-age 7d --action prompt
 
 # Stdout logging, e.g. for tmux / screen
-coronarium deps watch ~/code --min-age 7d --notifier stdout
+sakimori deps watch ~/code --min-age 7d --notifier stdout
 ```
 
 `--action` controls what happens on violation:
@@ -532,11 +532,11 @@ observes — optionally denies — its syscalls:
 - `execve(2)`
 
 ```bash
-coronarium run \
-  --policy .github/coronarium.yml \
+sakimori run \
+  --policy .github/sakimori.yml \
   --mode audit \
-  --log coronarium.log.json \
-  --html coronarium-report.html \
+  --log sakimori.log.json \
+  --html sakimori-report.html \
   -- cargo test
 ```
 
@@ -544,7 +544,7 @@ Flags:
 
 | flag | env | default | description |
 |---|---|---|---|
-| `--policy` / `-p` | `CORONARIUM_POLICY` | — | policy file (YAML or JSON) |
+| `--policy` / `-p` | `SAKIMORI_POLICY` | — | policy file (YAML or JSON) |
 | `--mode` | — | from policy | `audit` or `block` — overrides the policy's `mode:` |
 | `--log` | — | `-` (stdout) | JSON audit log destination |
 | `--summary` | `GITHUB_STEP_SUMMARY` | — | markdown summary |
@@ -556,7 +556,7 @@ event was denied → exits `1`.
 Policy format:
 
 ```yaml
-# .github/coronarium.yml
+# .github/sakimori.yml
 mode: block                    # audit | block
 
 network:
@@ -628,9 +628,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Starts coronarium proxy in the background and appends
+      # Starts sakimori proxy in the background and appends
       # HTTPS_PROXY + CA-bundle env vars to $GITHUB_ENV for later steps.
-      - uses: bokuweb/coronarium/proxy@v0
+      - uses: bokuweb/sakimori/proxy@v0
         with:
           min-age: 7d
 
@@ -645,7 +645,7 @@ Inputs:
 | `min-age` | `7d` | Minimum package age. Same grammar as `--min-age`. |
 | `listen` | `127.0.0.1:8910` | Proxy listen address. |
 | `fail-on-missing` | `false` | Treat unknown publish dates as deny. |
-| `version` | `v0` | coronarium release tag to download. |
+| `version` | `v0` | sakimori release tag to download. |
 
 ### Alternative: lockfile-only pre-flight check
 
@@ -653,8 +653,8 @@ Cheaper (no proxy), but fails loudly on any too-young dep instead
 of silently falling back.
 
 ```yaml
-- uses: bokuweb/coronarium@v0
-- run: $CORONARIUM_BIN deps check --min-age 7d Cargo.lock package-lock.json
+- uses: bokuweb/sakimori@v0
+- run: $SAKIMORI_BIN deps check --min-age 7d Cargo.lock package-lock.json
 - run: cargo test   # only reached if the check passed
 ```
 
@@ -667,9 +667,9 @@ strategy:
 runs-on: ${{ matrix.os }}
 steps:
   - uses: actions/checkout@v4
-  - uses: bokuweb/coronarium@v0
+  - uses: bokuweb/sakimori@v0
     with:
-      policy: .github/coronarium.yml
+      policy: .github/sakimori.yml
       mode: audit
 
   - if: runner.os == 'Linux'
@@ -678,46 +678,46 @@ steps:
       # it with secure_path). `env "PATH=$PATH"` re-injects the
       # runner user's PATH so the supervised child can find tools
       # installed outside /usr/bin (pnpm, cargo, rustup toolchains).
-      sudo -E env "PATH=$PATH" "$CORONARIUM_BIN" run \
-        --policy  "$CORONARIUM_POLICY" \
-        --mode    "$CORONARIUM_MODE" \
-        --log     "$CORONARIUM_LOG" \
-        --html    coronarium-report.html \
+      sudo -E env "PATH=$PATH" "$SAKIMORI_BIN" run \
+        --policy  "$SAKIMORI_POLICY" \
+        --mode    "$SAKIMORI_MODE" \
+        --log     "$SAKIMORI_LOG" \
+        --html    sakimori-report.html \
         --summary "$GITHUB_STEP_SUMMARY" \
         -- cargo test
 
   - if: runner.os == 'Windows'
     shell: pwsh
     run: |
-      & $env:CORONARIUM_BIN `
-        --policy $env:CORONARIUM_POLICY `
-        --log    coronarium.log.json `
-        --html   coronarium-report.html `
+      & $env:SAKIMORI_BIN `
+        --policy $env:SAKIMORI_POLICY `
+        --log    sakimori.log.json `
+        --html   sakimori-report.html `
         -- cargo test
 
   - uses: actions/upload-artifact@v4
     if: always()
     with:
-      name: coronarium-report-${{ runner.os }}
+      name: sakimori-report-${{ runner.os }}
       path: |
-        coronarium-report.html
-        coronarium.log.json
+        sakimori-report.html
+        sakimori.log.json
 ```
 
 ### PR comment with the HTML report
 
-`bokuweb/coronarium/comment@v0` reads the JSON log and upserts a
+`bokuweb/sakimori/comment@v0` reads the JSON log and upserts a
 single PR comment (keyed by an HTML marker, re-runs edit in place).
 Embeds a `gh run download` one-liner to view the full HTML on your
 machine.
 
 ```yaml
-- uses: bokuweb/coronarium/comment@v0
+- uses: bokuweb/sakimori/comment@v0
   if: github.event_name == 'pull_request'
   with:
-    log: coronarium.log.json
-    artifact-name: coronarium-report
-    html-filename: coronarium-report.html
+    log: sakimori.log.json
+    artifact-name: sakimori-report
+    html-filename: sakimori-report.html
     # fail-on-denied: "true"                # optional
 ```
 
@@ -741,7 +741,7 @@ machine.
 Prebuilt multi-arch image on GHCR:
 
 ```bash
-docker pull ghcr.io/bokuweb/coronarium-proxy:v0
+docker pull ghcr.io/bokuweb/sakimori-proxy:v0
 ```
 
 Tags: `v0` (floating), `v0.N`, `v0.N.M`, `latest`. Available archs:
@@ -751,21 +751,21 @@ Run with a named volume so the CA persists across restarts:
 
 ```bash
 docker run --rm -p 8910:8910 \
-    -v coronarium-conf:/etc/coronarium-xdg \
-    ghcr.io/bokuweb/coronarium-proxy:v0 \
+    -v sakimori-conf:/etc/sakimori-xdg \
+    ghcr.io/bokuweb/sakimori-proxy:v0 \
     --listen 0.0.0.0:8910 --min-age 7d
 
 # One-shot: grab the generated CA so hosts can trust it.
-docker run --rm -v coronarium-conf:/etc/coronarium-xdg \
-    --entrypoint cat ghcr.io/bokuweb/coronarium-proxy:v0 \
-    /etc/coronarium-xdg/coronarium/ca.pem > /tmp/coronarium-ca.pem
+docker run --rm -v sakimori-conf:/etc/sakimori-xdg \
+    --entrypoint cat ghcr.io/bokuweb/sakimori-proxy:v0 \
+    /etc/sakimori-xdg/sakimori/ca.pem > /tmp/sakimori-ca.pem
 ```
 
 Then on each host:
 
 ```bash
 export HTTPS_PROXY=http://<container-host>:8910
-export CARGO_HTTP_CAINFO=/tmp/coronarium-ca.pem
+export CARGO_HTTP_CAINFO=/tmp/sakimori-ca.pem
 # (or install-ca into your OS trust store with the CA you just copied)
 ```
 
@@ -790,19 +790,19 @@ Examples: `7d`, `72h`, `30m`, `3600s`, `7` (= 7 days).
 
 | OS | CA + key | Cache | Daemon unit |
 |---|---|---|---|
-| macOS | `~/.config/coronarium/ca.{pem,key}` (or `$XDG_CONFIG_HOME`) | `~/Library/Caches/coronarium/deps-cache.json` | `~/Library/LaunchAgents/com.coronarium.proxy.plist` |
-| Linux | `$XDG_CONFIG_HOME/coronarium/ca.{pem,key}` | `$XDG_CACHE_HOME/coronarium/deps-cache.json` | `~/.config/systemd/user/coronarium-proxy.service` |
-| Windows | `%LOCALAPPDATA%\coronarium\ca.{pem,key}` | `%LOCALAPPDATA%\coronarium\deps-cache.json` | `%LOCALAPPDATA%\coronarium\coronarium-proxy.task.xml` |
+| macOS | `~/.config/sakimori/ca.{pem,key}` (or `$XDG_CONFIG_HOME`) | `~/Library/Caches/sakimori/deps-cache.json` | `~/Library/LaunchAgents/com.sakimori.proxy.plist` |
+| Linux | `$XDG_CONFIG_HOME/sakimori/ca.{pem,key}` | `$XDG_CACHE_HOME/sakimori/deps-cache.json` | `~/.config/systemd/user/sakimori-proxy.service` |
+| Windows | `%LOCALAPPDATA%\sakimori\ca.{pem,key}` | `%LOCALAPPDATA%\sakimori\deps-cache.json` | `%LOCALAPPDATA%\sakimori\sakimori-proxy.task.xml` |
 
 ### Environment variables read
 
 | var | purpose |
 |---|---|
-| `CORONARIUM_POLICY` | Default policy file for `run` / `check-policy` |
-| `CORONARIUM_MODE` | Override policy `mode` in `run` |
-| `CORONARIUM_LOG` | Default log destination in `run` |
-| `CORONARIUM_BIN` | Set by the GH Action install step |
-| `CORONARIUM_BPF_OBJ` | Path to `coronarium.bpf.o` (Linux only) |
+| `SAKIMORI_POLICY` | Default policy file for `run` / `check-policy` |
+| `SAKIMORI_MODE` | Override policy `mode` in `run` |
+| `SAKIMORI_LOG` | Default log destination in `run` |
+| `SAKIMORI_BIN` | Set by the GH Action install step |
+| `SAKIMORI_BPF_OBJ` | Path to `sakimori.bpf.o` (Linux only) |
 | `GITHUB_STEP_SUMMARY` | Default `--summary` target |
 | `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` | Override default config/cache dir |
 
@@ -810,18 +810,18 @@ Examples: `7d`, `72h`, `30m`, `3600s`, `7` (= 7 days).
 
 ## Troubleshooting
 
-### `coronarium doctor` says the proxy is unreachable
+### `sakimori doctor` says the proxy is unreachable
 
-- Check it's actually running: `pgrep -f 'coronarium proxy'`
-- On macOS: `launchctl list | grep coronarium`
-- On Linux: `systemctl --user status coronarium-proxy`
-- On Windows: `schtasks /Query /TN coronarium-proxy`
-- Try `coronarium proxy start` in the foreground — see the log.
+- Check it's actually running: `pgrep -f 'sakimori proxy'`
+- On macOS: `launchctl list | grep sakimori`
+- On Linux: `systemctl --user status sakimori-proxy`
+- On Windows: `schtasks /Query /TN sakimori-proxy`
+- Try `sakimori proxy start` in the foreground — see the log.
 
 ### TLS errors from cargo / npm / pip
 
 Cargo on Linux uses libcurl which doesn't read the system trust
-store — `CARGO_HTTP_CAINFO` must point at the coronarium CA.
+store — `CARGO_HTTP_CAINFO` must point at the sakimori CA.
 Likewise `PIP_CERT` for pip and `NODE_EXTRA_CA_CERTS` for npm.
 
 `install-gate install` sets all of these. If you skipped that,
@@ -834,10 +834,10 @@ printed `security add-trusted-cert …` line and run it yourself.
 
 ### `npm install` still pulls a too-young version
 
-1. Is the proxy running? `coronarium doctor`
+1. Is the proxy running? `sakimori doctor`
 2. Is `HTTPS_PROXY` set in **this** shell? (install-gate only
    applies to new shells.) `echo $HTTPS_PROXY`
-3. Is the package being downloaded from a host coronarium
+3. Is the package being downloaded from a host sakimori
    intercepts? Only crates.io, registry.npmjs.org,
    files.pythonhosted.org, pypi.org, api.nuget.org are intercepted.
    Custom registries pass through unchanged.
@@ -848,7 +848,7 @@ Run the proxy on a separate host and point client env at it:
 
 ```bash
 export HTTPS_PROXY=http://proxy.corp.internal:8910
-export CARGO_HTTP_CAINFO=/etc/coronarium/ca.pem  # copy from the proxy container
+export CARGO_HTTP_CAINFO=/etc/sakimori/ca.pem  # copy from the proxy container
 ```
 
 ---
@@ -870,13 +870,13 @@ Honest assessment. Full details in [CLAUDE.md](CLAUDE.md).
   the publish came from OIDC-authenticated CI) but the bundle
   itself isn't cryptographically verified.
 <!-- DNS round-robin drift: addressed by `--dns-refresh-interval <secs>`
-     on `coronarium run`. Re-resolves hostname rules on the given
+     on `sakimori run`. Re-resolves hostname rules on the given
      interval and additively inserts any newly-observed IPs into the
      eBPF maps. Default is 0 (off); set to 60–300 for long-running
      CDN-heavy jobs. Entries are never removed, so increasing the
      rate is safe and won't kill active connections. -->
 - **CDN IP rotation across long runs**: handled by
-  `coronarium run --dns-refresh-interval <secs>`, which re-resolves
+  `sakimori run --dns-refresh-interval <secs>`, which re-resolves
   `network.allow` / `network.deny` hostnames every N seconds and
   additively inserts new IPs. Off by default (0); 60–300 is typical
   for CI jobs that run for hours behind round-robin DNS.
@@ -907,7 +907,7 @@ Honest assessment. Full details in [CLAUDE.md](CLAUDE.md).
 ### macOS
 
 - No supervised run mode. `run` is Linux/Windows only — on macOS
-  coronarium is a desktop-level tool (proxy + deps + watch).
+  sakimori is a desktop-level tool (proxy + deps + watch).
 
 ---
 
@@ -924,24 +924,24 @@ cargo fmt --all -- --check
 # Build the eBPF object (Linux only, requires nightly + bpf-linker)
 rustup toolchain install nightly --component rust-src
 cargo install bpf-linker
-cd crates/coronarium-ebpf
+cd crates/sakimori-ebpf
 RUSTUP_TOOLCHAIN=nightly cargo build --release \
     --target bpfel-unknown-none -Z build-std=core
 ```
 
 Crates:
 
-- `coronarium-common` — `no_std` POD types shared with eBPF (ring
+- `sakimori-common` — `no_std` POD types shared with eBPF (ring
   buffer records, map keys)
-- `coronarium-core` — platform-neutral: events, policy, matcher,
+- `sakimori-core` — platform-neutral: events, policy, matcher,
   stats, HTML report, `deps::*`, watch
-- `coronarium-ebpf` — Linux kernel programs (cgroup/connect
+- `sakimori-ebpf` — Linux kernel programs (cgroup/connect
   tracepoints). Excluded from the main workspace.
-- `coronarium-proxy` — HTTPS MITM proxy (hudsucker + rustls),
+- `sakimori-proxy` — HTTPS MITM proxy (hudsucker + rustls),
   registry parsers, rewriters (crates/npm/pypi/nuget), CA
   management, daemon unit generators
-- `coronarium` — userspace CLI and Linux supervisor
-- `coronarium-win` — Windows ETW supervisor + Defender Firewall
+- `sakimori` — userspace CLI and Linux supervisor
+- `sakimori-win` — Windows ETW supervisor + Defender Firewall
   integration (separate workspace for dep isolation)
 
 Architecture notes live in [CLAUDE.md](CLAUDE.md).
@@ -950,7 +950,7 @@ Architecture notes live in [CLAUDE.md](CLAUDE.md).
 
 ## Commercial support
 
-coronarium is free to use under MIT/Apache-2.0. If your team needs
+sakimori is free to use under MIT/Apache-2.0. If your team needs
 any of the following, the maintainer offers paid engagements:
 
 - Onboarding help (writing/auditing your `policy.yml`, integrating

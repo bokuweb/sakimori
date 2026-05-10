@@ -7,15 +7,15 @@ plain English, no agent-only jargon.
 
 ## What this project is
 
-**coronarium** is a cross-platform supply-chain guard with two main
+**sakimori** is a cross-platform supply-chain guard with two main
 surfaces:
 
-1. **A supervised-run mode** for CI (`coronarium run -- <cmd>`):
+1. **A supervised-run mode** for CI (`sakimori run -- <cmd>`):
    wraps your build/test command with an eBPF (Linux) or ETW (Windows)
    agent that audits and optionally blocks network / file / exec
    syscalls.
-2. **A lockfile supply-chain guard** (`coronarium deps check` and
-   `coronarium deps watch`): runs a "minimum release age" check across
+2. **A lockfile supply-chain guard** (`sakimori deps check` and
+   `sakimori deps watch`): runs a "minimum release age" check across
    4 ecosystems (npm, cargo, pypi, nuget), flagging recently-published
    dependencies so you can sit out the window in which malicious
    releases typically live.
@@ -61,7 +61,7 @@ the age requirement. Builds don't break; they just use slightly
 older deps.
 
 **Status (v0.17):**
-- **crates.io** — ✅ implemented via the proxy. `coronarium
+- **crates.io** — ✅ implemented via the proxy. `sakimori
   proxy serve` rewrites `index.crates.io` sparse-index responses on
   the fly, dropping JSONL lines whose `(name, vers)` publish time is
   < `--min-age`. cargo's resolver sees only acceptable versions and
@@ -140,21 +140,21 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
 
 ## Roadmap (what to build next, in priority order)
 
-1. **`coronarium install-gate`** — ✅ implemented in v0.19. Three
+1. **`sakimori install-gate`** — ✅ implemented in v0.19. Three
    subcommands:
    - `shellenv` — emits a shell-specific snippet that exports
      `HTTPS_PROXY` + `CARGO_HTTP_CAINFO` / `PIP_CERT` /
      `NODE_EXTRA_CA_CERTS` / `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE`
      pointing at the proxy's CA bundle, so tools that don't honour
      the system trust store still validate the MITM certs.
-   - `install` — appends `eval "$(coronarium install-gate shellenv)"`
+   - `install` — appends `eval "$(sakimori install-gate shellenv)"`
      to the detected shell rc file, bracketed with idempotent
      sentinels so repeated runs don't duplicate.
    - `uninstall` — strips the block.
 
    After this, every `npm install` / `cargo add` / `pip install` /
    `dotnet add package` in a new shell routes through
-   `coronarium proxy`. Because the proxy now does pnpm-style
+   `sakimori proxy`. Because the proxy now does pnpm-style
    silent fallback for all four ecosystems (v0.15–0.18), the user
    sees no error on "install something young" — they just get the
    newest safe version. For an unhandled path or a tarball pin to
@@ -251,21 +251,21 @@ a missing feature):
 
 ```
 crates/
-├── coronarium-common/   no_std + std types shared with eBPF (ring
+├── sakimori-common/   no_std + std types shared with eBPF (ring
 │                        buffer records, map keys, POD structs).
-├── coronarium-core/     Platform-neutral Rust: events, policy,
+├── sakimori-core/     Platform-neutral Rust: events, policy,
 │                        matcher, stats, html, report, deps::*, watch.
-├── coronarium-ebpf/     Linux kernel programs (tracepoint / cgroup
+├── sakimori-ebpf/     Linux kernel programs (tracepoint / cgroup
 │                        hooks). Compiled to bpfel-unknown-none with
 │                        nightly; excluded from the main workspace.
-├── coronarium/          Linux userspace binary (eBPF loader +
+├── sakimori/          Linux userspace binary (eBPF loader +
 │                        supervisor).
-└── coronarium-win/      Windows binary (ETW subscriber, Defender
+└── sakimori-win/      Windows binary (ETW subscriber, Defender
 │                        Firewall driver). Its own workspace so
 │                        ferrisetw doesn't pollute the Linux side.
 ```
 
-`coronarium-core::deps` houses the per-ecosystem lockfile parsers
+`sakimori-core::deps` houses the per-ecosystem lockfile parsers
 and registry clients. To add a new ecosystem:
 
 1. `deps::lockfile::<name>` parser (input: path → `Vec<Package>`).
@@ -301,7 +301,7 @@ in a separate commit rather than ignoring it.
   designed to be mockable (see `action::Prompter`, `watch::Notifier`,
   `watch::EventSource`) so the interesting logic sits behind a
   deterministic fake and doesn't need real IO.
-- Use `cargo test -p coronarium-core` for fast iteration; the full
+- Use `cargo test -p sakimori-core` for fast iteration; the full
   workspace runs eBPF + aya code that only builds meaningfully on
   Linux.
 - Use real `git` in tests (not a mock) when that's cheaper than

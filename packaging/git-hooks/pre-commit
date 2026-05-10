@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# coronarium pre-commit hook template.
+# sakimori pre-commit hook template.
 #
 # Refuses a commit when any staged lockfile would introduce dependencies
-# younger than `MIN_AGE`. Unlike `coronarium deps watch`, which runs
+# younger than `MIN_AGE`. Unlike `sakimori deps watch`, which runs
 # *after* the package manager writes the lockfile, this hook runs
 # *before* the lockfile is recorded in git history — the last reliable
 # chokepoint on desktop before CI.
@@ -19,13 +19,13 @@
 set -eo pipefail
 
 # How young is "too young". Accepts `7d`, `168h`, `600m`, `3600s`.
-MIN_AGE="${CORONARIUM_MIN_AGE:-7d}"
+MIN_AGE="${SAKIMORI_MIN_AGE:-7d}"
 # Patterns your team publishes itself and doesn't want blocked.
 # Space-separated; quote if names contain spaces. Example:
 #   IGNORE_PATTERNS='@my-org/* my-internal-*'
-IGNORE_PATTERNS="${CORONARIUM_IGNORE_PATTERNS:-}"
+IGNORE_PATTERNS="${SAKIMORI_IGNORE_PATTERNS:-}"
 
-# Which lockfile basenames we care about. Must match what `coronarium
+# Which lockfile basenames we care about. Must match what `sakimori
 # deps check` accepts.
 LOCKFILE_NAMES=(
   package-lock.json
@@ -48,10 +48,10 @@ if [[ ${#staged[@]} -eq 0 ]]; then
   exit 0
 fi
 
-echo "coronarium pre-commit: checking ${#staged[@]} lockfile(s) @ min-age=${MIN_AGE}"
+echo "sakimori pre-commit: checking ${#staged[@]} lockfile(s) @ min-age=${MIN_AGE}"
 
-if ! command -v coronarium >/dev/null 2>&1; then
-  echo "coronarium: binary not found on PATH — install with brew / release tarball" >&2
+if ! command -v sakimori >/dev/null 2>&1; then
+  echo "sakimori: binary not found on PATH — install with brew / release tarball" >&2
   echo "(skipping the age check; commit proceeding)" >&2
   exit 0
 fi
@@ -61,7 +61,7 @@ for pat in $IGNORE_PATTERNS; do
   ignore_args+=(--ignore "$pat")
 done
 
-if coronarium deps check --min-age "${MIN_AGE}" ${ignore_args[@]+"${ignore_args[@]}"} "${staged[@]}"; then
+if sakimori deps check --min-age "${MIN_AGE}" ${ignore_args[@]+"${ignore_args[@]}"} "${staged[@]}"; then
   exit 0
 fi
 
@@ -75,7 +75,7 @@ younger than ${MIN_AGE}. Either:
      install, or
   2. Wait, or
   3. Acknowledge deliberately by setting
-         CORONARIUM_MIN_AGE=0 git commit …
+         SAKIMORI_MIN_AGE=0 git commit …
      (bypasses this hook for one commit).
 ────────────────────────────────────────────────────────────────
 EOF

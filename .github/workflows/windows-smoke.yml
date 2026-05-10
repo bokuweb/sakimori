@@ -6,8 +6,8 @@ on:
     branches: [feat/windows-audit]
   pull_request:
     paths:
-      - "crates/coronarium-win/**"
-      - "crates/coronarium-core/**"
+      - "crates/sakimori-win/**"
+      - "crates/sakimori-core/**"
       - ".github/workflows/windows-smoke.yml"
 
 jobs:
@@ -25,15 +25,15 @@ jobs:
             [Security.Principal.WindowsIdentity]::GetCurrent()
           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-      - name: Build coronarium-win
-        working-directory: crates/coronarium-win
+      - name: Build sakimori-win
+        working-directory: crates/sakimori-win
         run: cargo build --release
 
       - name: audit-mode e2e (captures exec/open/connect)
         shell: pwsh
-        working-directory: crates/coronarium-win
+        working-directory: crates/sakimori-win
         run: |
-          $exe = "target\release\coronarium-win.exe"
+          $exe = "target\release\sakimori-win.exe"
           $policy = "$env:RUNNER_TEMP\policy.yml"
           @"
           mode: audit
@@ -48,7 +48,7 @@ jobs:
           & $exe --policy $policy --log $log --html $html -- `
              powershell -Command "Invoke-WebRequest -UseBasicParsing https://example.com -OutFile $env:TEMP\ex.html -ErrorAction SilentlyContinue; Get-ChildItem C:\Windows | Select -First 3"
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "coronarium-win exited $LASTEXITCODE in audit mode (should be child's exit = 0)"
+            Write-Error "sakimori-win exited $LASTEXITCODE in audit mode (should be child's exit = 0)"
             exit 1
           }
 
@@ -74,9 +74,9 @@ jobs:
 
       - name: block-mode e2e (deny_exec tags whoami as denied, then exit 1)
         shell: pwsh
-        working-directory: crates/coronarium-win
+        working-directory: crates/sakimori-win
         run: |
-          $exe = "target\release\coronarium-win.exe"
+          $exe = "target\release\sakimori-win.exe"
           $policy = "$env:RUNNER_TEMP\block.yml"
           @"
           mode: block
@@ -92,10 +92,10 @@ jobs:
           $log = "$env:RUNNER_TEMP\block.json"
           & $exe --policy $policy --log $log -- whoami
           $rc = $LASTEXITCODE
-          Write-Host "coronarium-win exit=$rc"
+          Write-Host "sakimori-win exit=$rc"
           Get-Content $log -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 4
           $json = Get-Content $log -Raw | ConvertFrom-Json
-          # Expect coronarium to exit 1 because deny_exec matched.
+          # Expect sakimori to exit 1 because deny_exec matched.
           if ($rc -eq 0) {
             Write-Error "block mode should have exited non-zero when a matching exec was seen"
             exit 1
@@ -109,16 +109,16 @@ jobs:
             exit 1
           }
           Write-Host "✓ block mode correctly flagged the denied exec"
-          # Explicit success — coronarium-win exited non-zero by design
+          # Explicit success — sakimori-win exited non-zero by design
           # (that's the *expected* outcome in block mode), but pwsh
           # otherwise inherits $LASTEXITCODE and fails the step.
           exit 0
 
       - name: network block e2e (curl to denied IP should fail)
         shell: pwsh
-        working-directory: crates/coronarium-win
+        working-directory: crates/sakimori-win
         run: |
-          $exe = "target\release\coronarium-win.exe"
+          $exe = "target\release\sakimori-win.exe"
           $policy = "$env:RUNNER_TEMP\netblock.yml"
           # example.com's stable IPv4; we block it via policy and expect
           # curl to either time out (firewall drops the SYN) or fail with
@@ -137,20 +137,20 @@ jobs:
           $err = "$env:RUNNER_TEMP\curl-err.txt"
 
           # Resolve curl.exe so the firewall rule's -Program matches what
-          # actually runs (coronarium-win does this via `where` too).
+          # actually runs (sakimori-win does this via `where` too).
           $curl = (Get-Command curl.exe).Source
           Write-Host "using curl at $curl"
 
           & $exe --policy $policy --log $log --mode block -- $curl -sS -m 8 -o $out http://93.184.216.34/ 2>$err
           $rc = $LASTEXITCODE
-          Write-Host "coronarium rc=${rc}"
+          Write-Host "sakimori rc=${rc}"
           Write-Host "--- curl stderr ---"
           Get-Content $err -ErrorAction SilentlyContinue
           Write-Host "--- log head ---"
           Get-Content $log -TotalCount 60
 
           if ($rc -eq 0) {
-            Write-Error "coronarium exit=0 — firewall didn't block, or deny wasn't observed"
+            Write-Error "sakimori exit=0 — firewall didn't block, or deny wasn't observed"
             exit 1
           }
           # curl itself should have failed. Accept either connection
