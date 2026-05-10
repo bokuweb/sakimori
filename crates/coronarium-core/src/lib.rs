@@ -11,6 +11,7 @@
 //! reports. Anything that needs eBPF / ETW / OS-specific APIs stays in
 //! the respective binary crates.
 
+pub mod actions;
 pub mod deps;
 pub mod events;
 pub mod html;

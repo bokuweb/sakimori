@@ -93,6 +93,45 @@ pub enum Command {
         #[command(subcommand)]
         cmd: PolicyCommand,
     },
+    /// Static analysis of GitHub Actions workflow files. Currently
+    /// just `audit`, which flags `uses:` refs that aren't pinned to
+    /// a 40-char commit SHA.
+    Actions {
+        #[command(subcommand)]
+        cmd: ActionsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ActionsCommand {
+    /// Walk one or more workflow YAMLs and report every `uses:`
+    /// pointing at a mutable tag/branch instead of a commit SHA.
+    /// Exits non-zero when at least one Error-severity finding
+    /// is present (third-party `@v1` style); first-party warnings
+    /// don't fail by default — pass `--strict` to escalate them.
+    Audit(ActionsAuditArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct ActionsAuditArgs {
+    /// Workflow YAML files to audit. Pass `.github/workflows/*.yml`
+    /// from your shell to glob — we don't expand globs ourselves.
+    #[arg(required = true)]
+    pub files: Vec<PathBuf>,
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: ActionsFormat,
+    /// Treat first-party (`actions/*`, `github/*`) mutable refs as
+    /// blocking too. Default is to warn for first-party, error for
+    /// third-party, on the theory that GitHub's own publish
+    /// pipeline is harder to compromise than a random vendor's.
+    #[arg(long)]
+    pub strict: bool,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum ActionsFormat {
+    Text,
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -612,7 +651,97 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Policy {
             cmd: PolicyCommand::Suggest(args),
         } => run_policy_suggest(args),
+        Command::Actions {
+            cmd: ActionsCommand::Audit(args),
+        } => run_actions_audit(args),
     }
+}
+
+fn run_actions_audit(args: ActionsAuditArgs) -> Result<()> {
+    use coronarium_core::actions::{Finding, Severity, Summary, audit_yaml};
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct PerFile<'a> {
+        file: &'a std::path::Path,
+        findings: &'a [Finding],
+        summary: Summary,
+    }
+
+    let mut all: Vec<(PathBuf, Vec<Finding>)> = Vec::new();
+    for path in &args.files {
+        let yaml =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let findings = audit_yaml(&yaml).with_context(|| format!("auditing {}", path.display()))?;
+        all.push((path.clone(), findings));
+    }
+
+    // `--strict` rewrites Warn → Error in-place so both the printed
+    // output and the exit code reflect the user's choice.
+    if args.strict {
+        for (_, findings) in &mut all {
+            for f in findings {
+                if f.severity == Severity::Warn {
+                    f.severity = Severity::Error;
+                }
+            }
+        }
+    }
+
+    let mut blocking = 0usize;
+    match args.format {
+        ActionsFormat::Json => {
+            let payload: Vec<PerFile<'_>> = all
+                .iter()
+                .map(|(p, f)| PerFile {
+                    file: p.as_path(),
+                    findings: f,
+                    summary: Summary::from_findings(f),
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+            blocking = all
+                .iter()
+                .flat_map(|(_, f)| f.iter())
+                .filter(|f| f.is_blocking())
+                .count();
+        }
+        ActionsFormat::Text => {
+            for (path, findings) in &all {
+                let summary = Summary::from_findings(findings);
+                println!(
+                    "{}  ({} ok, {} warn, {} error)",
+                    path.display(),
+                    summary.ok,
+                    summary.warn,
+                    summary.error
+                );
+                for f in findings {
+                    if matches!(f.severity, Severity::Ok) {
+                        continue;
+                    }
+                    let tag = match f.severity {
+                        Severity::Error => "ERROR",
+                        Severity::Warn => "warn ",
+                        Severity::Ok => "ok   ",
+                    };
+                    let where_ = match &f.step {
+                        Some(name) => format!("{}/{name}", f.job),
+                        None => f.job.clone(),
+                    };
+                    println!("  {tag}  {where_}: {}", f.message);
+                    if f.is_blocking() {
+                        blocking += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if blocking > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn run_policy_suggest(args: PolicySuggestArgs) -> Result<()> {

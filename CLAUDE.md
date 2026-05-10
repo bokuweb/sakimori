@@ -214,12 +214,16 @@ of value-per-implementation-cost.
    compromised dependency rewriting `.git/config` or source files
    during install. Detection-only initially; could escalate to
    git-revert in `--action revert` mode.
-10. **Floating-tag → SHA-pin static check** — new subcommand
-    `coronarium actions audit <workflow.yml>` that flags any
-    `uses: foo/bar@v1` (mutable ref) and recommends the SHA-pinned
-    form. StepSecurity's "secure-repo" runs this server-side; we'd
-    do it locally + in `coronarium deps check`-style CI mode.
-    No new infra needed — pure parser + GitHub API resolve.
+10. **Floating-tag → SHA-pin static check** — ✅ implemented in v0.21
+    as `coronarium actions audit <workflow.yml...>`. Walks every
+    `uses:` in `jobs.<id>.steps[]` and `jobs.<id>.uses` (reusable
+    workflow callers) and classifies each as Ok (40-char hex SHA,
+    local action, or docker `@sha256:` digest), Warn (first-party
+    `actions/*` / `github/*` with a mutable tag — risky but lower
+    blast radius), or Error (third-party with a mutable tag/branch).
+    Text + JSON output, `--strict` escalates Warn → Error. Tag→SHA
+    auto-resolution via the GitHub API is deferred — it requires
+    auth and turns the offline tool into a network one.
 11. **Per-step / per-PID source attribution** — today the JSON log
     has `pid` + `comm`, but harden-runner's value-add is being
     able to say "this outbound call came from `npm install
