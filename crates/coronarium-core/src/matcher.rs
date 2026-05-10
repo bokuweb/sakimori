@@ -26,6 +26,17 @@ impl FileMatcher {
     /// Deny entries win over allow entries (same precedence as the
     /// network map).
     pub fn is_denied(&self, path: &str) -> bool {
+        // The eBPF ringbuf occasionally emits open events with an
+        // empty filename — typically anonymous mmaps, deleted files,
+        // or memfd-style opens where the kernel can't recover an
+        // absolute path. Empty isn't actually a path we can
+        // meaningfully police, but with `default: deny` it would
+        // fall through every prefix check and get tagged as denied,
+        // inflating `stats.denied` and tripping block-mode exits on
+        // runs where nothing real was blocked. Treat as not-denied.
+        if path.is_empty() {
+            return false;
+        }
         for pat in &self.deny {
             if prefix_match(path, pat) {
                 return true;
@@ -146,6 +157,17 @@ mod tests {
         let fm = m(DefaultDecision::Allow, &["/etc"], &["/etc/shadow"]);
         assert!(fm.is_denied("/etc/shadow"));
         assert!(!fm.is_denied("/etc/hostname"));
+    }
+
+    #[test]
+    fn empty_path_is_not_denied_under_default_deny() {
+        // anonymous mmap / deleted file / memfd opens come through
+        // the ringbuf with an empty filename. With default-deny,
+        // those would otherwise fall through allow checks and get
+        // tagged as denied — flooding `stats.denied` and tripping
+        // block-mode exit on runs where nothing real was denied.
+        let fm = m(DefaultDecision::Deny, &["/usr", "/lib"], &["/etc/shadow"]);
+        assert!(!fm.is_denied(""));
     }
 
     fn em(patterns: &[&str]) -> ExecMatcher {
