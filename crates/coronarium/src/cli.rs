@@ -413,13 +413,14 @@ pub struct RunArgs {
 
     /// Re-resolve hostname-based `network.allow` / `network.deny`
     /// rules on this interval (seconds) and additively populate the
-    /// eBPF map with any newly-observed IPs. Needed for long-running
-    /// supervised jobs behind CDN round-robin DNS: a CDN that
-    /// rotates its IP set mid-run would otherwise start hitting
-    /// addresses the map has never seen. `0` disables refresh
-    /// (default). Entries are never removed once written, so
-    /// increasing the refresh rate is safe.
-    #[arg(long, default_value_t = 0, value_name = "SECS")]
+    /// eBPF map with any newly-observed IPs. Needed for supervised
+    /// jobs behind round-robin DNS (github.com, registry.npmjs.org,
+    /// most CDNs): the IPs returned by a fresh DNS query mid-run
+    /// can differ from the ones captured at startup, so without
+    /// refresh the second connect to the same hostname can be
+    /// denied with `Operation not permitted`. Entries are never
+    /// removed once written. `0` disables refresh entirely.
+    #[arg(long, default_value_t = 15, value_name = "SECS")]
     pub dns_refresh_interval: u64,
 
     /// Command + args to execute under supervision.
