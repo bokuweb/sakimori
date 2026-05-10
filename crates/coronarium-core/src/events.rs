@@ -1,25 +1,38 @@
 //! Event enum shared between Linux eBPF decoder and Windows ETW parser.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
     Exec {
+        #[serde(default)]
         pid: u32,
+        #[serde(default)]
         uid: u32,
+        #[serde(default)]
         comm: String,
+        #[serde(default)]
         filename: String,
+        #[serde(default)]
         argv0: String,
+        #[serde(default)]
         denied: bool,
     },
     Connect {
+        #[serde(default)]
         pid: u32,
+        #[serde(default)]
         uid: u32,
+        #[serde(default)]
         comm: String,
+        #[serde(default)]
         daddr: String,
+        #[serde(default)]
         dport: u16,
+        #[serde(default)]
         protocol: u16,
+        #[serde(default)]
         denied: bool,
         /// Reverse-DNS of `daddr` (PTR record) when known. Populated
         /// best-effort by the userspace supervisor after all events
@@ -29,11 +42,17 @@ pub enum Event {
         hostname: Option<String>,
     },
     Open {
+        #[serde(default)]
         pid: u32,
+        #[serde(default)]
         uid: u32,
+        #[serde(default)]
         comm: String,
+        #[serde(default)]
         filename: String,
+        #[serde(default)]
         flags: u32,
+        #[serde(default)]
         denied: bool,
     },
 }

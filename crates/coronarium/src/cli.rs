@@ -86,6 +86,33 @@ pub enum Command {
     /// $HTTPS_PROXY, rc-file block, and daemon unit. Exits non-zero
     /// if any critical check fails.
     Doctor(DoctorArgs),
+    /// Policy authoring helpers (suggest a starter policy from an
+    /// audit-mode log, etc.). `check-policy` (the validation
+    /// subcommand) lives at the top level for backwards compatibility.
+    Policy {
+        #[command(subcommand)]
+        cmd: PolicyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PolicyCommand {
+    /// Read a JSON audit log (typically produced by
+    /// `coronarium run --mode audit --log foo.json`) and emit a
+    /// starter `policy.yml` covering every observed connect / open.
+    /// Exec targets are surfaced as a commented `# observed_exec`
+    /// block so you can pick which to deny — the suggester never
+    /// auto-populates `process.deny_exec`.
+    Suggest(PolicySuggestArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct PolicySuggestArgs {
+    /// Audit log to read. Use `-` for stdin.
+    pub log: PathBuf,
+    /// Where to write the suggested policy. Defaults to stdout.
+    #[arg(long, short = 'o')]
+    pub output: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -582,7 +609,35 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::InstallGate {
             cmd: InstallGateCommand::Uninstall(args),
         } => run_install_gate_uninstall(args),
+        Command::Policy {
+            cmd: PolicyCommand::Suggest(args),
+        } => run_policy_suggest(args),
     }
+}
+
+fn run_policy_suggest(args: PolicySuggestArgs) -> Result<()> {
+    let suggestion = if args.log.as_os_str() == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading audit log from stdin")?;
+        let samples = coronarium_core::suggest::parse_log_samples(&buf)
+            .context("parsing audit log JSON from stdin")?;
+        coronarium_core::suggest::suggest_from_samples(&samples)
+    } else {
+        coronarium_core::suggest::suggest_from_log(&args.log)?
+    };
+    let yaml = coronarium_core::suggest::format_yaml(&suggestion)?;
+    match args.output {
+        Some(path) => {
+            std::fs::write(&path, yaml)
+                .with_context(|| format!("writing suggested policy to {}", path.display()))?;
+            eprintln!("coronarium: wrote suggested policy to {}", path.display());
+        }
+        None => print!("{yaml}"),
+    }
+    Ok(())
 }
 
 fn run_install_gate_install(args: InstallGateInstallArgs) -> Result<()> {

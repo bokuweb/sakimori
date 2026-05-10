@@ -1,0 +1,352 @@
+//! Audit-log → starter-policy generator.
+//!
+//! Reads a JSON audit log produced by `coronarium run --log foo.json`
+//! (one or more pretty-printed objects with a `samples` array) and
+//! emits a [`Policy`] covering every observed Connect / Open event,
+//! plus a commented-out list of every observed Exec target.
+//!
+//! The intended workflow:
+//!
+//! ```text
+//! 1. coronarium run --mode audit --log audit.json -- <build cmd>
+//! 2. coronarium policy suggest audit.json -o policy.yml
+//! 3. <review / prune policy.yml>
+//! 4. coronarium run -p policy.yml --mode block -- <build cmd>
+//! ```
+//!
+//! Aggregation rules:
+//! - **Network**: one `NetRule` per `(hostname-or-ip, sorted ports)`.
+//!   Hostname wins over the bare IP when present (matches what a
+//!   human would write).
+//! - **File**: one entry per **parent directory** of the observed
+//!   filename, deduped — a per-file allow list would be unusably
+//!   noisy and break the moment any tool writes to a temp basename.
+//! - **Exec**: surfaced as a commented `# observed_exec:` block at
+//!   the end of the YAML so the operator can paste names into
+//!   `process.deny_exec` after review. We deliberately do **not**
+//!   auto-populate `deny_exec` — every exec the audit captured is
+//!   by definition something the build wanted to run.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
+
+use crate::{
+    events::Event,
+    policy::{DefaultDecision, FilePolicy, Mode, NetRule, NetworkPolicy, Policy, ProcessPolicy},
+};
+
+/// What `suggest_from_samples` returns. The `Policy` is what would
+/// serialise straight to YAML; `observed_execs` is the post-serialisation
+/// commented block the CLI appends.
+#[derive(Debug, Clone)]
+pub struct Suggestion {
+    pub policy: Policy,
+    /// Sorted, deduped list of every `Exec` target seen. Surfaced as
+    /// a `# observed_exec:` YAML comment so the operator can choose
+    /// what (if anything) to deny.
+    pub observed_execs: Vec<String>,
+}
+
+/// Build a starter [`Policy`] from a flat slice of [`Event`]s.
+pub fn suggest_from_samples(samples: &[Event]) -> Suggestion {
+    // (target → set of ports). BTreeMap so the YAML output is stable.
+    let mut net: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
+    let mut file_dirs: BTreeSet<String> = BTreeSet::new();
+    let mut execs: BTreeSet<String> = BTreeSet::new();
+
+    for ev in samples {
+        match ev {
+            Event::Connect {
+                daddr,
+                dport,
+                hostname,
+                ..
+            } => {
+                let target = hostname.clone().unwrap_or_else(|| daddr.clone());
+                if target.is_empty() {
+                    continue;
+                }
+                net.entry(target).or_default().insert(*dport);
+            }
+            Event::Open { filename, .. } => {
+                if filename.is_empty() {
+                    continue;
+                }
+                file_dirs.insert(parent_dir(filename));
+            }
+            Event::Exec { filename, .. } => {
+                if !filename.is_empty() {
+                    execs.insert(filename.clone());
+                }
+            }
+        }
+    }
+
+    let allow: Vec<NetRule> = net
+        .into_iter()
+        .map(|(target, ports)| NetRule {
+            target,
+            ports: ports.into_iter().collect(),
+        })
+        .collect();
+
+    let policy = Policy {
+        mode: Mode::Audit,
+        network: NetworkPolicy {
+            default: DefaultDecision::Deny,
+            allow,
+            deny: Vec::new(),
+        },
+        file: FilePolicy {
+            default: DefaultDecision::Allow,
+            allow: file_dirs.into_iter().collect(),
+            deny: Vec::new(),
+        },
+        process: ProcessPolicy::default(),
+        env: Default::default(),
+    };
+
+    Suggestion {
+        policy,
+        observed_execs: execs.into_iter().collect(),
+    }
+}
+
+/// Read a `coronarium run --log <file>` audit log and return the
+/// suggested policy. The log is a stream of pretty-printed JSON
+/// objects (one per `report::write` call); we parse them iteratively
+/// and concatenate every object's `samples` array.
+pub fn suggest_from_log(path: &Path) -> Result<Suggestion> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading audit log {}", path.display()))?;
+    let samples = parse_log_samples(&text)
+        .with_context(|| format!("parsing audit log {}", path.display()))?;
+    Ok(suggest_from_samples(&samples))
+}
+
+/// Render a [`Suggestion`] as a YAML document ready to drop in as a
+/// policy file. The commented `# observed_exec:` block is appended
+/// only when at least one exec was seen.
+pub fn format_yaml(s: &Suggestion) -> Result<String> {
+    let mut out = String::new();
+    out.push_str("# Generated by `coronarium policy suggest`. Review before enforcing.\n");
+    out.push_str(&serde_yaml::to_string(&s.policy)?);
+    if !s.observed_execs.is_empty() {
+        out.push_str("\n# observed_exec — every binary execve()'d during the audit run.\n");
+        out.push_str("# Move any of these into `process.deny_exec:` to block them.\n");
+        for e in &s.observed_execs {
+            out.push_str("#   - ");
+            out.push_str(e);
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Deserialize)]
+struct LogChunk {
+    #[serde(default)]
+    samples: Vec<Event>,
+}
+
+pub fn parse_log_samples(text: &str) -> Result<Vec<Event>> {
+    let mut out = Vec::new();
+    let de = serde_json::Deserializer::from_str(text);
+    for chunk in de.into_iter::<LogChunk>() {
+        let chunk = chunk?;
+        out.extend(chunk.samples);
+    }
+    Ok(out)
+}
+
+/// Parent directory of `path`, with a trailing `/` so it reads as a
+/// prefix in the policy. Falls back to the whole path when there's
+/// no separator (e.g. bare basenames coming out of a chrooted run).
+fn parent_dir(path: &str) -> String {
+    match path.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(i) => path[..=i].to_string(),
+        None => path.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connect(host: Option<&str>, daddr: &str, dport: u16) -> Event {
+        Event::Connect {
+            pid: 1,
+            uid: 0,
+            comm: "x".into(),
+            daddr: daddr.into(),
+            dport,
+            protocol: 6,
+            denied: false,
+            hostname: host.map(|s| s.into()),
+        }
+    }
+    fn open(filename: &str) -> Event {
+        Event::Open {
+            pid: 1,
+            uid: 0,
+            comm: "x".into(),
+            filename: filename.into(),
+            flags: 0,
+            denied: false,
+        }
+    }
+    fn exec(filename: &str) -> Event {
+        Event::Exec {
+            pid: 1,
+            uid: 0,
+            comm: "x".into(),
+            filename: filename.into(),
+            argv0: filename.into(),
+            denied: false,
+        }
+    }
+
+    #[test]
+    fn parent_dir_handles_root_basename_and_nested() {
+        assert_eq!(parent_dir("/etc/hosts"), "/etc/");
+        assert_eq!(parent_dir("/foo"), "/");
+        assert_eq!(parent_dir("bare"), "bare");
+        assert_eq!(parent_dir("/a/b/c/d.txt"), "/a/b/c/");
+    }
+
+    #[test]
+    fn connect_groups_by_target_and_sorts_ports() {
+        let evs = vec![
+            connect(Some("api.github.com"), "140.82.121.6", 443),
+            connect(Some("api.github.com"), "140.82.121.6", 80),
+            connect(None, "1.2.3.4", 22),
+        ];
+        let s = suggest_from_samples(&evs);
+        let allow = &s.policy.network.allow;
+        assert_eq!(allow.len(), 2);
+        let gh = allow.iter().find(|r| r.target == "api.github.com").unwrap();
+        assert_eq!(gh.ports, vec![80, 443], "ports must be sorted ascending");
+        let raw = allow.iter().find(|r| r.target == "1.2.3.4").unwrap();
+        assert_eq!(raw.ports, vec![22]);
+    }
+
+    #[test]
+    fn connect_prefers_hostname_over_ip_when_both_present() {
+        let evs = vec![
+            connect(Some("api.github.com"), "140.82.121.6", 443),
+            connect(None, "140.82.121.6", 443),
+        ];
+        let s = suggest_from_samples(&evs);
+        // Hostname-keyed entry exists; the same (ip,443) is also kept
+        // separately because we can't safely assume the IP-only event
+        // resolves to the same name.
+        assert!(
+            s.policy
+                .network
+                .allow
+                .iter()
+                .any(|r| r.target == "api.github.com")
+        );
+        assert!(
+            s.policy
+                .network
+                .allow
+                .iter()
+                .any(|r| r.target == "140.82.121.6")
+        );
+    }
+
+    #[test]
+    fn open_collapses_to_parent_directories() {
+        let evs = vec![
+            open("/usr/lib/libc.so.6"),
+            open("/usr/lib/ld-linux.so.2"),
+            open("/etc/hosts"),
+        ];
+        let s = suggest_from_samples(&evs);
+        let allow = &s.policy.file.allow;
+        assert!(allow.contains(&"/usr/lib/".to_string()));
+        assert!(allow.contains(&"/etc/".to_string()));
+        // Two distinct files under /usr/lib collapsed into one entry.
+        assert_eq!(allow.iter().filter(|p| *p == "/usr/lib/").count(), 1);
+    }
+
+    #[test]
+    fn exec_targets_are_observation_only_not_denied() {
+        let evs = vec![exec("/bin/sh"), exec("/usr/bin/curl"), exec("/bin/sh")];
+        let s = suggest_from_samples(&evs);
+        // Never auto-populated into deny_exec.
+        assert!(s.policy.process.deny_exec.is_empty());
+        // Surfaced as observation, deduped + sorted.
+        assert_eq!(s.observed_execs, vec!["/bin/sh", "/usr/bin/curl"]);
+    }
+
+    #[test]
+    fn empty_targets_are_skipped() {
+        let evs = vec![
+            connect(Some(""), "", 443), // empty everywhere
+            open(""),
+            exec(""),
+        ];
+        let s = suggest_from_samples(&evs);
+        assert!(s.policy.network.allow.is_empty());
+        assert!(s.policy.file.allow.is_empty());
+        assert!(s.observed_execs.is_empty());
+    }
+
+    #[test]
+    fn parses_concatenated_pretty_printed_chunks() {
+        // Two appends — what you get from running `coronarium run`
+        // twice with the same `--log` path.
+        let blob = r#"{
+  "observed": 1,
+  "denied": 0,
+  "lost": 0,
+  "samples": [
+    {"kind": "connect", "pid": 1, "uid": 0, "comm": "c",
+     "daddr": "1.1.1.1", "dport": 443, "protocol": 6, "denied": false}
+  ]
+}
+{
+  "observed": 1,
+  "denied": 0,
+  "lost": 0,
+  "samples": [
+    {"kind": "open", "pid": 2, "uid": 0, "comm": "c",
+     "filename": "/etc/hosts", "flags": 0, "denied": false}
+  ]
+}"#;
+        let evs = parse_log_samples(blob).expect("two valid chunks");
+        assert_eq!(evs.len(), 2);
+    }
+
+    #[test]
+    fn format_yaml_includes_observed_exec_block_only_when_present() {
+        let with_exec = Suggestion {
+            policy: Policy {
+                mode: Mode::Audit,
+                network: NetworkPolicy::default(),
+                file: FilePolicy::default(),
+                process: ProcessPolicy::default(),
+                env: Default::default(),
+            },
+            observed_execs: vec!["/bin/sh".into()],
+        };
+        let s = format_yaml(&with_exec).unwrap();
+        assert!(s.contains("# observed_exec"));
+        assert!(s.contains("/bin/sh"));
+
+        let without = Suggestion {
+            observed_execs: Vec::new(),
+            ..with_exec
+        };
+        let s = format_yaml(&without).unwrap();
+        assert!(!s.contains("observed_exec"));
+    }
+}

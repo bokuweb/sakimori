@@ -524,9 +524,23 @@ env:
   deny: ["AWS_*", "*_TOKEN", "*_SECRET", NPM_TOKEN]
 ```
 
-**First-time setup pattern** — run in `mode: audit` once, inspect
-the JSON log, add actually-needed entries to `allow:`, flip to
-`mode: block` when the log is clean.
+**First-time setup pattern** — run in `mode: audit` once, then let
+`policy suggest` turn the log into a starter policy, prune by hand,
+and flip to `mode: block`:
+
+```bash
+coronarium run --mode audit --log audit.json -- cargo test
+coronarium policy suggest audit.json -o .github/coronarium.yml
+$EDITOR .github/coronarium.yml      # remove anything you don't want allowed
+coronarium run -p .github/coronarium.yml --mode block -- cargo test
+```
+
+`suggest` populates `network.allow` (one entry per host:port observed,
+hostnames preferred over raw IPs) and `file.allow` (one entry per
+parent directory observed). Exec targets are surfaced as a
+commented `# observed_exec:` block — `process.deny_exec` is
+deliberately left empty because the suggester can't know which of
+the binaries the build actually wanted.
 
 The HTML report includes:
 - verdict (ALLOW / DENY), kind, pid, comm

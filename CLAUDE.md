@@ -177,6 +177,66 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
 5. **macOS live block** — either a Network Extension (heavy, needs
    signing) or an HTTPS proxy (see #2).
 
+### harden-runner parity gaps (tracked but not yet scheduled)
+
+These are features `step-security/harden-runner` ships that
+coronarium currently does not. Listed roughly in descending order
+of value-per-implementation-cost.
+
+6. **Enriched `$GITHUB_STEP_SUMMARY`** — ✅ implemented in v0.20.
+   The supervisor now writes per-host (Connect), per-path (Open),
+   and per-binary (Exec) top-N tables into the step summary,
+   marking denied rows with ❌ so reviewers can spot the offending
+   destinations directly on the run page without downloading the
+   JSON log.
+7. **`coronarium policy suggest <audit-log.json>`** — ✅ implemented
+   in v0.20. Reads a JSON audit log (typically produced by an
+   audit-mode run) and emits a starter `policy.yml` with every
+   observed host/port pair on `network.allow`, observed file
+   parents on `file.allow`, and observed exec'd binaries listed
+   under a commented `# observed_exec` block. Reduces the "stare
+   at the log and hand-craft the policy" friction that today
+   blocks teams from flipping `mode: audit` → `mode: block`.
+8. **SNI-based egress in the proxy** — extend `coronarium proxy`
+   to honour a `network.allow` style hostname list at the CONNECT
+   layer (parse SNI from the TLS ClientHello, match against the
+   policy, return 403 on miss). Today the eBPF path enforces by
+   resolved IP, which loses against CDN rotation; doing it at the
+   proxy gives FQDN/wildcard semantics that match what
+   harden-runner users expect (`*.githubusercontent.com:443`
+   etc.). Doable on top of the existing hudsucker stack; depends
+   on `install-gate` already being on the user's shell.
+9. **Workspace tamper detection** — at `run` start, snapshot the
+   git index + working tree hashes for files under `$GITHUB_WORKSPACE`;
+   at exit, diff and flag any files that were modified by the
+   supervised step but weren't expected to change (e.g. by
+   comparing against a per-step manifest). Goal: catch a
+   compromised dependency rewriting `.git/config` or source files
+   during install. Detection-only initially; could escalate to
+   git-revert in `--action revert` mode.
+10. **Floating-tag → SHA-pin static check** — new subcommand
+    `coronarium actions audit <workflow.yml>` that flags any
+    `uses: foo/bar@v1` (mutable ref) and recommends the SHA-pinned
+    form. StepSecurity's "secure-repo" runs this server-side; we'd
+    do it locally + in `coronarium deps check`-style CI mode.
+    No new infra needed — pure parser + GitHub API resolve.
+11. **Per-step / per-PID source attribution** — today the JSON log
+    has `pid` + `comm`, but harden-runner's value-add is being
+    able to say "this outbound call came from `npm install
+    foo@1.2.3`'s postinstall script". Achievable by walking the
+    process tree at event time and attaching the originating
+    package manager argv to the event record. Linux-first via
+    `/proc/<pid>/status` PPid chain.
+
+Explicitly **out of scope** (different product philosophy, not
+a missing feature):
+
+- Centralised SaaS dashboard / cross-runner correlation. coronarium
+  is local-first; the JSON log + HTML report are the artefacts.
+- Automatic runner hardening (sudo disabling, immutable rootfs).
+  We don't take destructive actions on the runner without an
+  explicit opt-in.
+
 ## Crate layout
 
 ```
