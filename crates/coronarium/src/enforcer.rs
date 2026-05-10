@@ -79,12 +79,38 @@ async fn populate_network_maps(
 ) -> anyhow::Result<()> {
     use std::net::IpAddr;
 
+    use anyhow::Context;
     use coronarium_common::{Ipv4Key, Ipv6Key, POLICY_ALLOW, POLICY_DENY};
 
     // Pre-resolve every rule's endpoints *before* touching the maps so that a
     // transient DNS failure doesn't leave half-populated state.
     let allow = resolve_all(resolver, &policy.network.allow).await;
     let deny = resolve_all(resolver, &policy.network.deny).await;
+
+    // Pre-flight: each (addr, port) becomes one entry in the BPF map.
+    // The maps are sized via `HashMap::with_max_entries(BPF_NET_MAP_CAPACITY)`
+    // in the eBPF program. Going over yields a bare `bpf_map_update_elem
+    // failed: Argument list too long` from aya — surface a clearly
+    // diagnosable error before we even start updating instead.
+    let (v4_count, v6_count) = endpoint_counts(&allow, &deny);
+    if v4_count > BPF_NET_MAP_CAPACITY {
+        anyhow::bail!(
+            "policy network rules expand to {v4_count} IPv4 (addr,port) pairs, \
+             but the eBPF NET4 map is sized for {BPF_NET_MAP_CAPACITY}. \
+             Common cause: a wide CIDR like Cloudflare's /12s — coronarium \
+             enumerates every host into the map and CDN ranges overflow it \
+             quickly. Use hostname rules (kept fresh by --dns-refresh-interval) \
+             or narrower CIDRs."
+        );
+    }
+    if v6_count > BPF_NET_MAP_CAPACITY {
+        anyhow::bail!(
+            "policy network rules expand to {v6_count} IPv6 (addr,port) pairs, \
+             but the eBPF NET6 map is sized for {BPF_NET_MAP_CAPACITY}. \
+             Use hostname rules or narrower CIDRs (an IPv6 /112 is the \
+             tightest CIDR that fits unconditionally)."
+        );
+    }
 
     // deny wins if the same (addr, port) appears on both lists.
     if let Some(map) = bpf.map_mut("NET4") {
@@ -100,7 +126,13 @@ async fn populate_network_maps(
                     port: ep.port.to_be(),
                     _pad: 0,
                 };
-                m.insert(key, verdict, 0)?;
+                m.insert(key, verdict, 0).with_context(|| {
+                    format!(
+                        "writing {v4}:{} to NET4 map (capacity {BPF_NET_MAP_CAPACITY}); \
+                         policy may exceed map size",
+                        ep.port,
+                    )
+                })?;
             }
         }
     }
@@ -118,11 +150,39 @@ async fn populate_network_maps(
                     port: ep.port.to_be(),
                     _pad: [0; 6],
                 };
-                m.insert(key, verdict, 0)?;
+                m.insert(key, verdict, 0).with_context(|| {
+                    format!(
+                        "writing [{v6}]:{} to NET6 map (capacity {BPF_NET_MAP_CAPACITY}); \
+                         policy may exceed map size",
+                        ep.port,
+                    )
+                })?;
             }
         }
     }
     Ok(())
+}
+
+/// Mirror of `HashMap::with_max_entries(...)` in `crates/coronarium-ebpf`'s
+/// `NET4` / `NET6` declarations. Keep in sync with the eBPF side.
+#[cfg(target_os = "linux")]
+const BPF_NET_MAP_CAPACITY: usize = 1024;
+
+#[cfg(target_os = "linux")]
+fn endpoint_counts(
+    allow: &[crate::resolve::Endpoint],
+    deny: &[crate::resolve::Endpoint],
+) -> (usize, usize) {
+    use std::net::IpAddr;
+    let mut v4 = 0usize;
+    let mut v6 = 0usize;
+    for ep in allow.iter().chain(deny.iter()) {
+        match ep.addr {
+            IpAddr::V4(_) => v4 += 1,
+            IpAddr::V6(_) => v6 += 1,
+        }
+    }
+    (v4, v6)
 }
 
 #[cfg(target_os = "linux")]

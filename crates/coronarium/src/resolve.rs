@@ -19,7 +19,12 @@ pub struct Endpoint {
 }
 
 /// Cap the number of /N expansions we're willing to materialise into the map.
-/// A /16 is ~65k entries; beyond that the user should pick a tighter prefix.
+///
+/// Note: the eBPF `NET4` / `NET6` maps in `crates/coronarium-ebpf` are
+/// only sized for 1024 entries each *total*, so even one CIDR at this
+/// cap will overflow the map at attach time. Enforcer-side does the
+/// real bookkeeping (and bails with a friendly message) — the cap here
+/// is just to keep the per-rule allocation bounded.
 const MAX_CIDR_EXPANSION: usize = 65_536;
 
 pub struct Resolver {
