@@ -19,22 +19,52 @@ pub const TOTAL_SAMPLE_CAP: usize = 256;
 impl Stats {
     /// Merge an already-parsed event into the stats. Returns whether the
     /// event was kept in the sample buffer (for callers that want to know).
+    ///
+    /// Denied events are prioritised: if the per-kind or total cap is
+    /// already full, an incoming denied event displaces the oldest
+    /// non-denied sample (preferring same-kind) so the offending paths
+    /// still surface in the report. Without this, a flood of benign
+    /// events early in a run (e.g. pnpm install's first thousand
+    /// openat()s) crowds out the actual offenders that fired the
+    /// block-mode exit, leaving operators with "N denied" and no clue
+    /// which paths.
     pub fn ingest(&mut self, ev: Event) -> bool {
         self.observed += 1;
-        if ev.denied() {
+        let denied = ev.denied();
+        if denied {
             self.denied += 1;
         }
-        let existing = self
-            .samples
-            .iter()
-            .filter(|s| s.kind_tag() == ev.kind_tag())
-            .count();
-        if existing < PER_KIND_CAP && self.samples.len() < TOTAL_SAMPLE_CAP {
+        let kind = ev.kind_tag();
+        let same_kind = self.samples.iter().filter(|s| s.kind_tag() == kind).count();
+        let kind_room = same_kind < PER_KIND_CAP;
+        let total_room = self.samples.len() < TOTAL_SAMPLE_CAP;
+        if kind_room && total_room {
             self.samples.push(ev);
-            true
-        } else {
-            false
+            return true;
         }
+
+        if denied {
+            // Prefer evicting an older non-denied sample of the same
+            // kind (keeps inter-kind ratios honest). If the total cap
+            // is the binding constraint, fall back to any non-denied.
+            let victim = self
+                .samples
+                .iter()
+                .position(|s| !s.denied() && s.kind_tag() == kind)
+                .or_else(|| {
+                    if !total_room {
+                        self.samples.iter().position(|s| !s.denied())
+                    } else {
+                        None
+                    }
+                });
+            if let Some(idx) = victim {
+                self.samples.remove(idx);
+                self.samples.push(ev);
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -86,6 +116,45 @@ mod tests {
         // Later-kind events can still get a sample slot up to their cap.
         s.ingest(exec());
         assert_eq!(s.samples.len(), PER_KIND_CAP + 1);
+    }
+
+    #[test]
+    fn denied_events_displace_older_non_denied_when_kind_full() {
+        // Simulate a flood of benign opens followed by a real deny.
+        // Without prioritisation the deny would be dropped on the
+        // floor and the report would say "1 denied" with no path.
+        let mut s = Stats::default();
+        for i in 0..PER_KIND_CAP {
+            s.ingest(open(&format!("/benign/{i}"), false));
+        }
+        // Cap full — next benign drops.
+        assert!(!s.ingest(open("/benign/extra", false)));
+        // But a denied open displaces an older benign of the same kind.
+        assert!(s.ingest(open("/etc/shadow", true)));
+        assert_eq!(s.samples.len(), PER_KIND_CAP);
+        assert!(
+            s.samples
+                .iter()
+                .any(|e| matches!(e, Event::Open { filename, denied: true, .. } if filename == "/etc/shadow")),
+            "denied sample must survive — operators need the offender path"
+        );
+        assert_eq!(s.denied, 1);
+        assert_eq!(s.observed, PER_KIND_CAP as u64 + 2);
+    }
+
+    #[test]
+    fn denied_events_dropped_only_when_no_non_denied_to_evict() {
+        // Pathological: every sample slot is already a denied event.
+        // We don't unbound memory, so the new denied event is dropped.
+        let mut s = Stats::default();
+        for i in 0..PER_KIND_CAP {
+            s.ingest(open(&format!("/x/{i}"), true));
+        }
+        assert_eq!(s.samples.len(), PER_KIND_CAP);
+        assert!(!s.ingest(open("/y", true)));
+        // But the denied counter still increments — it tracks all
+        // denials, regardless of whether the sample buffer kept one.
+        assert_eq!(s.denied, PER_KIND_CAP as u64 + 1);
     }
 
     #[test]

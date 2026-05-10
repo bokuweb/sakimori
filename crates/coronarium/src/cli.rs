@@ -433,6 +433,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::CheckPolicy { policy } => {
             let p = policy::Policy::from_file(&policy)
                 .with_context(|| format!("loading {}", policy.display()))?;
+            p.validate(p.mode)?;
             for w in p.lint() {
                 eprintln!("warning: {w}");
             }
@@ -669,6 +670,7 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
         Some(Mode::Block) => policy::Mode::Block,
         None => policy.mode,
     };
+    policy.validate(mode)?;
     for w in policy.lint() {
         log::warn!("{w}");
     }
