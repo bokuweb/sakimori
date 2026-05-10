@@ -176,6 +176,25 @@ impl Supervisor {
         let mut cmd = Command::new(program);
         cmd.args(rest);
 
+        // Apply env policy *before* spawn. This is genuine prevention,
+        // not tripwire: the child's execve sees an envp we control. Any
+        // grandchildren (postinstall scripts, etc.) inherit the scrubbed
+        // set automatically, so a stripped AWS_SECRET_ACCESS_KEY stays
+        // stripped all the way down.
+        if self.policy.env.is_active() {
+            let parent: Vec<(String, String)> = std::env::vars().collect();
+            let (kept, removed) = self.policy.env.resolve(parent);
+            cmd.env_clear();
+            cmd.envs(kept);
+            if !removed.is_empty() {
+                log::info!(
+                    "env policy: stripped {} variable(s) from child env: {}",
+                    removed.len(),
+                    removed.join(", ")
+                );
+            }
+        }
+
         // Enroll the child into our cgroup *before* it execs. On Linux we use
         // pre_exec; other platforms just run the command unconfined.
         #[cfg(target_os = "linux")]

@@ -512,6 +512,16 @@ file:
 process:
   deny_exec:
     - /usr/bin/nc
+
+env:
+  # Scrub the env block before the child execs. Real prevention,
+  # not a tripwire — `Command::env_clear()` happens before
+  # `execve`, so the child (and its postinstall grandchildren)
+  # literally cannot read what's been stripped.
+  default: pass                  # `pass` keeps everything not on `deny`;
+                                 # `clear` flips it to allowlist mode
+  allow: [PATH, HOME, "GITHUB_*"]
+  deny: ["AWS_*", "*_TOKEN", "*_SECRET", NPM_TOKEN]
 ```
 
 **First-time setup pattern** — run in `mode: audit` once, inspect

@@ -215,8 +215,26 @@ pub fn run() -> Result<()> {
     // them. Resolve via `where`-backed lookup so the supervised
     // command matches what users see in their shell.
     let resolved = resolve_program(program);
-    let status = Command::new(&resolved)
-        .args(rest)
+    let mut child_cmd = Command::new(&resolved);
+    child_cmd.args(rest);
+
+    // Apply env policy before spawn (real prevention — child's process
+    // env block is the one we hand it, not the inherited one).
+    if policy.env.is_active() {
+        let parent: Vec<(String, String)> = std::env::vars().collect();
+        let (kept, removed) = policy.env.resolve(parent);
+        child_cmd.env_clear();
+        child_cmd.envs(kept);
+        if !removed.is_empty() {
+            log::info!(
+                "env policy: stripped {} variable(s) from child env: {}",
+                removed.len(),
+                removed.join(", ")
+            );
+        }
+    }
+
+    let status = child_cmd
         .status()
         .with_context(|| {
             format!(

@@ -21,6 +21,7 @@ pub mod stats;
 
 pub use events::Event;
 pub use policy::{
-    DefaultDecision, FilePolicy, Mode, NetRule, NetworkPolicy, Policy, ProcessPolicy,
+    DefaultDecision, EnvDefault, EnvPolicy, FilePolicy, Mode, NetRule, NetworkPolicy, Policy,
+    ProcessPolicy,
 };
 pub use stats::Stats;
