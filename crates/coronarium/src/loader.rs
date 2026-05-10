@@ -194,10 +194,31 @@ impl Supervisor {
         #[cfg(not(target_os = "linux"))]
         let _ = cgroup_path;
 
-        let status = cmd
-            .status()
-            .await
-            .with_context(|| format!("spawning {program}"))?;
+        let status = cmd.status().await.with_context(|| {
+            // sudo replaces PATH with secure_path even with `-E`, so a
+            // non-absolute program name run under sudo will look up
+            // against /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            // and miss anything installed elsewhere (pnpm, cargo,
+            // rustup-installed toolchains, …). Surface the workaround
+            // in the error rather than letting users debug it raw.
+            let is_relative = !std::path::Path::new(program).is_absolute();
+            let under_sudo =
+                std::env::var_os("SUDO_USER").is_some() || std::env::var_os("SUDO_UID").is_some();
+            if is_relative && under_sudo {
+                format!(
+                    "spawning {program}: not found on sudo's PATH. \
+                     sudo strips PATH (`-E` doesn't preserve it); pass it \
+                     explicitly with `sudo -E env \"PATH=$PATH\" {} ...` \
+                     or use an absolute path",
+                    std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                        .unwrap_or_else(|| "coronarium".into()),
+                )
+            } else {
+                format!("spawning {program}")
+            }
+        })?;
         Ok(status.code().unwrap_or(1))
     }
 
