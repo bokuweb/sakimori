@@ -218,6 +218,45 @@ impl Policy {
         }
     }
 
+    /// Reject policy shapes that would silently mis-enforce. Unlike
+    /// [`Self::lint`], these are hard errors — the supervisor must
+    /// refuse to start rather than let the operator believe a rule is
+    /// active when it isn't.
+    ///
+    /// `effective_mode` is the post-CLI-override mode (e.g. `--mode
+    /// block` over an audit-default policy file). Validation only
+    /// trips when the *effective* mode is block, since audit runs are
+    /// allowed to exceed enforcement-layer limits — they're just
+    /// reporting.
+    ///
+    /// Currently checks:
+    ///
+    /// - `file.deny.len() > FILE_DENY_MAX_ENTRIES` under
+    ///   `mode: block`. The kernel-side prefix map only holds 8 slots;
+    ///   entries past the cap get audit-tagged (`denied: true` in the
+    ///   JSON log) but the kernel never fires `bpf_send_signal` on
+    ///   them. The audit tag still counts toward `stats.denied`,
+    ///   tripping the block-mode non-zero exit *without* the offender
+    ///   actually being killed — a failure mode that's nearly
+    ///   impossible to debug from logs alone.
+    pub fn validate(&self, effective_mode: Mode) -> Result<()> {
+        use coronarium_common::FILE_DENY_MAX_ENTRIES;
+        if matches!(effective_mode, Mode::Block)
+            && self.file.deny.len() > FILE_DENY_MAX_ENTRIES as usize
+        {
+            bail!(
+                "file.deny has {} entries but kernel-side block supports at most {} \
+                 (mode: block). Entries past the cap would be audit-tagged but not \
+                 actually blocked, while still tripping the non-zero exit — refusing \
+                 to start. Either trim the list, split into multiple policies, or \
+                 run with `--mode audit`.",
+                self.file.deny.len(),
+                FILE_DENY_MAX_ENTRIES,
+            );
+        }
+        Ok(())
+    }
+
     /// Spot obviously-redundant policy shapes. Kept small on purpose —
     /// prefer clear docs over implicit behaviour.
     ///
@@ -500,6 +539,31 @@ network:
             !msgs.iter().any(|m| m.contains("file.deny")),
             "got: {msgs:?}"
         );
+    }
+
+    #[test]
+    fn validate_rejects_too_many_file_deny_in_block_mode() {
+        let mut p = Policy::permissive_audit();
+        p.file.default = DefaultDecision::Allow;
+        for i in 0..9 {
+            p.file.deny.push(format!("/x/{i}"));
+        }
+        // Audit mode: reporting-only, allowed to exceed the cap.
+        assert!(p.validate(Mode::Audit).is_ok());
+        // Block mode: silent mis-enforcement — must refuse.
+        let err = p.validate(Mode::Block).unwrap_err().to_string();
+        assert!(err.contains("file.deny"), "got: {err}");
+        assert!(err.contains("9"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_exactly_the_kernel_cap() {
+        use coronarium_common::FILE_DENY_MAX_ENTRIES;
+        let mut p = Policy::permissive_audit();
+        for i in 0..FILE_DENY_MAX_ENTRIES {
+            p.file.deny.push(format!("/x/{i}"));
+        }
+        assert!(p.validate(Mode::Block).is_ok());
     }
 
     #[test]

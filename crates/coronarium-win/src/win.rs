@@ -92,6 +92,7 @@ pub fn run() -> Result<()> {
         Some(CliMode::Block) => Mode::Block,
         None => policy.mode,
     };
+    policy.validate(mode)?;
     for w in policy.lint() {
         log::warn!("{w}");
     }
