@@ -3,3 +3,8 @@
 /osv-mirror/mal.json
 /typosquat-data/top.json
 __pycache__/
+
+# coronarium-win has its own [workspace]; its target/ + lockfile
+# are not part of the main workspace and shouldn't be tracked.
+crates/coronarium-win/target/
+crates/coronarium-win/Cargo.lock

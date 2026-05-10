@@ -99,19 +99,30 @@ impl Policy {
 
     /// Spot obviously-redundant policy shapes. Kept small on purpose —
     /// prefer clear docs over implicit behaviour.
+    ///
+    /// `default: deny + deny: [...]` is only redundant when there are
+    /// no `allow` entries: with an allow overlay, deny is what
+    /// re-blocks sensitive subtrees of an otherwise-allowed parent
+    /// (e.g. `allow: [/etc/]` + `deny: [/etc/shadow]`).
     pub fn lint(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if !self.network.deny.is_empty() && matches!(self.network.default, DefaultDecision::Deny) {
+        if !self.network.deny.is_empty()
+            && matches!(self.network.default, DefaultDecision::Deny)
+            && self.network.allow.is_empty()
+        {
             out.push(
-                "network.deny is non-empty but network.default is already 'deny' — \
-                 the deny list is redundant."
+                "network.deny is non-empty but network.default is already 'deny' \
+                 with no allow overlay — the deny list is redundant."
                     .to_string(),
             );
         }
-        if !self.file.deny.is_empty() && matches!(self.file.default, DefaultDecision::Deny) {
+        if !self.file.deny.is_empty()
+            && matches!(self.file.default, DefaultDecision::Deny)
+            && self.file.allow.is_empty()
+        {
             out.push(
-                "file.deny is non-empty but file.default is already 'deny' — \
-                 the deny list is redundant."
+                "file.deny is non-empty but file.default is already 'deny' \
+                 with no allow overlay — the deny list is redundant."
                     .to_string(),
             );
         }
@@ -222,6 +233,34 @@ network:
         let msgs = p.lint();
         assert!(msgs.iter().any(|m| m.contains("network.deny")));
         assert!(msgs.iter().any(|m| m.contains("file.deny")));
+    }
+
+    #[test]
+    fn lint_does_not_flag_deny_when_allow_overlay_present() {
+        // default-deny with an allow overlay: deny rules carve sensitive
+        // subtrees out of an otherwise-allowed parent. Not redundant.
+        let mut p = Policy::permissive_audit();
+        p.network.default = DefaultDecision::Deny;
+        p.network.allow.push(NetRule {
+            target: "github.com".into(),
+            ports: vec![443],
+        });
+        p.network.deny.push(NetRule {
+            target: "x".into(),
+            ports: vec![],
+        });
+        p.file.default = DefaultDecision::Deny;
+        p.file.allow.push("/etc/".into());
+        p.file.deny.push("/etc/shadow".into());
+        let msgs = p.lint();
+        assert!(
+            !msgs.iter().any(|m| m.contains("network.deny")),
+            "got: {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("file.deny")),
+            "got: {msgs:?}"
+        );
     }
 
     #[test]
