@@ -209,10 +209,25 @@ pub fn run() -> Result<()> {
         None
     };
 
-    let status = Command::new(program)
+    // Rust's `Command::new` on Windows does NOT honour PATHEXT, so a
+    // bare `pnpm` (a `.cmd` shim from pnpm/action-setup), `yarn`,
+    // `npm`, etc. would fail to spawn even though `where pnpm` finds
+    // them. Resolve via `where`-backed lookup so the supervised
+    // command matches what users see in their shell.
+    let resolved = resolve_program(program);
+    let status = Command::new(&resolved)
         .args(rest)
         .status()
-        .with_context(|| format!("spawning {program}"))?;
+        .with_context(|| {
+            format!(
+                "spawning {program}{}",
+                if resolved.as_os_str() == std::ffi::OsStr::new(program) {
+                    ": program not found on PATH (PATHEXT-aware lookup via `where` returned nothing)"
+                } else {
+                    ""
+                }
+            )
+        })?;
 
     // Drain tail events. ETW is async; bursts take a second or so to
     // percolate through the buffering path into our callback.
