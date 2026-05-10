@@ -329,11 +329,24 @@ fn spawn_ringbuf_drain(
             return;
         };
 
+        // /proc reader is constructed once and shared per drain. Reads
+        // are stateless so concurrency isn't an issue, but allocating
+        // a new ProcFs per event would be silly.
+        let proc_lookup = sakimori_core::attribution::ProcFs::new();
+        let supervisor_pid = std::process::id();
+
         loop {
             while let Some(item) = ring.next() {
                 let bytes: &[u8] = &item;
                 let mut s = stats.lock().await;
-                ingest(&mut s, bytes, &file_matcher, &exec_matcher);
+                ingest(
+                    &mut s,
+                    bytes,
+                    &file_matcher,
+                    &exec_matcher,
+                    Some(&proc_lookup),
+                    supervisor_pid,
+                );
             }
             if stop.load(Ordering::SeqCst) {
                 break;
@@ -348,6 +361,8 @@ pub(crate) fn ingest(
     raw: &[u8],
     file_matcher: &FileMatcher,
     exec_matcher: &ExecMatcher,
+    attribution_lookup: Option<&dyn sakimori_core::attribution::Lookup>,
+    supervisor_pid: u32,
 ) {
     let Some(mut ev) = events::decode(raw) else {
         stats.lost += 1;
@@ -371,6 +386,14 @@ pub(crate) fn ingest(
             *denied = true;
         }
         _ => {}
+    }
+
+    // Best-effort PPid-chain lookup. Skipping when no resolver is
+    // wired in (mocking, tests, or `--no-attribution`); also a quiet
+    // no-op when the event's pid has already exited.
+    if let Some(lookup) = attribution_lookup {
+        let attr = sakimori_core::attribution::attribute(ev.pid(), lookup, &[supervisor_pid]);
+        ev.set_source(attr);
     }
 
     stats.ingest(ev);

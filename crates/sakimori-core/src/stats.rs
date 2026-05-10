@@ -80,6 +80,7 @@ mod tests {
             filename: filename.into(),
             flags: 0,
             denied,
+            source: None,
         }
     }
     fn exec() -> Event {
@@ -90,6 +91,7 @@ mod tests {
             filename: "/bin/x".into(),
             argv0: "x".into(),
             denied: false,
+            source: None,
         }
     }
 
@@ -179,6 +181,7 @@ mod tests {
                 protocol: 6,
                 denied: false,
                 hostname: None,
+                source: None,
             });
         }
         assert_eq!(s.samples.len(), 3 * PER_KIND_CAP);

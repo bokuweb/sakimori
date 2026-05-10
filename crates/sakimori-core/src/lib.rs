@@ -12,6 +12,7 @@
 //! the respective binary crates.
 
 pub mod actions;
+pub mod attribution;
 pub mod deps;
 pub mod events;
 pub mod html;

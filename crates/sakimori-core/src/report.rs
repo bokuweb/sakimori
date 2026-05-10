@@ -133,6 +133,12 @@ pub fn render_step_summary(command: &str, stats: &Stats) -> String {
         "binary",
         exec_breakdown(&stats.samples),
     );
+    push_breakdown_table(
+        &mut out,
+        "Sources — events grouped by originating package manager",
+        "source",
+        source_breakdown(&stats.samples),
+    );
     out
 }
 
@@ -230,6 +236,36 @@ fn exec_breakdown(samples: &[Event]) -> Vec<BreakdownRow> {
     finalise(acc)
 }
 
+/// Group events by the package manager that ultimately spawned them
+/// (if any). Events without source attribution — either the
+/// supervisor wasn't given a [`Lookup`], the pid had already
+/// exited, or no package manager was found in the chain — collapse
+/// into a single `(unattributed)` row so they're still visible.
+/// Empty when no event in the sample carries source info, in which
+/// case the table is suppressed entirely (see push_breakdown_table).
+fn source_breakdown(samples: &[Event]) -> Vec<BreakdownRow> {
+    // If nothing carries attribution at all, return empty so the
+    // table is hidden — saves the user from a useless "all
+    // unattributed" row on macOS / Windows.
+    if !samples.iter().any(|e| e.source().is_some()) {
+        return Vec::new();
+    }
+    let mut acc: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for ev in samples {
+        let label = ev
+            .source()
+            .and_then(|a| a.package_manager)
+            .map(|pm| pm.label().to_string())
+            .unwrap_or_else(|| "(unattributed)".to_string());
+        let e = acc.entry(label).or_default();
+        e.0 += 1;
+        if ev.denied() {
+            e.1 += 1;
+        }
+    }
+    finalise(acc)
+}
+
 /// Sort breakdown rows: denied-first (so offenders bubble to the
 /// top of the truncated table), then by raw count desc, then label
 /// asc for stable output.
@@ -273,6 +309,7 @@ mod tests {
             protocol: 6,
             denied,
             hostname: host.map(|s| s.into()),
+            source: None,
         }
     }
     fn ev_open(filename: &str, denied: bool) -> Event {
@@ -283,6 +320,7 @@ mod tests {
             filename: filename.into(),
             flags: 0,
             denied,
+            source: None,
         }
     }
     fn ev_exec(filename: &str, denied: bool) -> Event {
@@ -293,6 +331,7 @@ mod tests {
             filename: filename.into(),
             argv0: filename.into(),
             denied,
+            source: None,
         }
     }
 
@@ -381,5 +420,53 @@ mod tests {
         let s = render_step_summary("cmd", &stats);
         assert!(s.contains("⚠️"));
         assert!(s.contains("7 events were dropped"));
+    }
+
+    #[test]
+    fn sources_table_appears_only_when_any_event_has_attribution() {
+        use crate::attribution::{Attribution, PackageManager, ProcInfo};
+
+        // No source attribution anywhere → table suppressed.
+        let mut stats = Stats::default();
+        stats.ingest(ev_connect(Some("a.example"), "1.1.1.1", 443, false));
+        let s = render_step_summary("cmd", &stats);
+        assert!(
+            !s.contains("### Sources"),
+            "with zero attribution the section must be hidden, got:\n{s}"
+        );
+
+        // Two attributed events (npm + pip) plus one unattributed —
+        // table renders all three rows, npm + pip + (unattributed).
+        let mut stats = Stats::default();
+        let mut e1 = ev_connect(Some("registry.npmjs.org"), "1.1.1.1", 443, false);
+        e1.set_source(Some(Attribution {
+            chain: vec![ProcInfo {
+                pid: 10,
+                argv0: "npm".into(),
+                argv: "npm install foo".into(),
+            }],
+            package_manager: Some(PackageManager::Npm),
+            root_argv: Some("npm install foo".into()),
+        }));
+        let mut e2 = ev_open("/tmp/whl", true);
+        e2.set_source(Some(Attribution {
+            chain: vec![ProcInfo {
+                pid: 11,
+                argv0: "pip".into(),
+                argv: "pip install bar".into(),
+            }],
+            package_manager: Some(PackageManager::Pip),
+            root_argv: Some("pip install bar".into()),
+        }));
+        let e3 = ev_exec("/bin/sh", false); // no source attached
+        stats.ingest(e1);
+        stats.ingest(e2);
+        stats.ingest(e3);
+
+        let s = render_step_summary("cmd", &stats);
+        assert!(s.contains("### Sources"), "section header missing");
+        assert!(s.contains("`npm`"));
+        assert!(s.contains("`pip`"));
+        assert!(s.contains("(unattributed)"));
     }
 }

@@ -316,6 +316,7 @@ fn handle_process_event(
         filename,
         argv0,
         denied,
+        source: None,
     };
     stats.lock().unwrap().ingest(ev);
 }
@@ -387,6 +388,7 @@ fn handle_network_event(
         protocol: 6,
         denied,
         hostname: None,
+        source: None,
     };
     stats.lock().unwrap().ingest(ev);
 }
@@ -421,6 +423,7 @@ fn handle_file_event(
         filename: filename_norm,
         flags: 0,
         denied,
+        source: None,
     };
     stats.lock().unwrap().ingest(ev);
 }

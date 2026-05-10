@@ -531,6 +531,7 @@ mod tests {
             protocol: 6,
             denied: false,
             hostname: hostname.map(|s| s.to_string()),
+            source: None,
         });
         s
     }
@@ -581,6 +582,7 @@ mod tests {
             filename: "/bin/sh".into(),
             argv0: "sh".into(),
             denied: false,
+            source: None,
         });
         s.ingest(Event::Open {
             pid: 1,
@@ -589,6 +591,7 @@ mod tests {
             filename: "/etc/passwd".into(),
             flags: 0,
             denied: false,
+            source: None,
         });
         let out = render(&p, &s, meta());
         // Both rows should render; the host cell is simply empty for
