@@ -456,6 +456,37 @@ coronarium deps watch ~/code --min-age 7d --notifier stdout
 See [packaging/macos/README.md](packaging/macos/README.md) for the
 launchd plist.
 
+### `actions audit`
+
+Static analysis for `.github/workflows/*.yml`. Walks every `uses:`
+in the workflow and flags any reference that isn't pinned to a
+40-char commit SHA — the supply-chain analogue of an unpinned
+dependency. Offline, no GitHub API calls.
+
+```bash
+coronarium actions audit .github/workflows/*.yml
+
+# Machine-readable.
+coronarium actions audit --format json .github/workflows/ci.yml
+
+# Treat first-party (actions/*, github/*) mutable refs as blocking
+# too — useful once you've already pinned all your third-party deps.
+coronarium actions audit --strict .github/workflows/*.yml
+```
+
+Severity:
+
+| | when |
+|---|---|
+| **error** | third-party action with mutable tag/branch (`foo/bar@v1`, `foo/bar@main`) |
+| **warn**  | first-party (`actions/*`, `github/*`) mutable tag, or docker image without `@sha256:` digest |
+| **ok**    | 40-char SHA pin, local action (`./...`), docker image with digest |
+
+Exit code: `1` when at least one error is present (or any warn,
+under `--strict`); `0` otherwise. Composite-action `action.yml`
+files are ignored — only workflow files (those with a top-level
+`jobs:` block) are walked.
+
 ### `run`
 
 Wraps a command under eBPF (Linux) / ETW (Windows) supervision and
