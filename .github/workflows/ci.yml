@@ -642,21 +642,49 @@ jobs:
               - /usr/bin/whoami
           EOF
 
-      # The job action under test. pre.js honours the pre-set
-      # SAKIMORI_BIN / SAKIMORI_BPF_OBJ and skips the gh release
-      # download path, so this exercises the JS-action wiring against
-      # the locally-built binary instead of the published release.
-      #
-      # Note: `uses: ./job` would NOT trigger pre/post hooks ("pre
-      # execution is not supported for local action"), so we resolve
-      # the action at the PR head SHA (or the push SHA) instead. Same
-      # repo, so the ref is always public and reachable.
-      - uses: bokuweb/sakimori/job@${{ github.sha }}
-        with:
-          policy: ${{ runner.temp }}/policy.yml
-          mode: audit
-          log: ${{ runner.temp }}/sakimori-job.log.json
-          html: ${{ runner.temp }}/sakimori-job.html
+      # Start the daemon by hand instead of via `uses: bokuweb/sakimori/job`.
+      # Two GitHub-Actions limitations make the wrapper unreachable from
+      # CI on the same PR:
+      #   1. Local refs (`uses: ./job`) silently skip pre/post hooks,
+      #      so the daemon never starts and the assertion can't run.
+      #   2. Step-level `uses:` doesn't accept `${{ }}` expressions,
+      #      so we can't pin to ${github.sha} of the current PR either.
+      # The full wrapper is exercised post-release via consumer-smoke.yml
+      # against the published release; here we exercise the daemon's
+      # cross-step observation mechanics, which is the actually-novel
+      # piece. The wrapper's role is just to invoke this same CLI from
+      # pre.js/post.js.
+      - name: Start daemon (mimics pre.js)
+        run: |
+          set -euo pipefail
+          # Background the daemon attached to *this* step's parent pid
+          # (= Runner.Worker, the common ancestor of every step in the
+          # job). Detached + stdio redirected so it survives the step.
+          setsid sudo -n -E "$SAKIMORI_BIN" daemon start \
+            --observe-cgroup-of "$PPID" \
+            --policy "$RUNNER_TEMP/policy.yml" \
+            --mode audit \
+            --log "$RUNNER_TEMP/sakimori-job.log.json" \
+            --html "$RUNNER_TEMP/sakimori-job.html" \
+            --pid-file "$RUNNER_TEMP/sakimori-job.pid" \
+            > "$RUNNER_TEMP/sakimori-daemon.stdout.log" \
+            2> "$RUNNER_TEMP/sakimori-daemon.stderr.log" \
+            < /dev/null &
+          disown
+          # Poll for ready (pid-file appears only after BPF attach
+          # succeeds). 20s budget matches pre.js.
+          deadline=$(( $(date +%s) + 20 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            if [ -f "$RUNNER_TEMP/sakimori-job.pid" ]; then
+              echo "daemon ready (pid $(cat "$RUNNER_TEMP/sakimori-job.pid")), observing cgroup of PPID=$PPID"
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "::error::daemon did not become ready in 20s"
+          echo "--- daemon stderr ---"
+          cat "$RUNNER_TEMP/sakimori-daemon.stderr.log" || true
+          exit 1
 
       # Three separate steps the daemon must observe. If cross-step
       # cgroup inheritance is broken, only one will appear in the log.
