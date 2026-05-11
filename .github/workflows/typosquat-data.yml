@@ -3,7 +3,7 @@ name: typosquat-data
 # Weekly refresh of the top-N-per-ecosystem list that fuels
 # `--typosquat-mirror` on the proxy. See
 # `scripts/build-typosquat-data.py` for the producer and
-# `crates/coronarium-proxy/src/typosquat.rs::MirroredDetector`
+# `crates/sakimori-proxy/src/typosquat.rs::MirroredDetector`
 # for the consumer.
 #
 # Weekly (not every 10 min like the OSV mirror) because download
@@ -57,20 +57,20 @@ jobs:
           cp typosquat-data/top.json "$work/top.json"
 
           cat > "$work/README.md" <<'EOF'
-          # coronarium typosquat mirror data
+          # sakimori typosquat mirror data
 
           Auto-generated on every run of `.github/workflows/typosquat-data.yml`
           in the main branch. **Don't edit this branch by hand** — any
           manual commits get force-pushed over by the next cron.
 
           Consumers:
-          - `https://raw.githubusercontent.com/bokuweb/coronarium/typosquat-data/top.json`
+          - `https://raw.githubusercontent.com/bokuweb/sakimori/typosquat-data/top.json`
 
           Schema: see `scripts/build-typosquat-data.py` on `main`.
           EOF
 
           cd "$work"
-          git config user.name 'coronarium-typosquat-bot'
+          git config user.name 'sakimori-typosquat-bot'
           git config user.email 'typosquat-bot@users.noreply.github.com'
           git checkout -q -b typosquat-data
           git add .

@@ -1,16 +1,16 @@
-name: "coronarium / comment"
-description: "Post a coronarium audit summary as a pull-request comment."
+name: "sakimori / comment"
+description: "Post a sakimori audit summary as a pull-request comment."
 author: "bokuweb"
 
 inputs:
   log:
-    description: "Path to the coronarium JSON log (default matches the main action)."
+    description: "Path to the sakimori JSON log (default matches the main action)."
     required: false
-    default: "coronarium.log.json"
+    default: "sakimori.log.json"
   marker:
     description: "HTML comment marker used to upsert a single comment per PR instead of appending."
     required: false
-    default: "<!-- coronarium-report -->"
+    default: "<!-- sakimori-report -->"
   fail-on-denied:
     description: "Set to 'true' to make this step exit non-zero when denied>0 (after posting)."
     required: false
@@ -18,7 +18,7 @@ inputs:
   title:
     description: "Heading shown at the top of the comment."
     required: false
-    default: "coronarium report"
+    default: "sakimori report"
   artifact-name:
     description: "Name of the uploaded artifact that contains report.html. When set, the comment includes a one-liner to download + open it."
     required: false
@@ -26,7 +26,7 @@ inputs:
   html-filename:
     description: "File name of the HTML report inside the artifact."
     required: false
-    default: "coronarium-report.html"
+    default: "sakimori-report.html"
 
 runs:
   using: composite
@@ -47,7 +47,7 @@ runs:
         fi
 
         if [[ ! -f "${LOG}" ]]; then
-          echo "::error::log file '${LOG}' not found — did the coronarium run step complete?"
+          echo "::error::log file '${LOG}' not found — did the sakimori run step complete?"
           exit 1
         fi
 
@@ -59,7 +59,7 @@ runs:
           # Scope destination by run-id so re-runs / parallel PRs don't clobber
           # each other, and `rm -rf` first so `gh run download` (which refuses
           # to overwrite existing files) works on the second+ invocation.
-          dir="/tmp/coronarium-${GITHUB_RUN_ID}"
+          dir="/tmp/sakimori-${GITHUB_RUN_ID}"
           html="${dir}/${{ inputs.html-filename }}"
           oneliner="rm -rf ${dir} && gh run download ${GITHUB_RUN_ID} -R ${GITHUB_REPOSITORY} -n ${{ inputs.artifact-name }} -D ${dir} && (open ${html} 2>/dev/null || xdg-open ${html} 2>/dev/null || echo \"open file://${html}\")"
         fi
@@ -137,18 +137,18 @@ runs:
           --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -n1)
 
         if [[ -n "${existing}" ]]; then
-          echo "Updating existing coronarium comment ${existing}"
+          echo "Updating existing sakimori comment ${existing}"
           gh api -X PATCH "repos/${repo}/issues/comments/${existing}" \
             -f body="${body}" >/dev/null
         else
-          echo "Creating new coronarium comment on PR #${pr_number}"
+          echo "Creating new sakimori comment on PR #${pr_number}"
           gh pr comment "${pr_number}" --repo "${repo}" --body "${body}"
         fi
 
         if [[ "${FAIL_ON_DENIED}" == "true" ]]; then
           denied=$(python3 -c 'import json,sys;print(json.load(open("'"${LOG}"'"))["denied"])')
           if [[ "${denied}" != "0" ]]; then
-            echo "::error::coronarium recorded ${denied} denied events"
+            echo "::error::sakimori recorded ${denied} denied events"
             exit 1
           fi
         fi

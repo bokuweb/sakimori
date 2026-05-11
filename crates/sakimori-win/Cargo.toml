@@ -1,0 +1,29 @@
+[package]
+name = "sakimori-win"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "ETW-based audit counterpart to sakimori (Windows). Experimental."
+
+# Own workspace so the Windows-specific deps don't pollute the main Linux
+# workspace.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive", "env"] }
+ipnet = "2"
+sakimori-core = { path = "../sakimori-core" }
+sakimori-common = { path = "../sakimori-common", features = ["user"] }
+
+[target.'cfg(windows)'.dependencies]
+ferrisetw = "1.2"
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Build `osv-mirror/mal.json` — the coronarium known-malicious mirror.
+Build `osv-mirror/mal.json` — the sakimori known-malicious mirror.
 
 Runs as a scheduled GitHub Action (see .github/workflows/osv-mirror.yml).
 Downloads OSV.dev's per-ecosystem bulk zip from
 `https://storage.googleapis.com/osv-vulnerabilities/` (public, no auth),
 filters to malicious-package advisories, and writes a compact JSON
-file the coronarium proxy consumes at runtime.
+file the sakimori proxy consumes at runtime.
 
 Why pre-filter?  OSV ships thousands of ordinary CVEs / GHSAs per
 ecosystem; our proxy only wants the malicious ones (MAL-* IDs +
@@ -31,9 +31,9 @@ so we amortise every byte per row.
     }
 
 Each entry is `[eco, name, version, id]`:
-- `eco`  uses the coronarium ecosystem labels
+- `eco`  uses the sakimori ecosystem labels
   (`crates | npm | pypi | nuget` — matches
-  `coronarium_core::deps::Ecosystem::label`).
+  `sakimori_core::deps::Ecosystem::label`).
 - `version` is a single affected version, or `"*"` for
   "every version" when the advisory didn't list specifics. The
   consumer's lookup uses `(eco, name, version)` exact match or falls
@@ -60,7 +60,7 @@ import urllib.request
 import zipfile
 
 ECOSYSTEMS = {
-    # OSV bucket folder → coronarium ecosystem label
+    # OSV bucket folder → sakimori ecosystem label
     "npm": "npm",
     "PyPI": "pypi",
     "crates.io": "crates",
@@ -70,7 +70,7 @@ BUCKET = "https://storage.googleapis.com/osv-vulnerabilities"
 
 
 def is_malicious(advisory: dict) -> bool:
-    """Same rule as coronarium_proxy::osv::is_malicious in Rust — keep
+    """Same rule as sakimori_proxy::osv::is_malicious in Rust — keep
     them aligned. An advisory counts as a malicious-package flag if
     any of:
       1. ID starts with `MAL-`, OR
@@ -121,7 +121,7 @@ def download_zip(eco_folder: str) -> zipfile.ZipFile:
     # that too; we just keep it simple).
     url = f"{BUCKET}/{eco_folder}/all.zip"
     print(f"fetching {url}", file=sys.stderr)
-    req = urllib.request.Request(url, headers={"user-agent": "coronarium-osv-mirror/0.1"})
+    req = urllib.request.Request(url, headers={"user-agent": "sakimori-osv-mirror/0.1"})
     with urllib.request.urlopen(req, timeout=60) as r:
         data = r.read()
     return zipfile.ZipFile(io.BytesIO(data))

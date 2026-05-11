@@ -7,9 +7,9 @@ on:
 
 jobs:
   proxy-image:
-    # Build + push the coronarium-proxy container image to GHCR on
+    # Build + push the sakimori-proxy container image to GHCR on
     # every `v*` tag. Users consume it via:
-    #   docker run --rm -p 8910:8910 ghcr.io/bokuweb/coronarium-proxy:v0
+    #   docker run --rm -p 8910:8910 ghcr.io/bokuweb/sakimori-proxy:v0
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -32,11 +32,11 @@ jobs:
           # Skip the floating :v0 push for prereleases (v0.21.0-rc1 etc.)
           major=$(echo "$ref" | awk -F. '{print $1}')
           minor=$(echo "$ref" | awk -F. '{print $1"."$2}')
-          tags="ghcr.io/${GITHUB_REPOSITORY_OWNER}/coronarium-proxy:${ref}"
+          tags="ghcr.io/${GITHUB_REPOSITORY_OWNER}/sakimori-proxy:${ref}"
           if [[ "$ref" != *-* ]]; then
-            tags="${tags},ghcr.io/${GITHUB_REPOSITORY_OWNER}/coronarium-proxy:${minor}"
-            tags="${tags},ghcr.io/${GITHUB_REPOSITORY_OWNER}/coronarium-proxy:${major}"
-            tags="${tags},ghcr.io/${GITHUB_REPOSITORY_OWNER}/coronarium-proxy:latest"
+            tags="${tags},ghcr.io/${GITHUB_REPOSITORY_OWNER}/sakimori-proxy:${minor}"
+            tags="${tags},ghcr.io/${GITHUB_REPOSITORY_OWNER}/sakimori-proxy:${major}"
+            tags="${tags},ghcr.io/${GITHUB_REPOSITORY_OWNER}/sakimori-proxy:latest"
           fi
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6

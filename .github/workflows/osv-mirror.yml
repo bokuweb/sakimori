@@ -1,8 +1,8 @@
 name: osv-mirror
 
-# Scheduled refresh of `osv-mirror/mal.json` — the coronarium
+# Scheduled refresh of `osv-mirror/mal.json` — the sakimori
 # known-malicious denylist that proxies consume via
-# `https://raw.githubusercontent.com/<owner>/coronarium/osv-mirror-data/mal.json`.
+# `https://raw.githubusercontent.com/<owner>/sakimori/osv-mirror-data/mal.json`.
 #
 # Two triggers:
 #   - schedule: every 10 minutes (GitHub can add 5–15 min of drift,
@@ -60,27 +60,27 @@ jobs:
           cd main-ck
 
           # Stand up a tiny orphan working tree for the data branch.
-          # We don't want the rest of coronarium's history in there —
+          # We don't want the rest of sakimori's history in there —
           # just the mirror + a README explaining what this branch is.
           work=$(mktemp -d)
           git init -q "$work"
           cp osv-mirror/mal.json "$work/mal.json"
 
           cat > "$work/README.md" <<'EOF'
-          # coronarium OSV mirror data
+          # sakimori OSV mirror data
 
           Auto-generated on every run of `.github/workflows/osv-mirror.yml`
           in the main branch. **Don't edit this branch by hand** — any
           manual commits get force-pushed over by the next cron.
 
           Consumers:
-          - `https://raw.githubusercontent.com/bokuweb/coronarium/osv-mirror-data/mal.json`
+          - `https://raw.githubusercontent.com/bokuweb/sakimori/osv-mirror-data/mal.json`
 
           Schema: see `scripts/build-osv-mirror.py` on `main`.
           EOF
 
           cd "$work"
-          git config user.name 'coronarium-osv-bot'
+          git config user.name 'sakimori-osv-bot'
           git config user.email 'osv-bot@users.noreply.github.com'
           git checkout -q -b osv-mirror-data
           git add .

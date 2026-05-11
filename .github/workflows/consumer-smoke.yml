@@ -1,6 +1,6 @@
 name: consumer-smoke
 
-# Proves the published release is consumable as `bokuweb/coronarium@v0`.
+# Proves the published release is consumable as `bokuweb/sakimori@v0`.
 # Runs after a release is published, on manual dispatch, and on PRs
 # (so we exercise the PR-comment sub-action end-to-end).
 
@@ -16,12 +16,18 @@ permissions:
 
 jobs:
   use-as-action:
+    # The `bokuweb/sakimori@v0` published action still ships the pre-rename
+    # `coronarium-*.tar.gz` assets and exports `CORONARIUM_BIN`; on a
+    # pull_request run from this branch the workflow references
+    # `$SAKIMORI_BIN` and fails. Re-enable on PR after the first release
+    # under the new name has been cut.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       # The exact pattern third-party consumers will write.
-      - uses: bokuweb/coronarium@v0
+      - uses: bokuweb/sakimori@v0
         with:
           mode: audit
 
@@ -55,27 +61,27 @@ jobs:
             deny_exec:
               - /usr/bin/whoami
           EOF
-          sudo -E "$CORONARIUM_BIN" run \
+          sudo -E "$SAKIMORI_BIN" run \
             --policy /tmp/policy.yml \
-            --log coronarium.log.json \
-            --html coronarium-report.html \
+            --log sakimori.log.json \
+            --html sakimori-report.html \
             --summary "$GITHUB_STEP_SUMMARY" \
             -- /bin/sh -c '
-              echo hello from coronarium;
+              echo hello from sakimori;
               /usr/bin/whoami >/dev/null 2>&1 || true;
               cat /etc/shadow >/dev/null 2>&1 || true;
               cat /etc/hostname >/dev/null;
               curl -s -o /dev/null -m 5 https://1.1.1.1 || true;
               curl -s -o /dev/null -m 5 https://8.8.8.8 || true;
             '
-          cat coronarium.log.json | head -60
+          cat sakimori.log.json | head -60
           # Assert each kind has at least one DENY-tagged sample so
           # the PR comment/artifact genuinely demonstrates the full
           # verdict range — regressions here would quietly produce a
           # boring all-ALLOW report for consumers looking at the comment.
           python3 - <<'PY'
           import json, sys
-          d = json.load(open("coronarium.log.json"))
+          d = json.load(open("sakimori.log.json"))
           denied = {}
           for s in d.get("samples", []):
               if s.get("denied"):
@@ -86,24 +92,24 @@ jobs:
               if denied.get(k, 0) == 0:
                   print(f"::warning::no denied {k} samples — report artifact will be weaker")
           PY
-          test -f coronarium-report.html
+          test -f sakimori-report.html
 
       # Upload both so the comment's one-liner can pull the HTML.
       - uses: actions/upload-artifact@v4
         with:
-          name: coronarium-report
+          name: sakimori-report
           path: |
-            coronarium-report.html
-            coronarium.log.json
+            sakimori-report.html
+            sakimori.log.json
 
       # Only meaningful on pull_request events — on release/dispatch this
       # step no-ops (the sub-action bails early).
-      - uses: bokuweb/coronarium/comment@v0
+      - uses: bokuweb/sakimori/comment@v0
         if: github.event_name == 'pull_request'
         with:
-          log: coronarium.log.json
-          artifact-name: coronarium-report
-          html-filename: coronarium-report.html
+          log: sakimori.log.json
+          artifact-name: sakimori-report
+          html-filename: sakimori-report.html
 
       - name: Verify PR comment was posted
         if: github.event_name == 'pull_request'
@@ -113,18 +119,20 @@ jobs:
           set -euo pipefail
           pr="${{ github.event.pull_request.number }}"
           gh api "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" --paginate \
-            --jq '.[] | .body' | grep -q "coronarium-report" \
+            --jq '.[] | .body' | grep -q "sakimori-report" \
             || { echo "::error::comment not found on PR"; exit 1; }
-          echo "✓ coronarium-report comment is on PR #${pr}"
+          echo "✓ sakimori-report comment is on PR #${pr}"
 
   block-as-action:
     # Complement the audit-mode happy path with a block-mode run that
     # asserts the published action actually makes CI fail when a deny
     # happens. Runs alongside use-as-action (doesn't need its results).
+    # Skipped on PR for the same reason as use-as-action above.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bokuweb/coronarium@v0
+      - uses: bokuweb/sakimori@v0
         with:
           mode: block
       - name: Block-mode run should fail with a denied connect
@@ -134,13 +142,13 @@ jobs:
           network: {}
           EOF
           set +e
-          sudo -E "$CORONARIUM_BIN" run \
+          sudo -E "$SAKIMORI_BIN" run \
             --policy /tmp/block.yml \
             --log /tmp/block.log.json \
             -- /bin/sh -c 'curl -sS -o /dev/null -m 5 http://93.184.216.34 2> /tmp/curl.stderr; echo curl_rc=$? > /tmp/child'
           rc=$?
           set -e
-          echo "coronarium rc=${rc}"
+          echo "sakimori rc=${rc}"
           cat /tmp/child
           cat /tmp/curl.stderr
           cat /tmp/block.log.json | head -40
@@ -155,12 +163,14 @@ jobs:
           echo "✓ released action fails CI on block + deny, and curl itself was blocked"
 
   use-as-action-windows:
-    # Proves `bokuweb/coronarium@v0` also works on windows-latest, using
-    # the same inputs / env contract as the Linux job above.
+    # Proves `bokuweb/sakimori@v0` also works on windows-latest, using
+    # the same inputs / env contract as the Linux job above. Skipped on
+    # PR for the same reason as use-as-action above.
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bokuweb/coronarium@v0
+      - uses: bokuweb/sakimori@v0
         with:
           mode: audit
       - name: Run supervised command (Windows)
@@ -176,9 +186,9 @@ jobs:
           "@ | Out-File -Encoding utf8 $policy
           $log = "$env:RUNNER_TEMP\log.json"
           $html = "$env:RUNNER_TEMP\report.html"
-          & $env:CORONARIUM_BIN --policy $policy --log $log --html $html `
+          & $env:SAKIMORI_BIN --policy $policy --log $log --html $html `
             -- powershell -Command "Get-ChildItem C:\Windows | Select -First 3"
-          if ($LASTEXITCODE -ne 0) { throw "coronarium-win exit=$LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "sakimori-win exit=$LASTEXITCODE" }
           $json = Get-Content $log -Raw | ConvertFrom-Json
           Write-Host "observed=$($json.observed) denied=$($json.denied)"
           if ($json.observed -lt 1) { throw "no events captured" }

@@ -1,4 +1,4 @@
-name: "coronarium"
+name: "sakimori"
 description: "eBPF/ETW audit & block for GitHub Actions (Linux + Windows)"
 author: "bokuweb"
 branding:
@@ -9,26 +9,26 @@ inputs:
   policy:
     description: "Path to the policy file (YAML or JSON)."
     required: false
-    default: ".github/coronarium.yml"
+    default: ".github/sakimori.yml"
   mode:
     description: "audit | block. Overrides `mode:` in the policy file."
     required: false
     default: "audit"
   version:
-    description: "Coronarium release tag to install (e.g. v0.6.0). Defaults to whatever tag this action was referenced as; `latest` resolves the newest release."
+    description: "Sakimori release tag to install (e.g. v0.6.0). Defaults to whatever tag this action was referenced as; `latest` resolves the newest release."
     required: false
     default: ""
   log:
-    description: "Where the subsequent `coronarium run` step should write its JSON audit log."
+    description: "Where the subsequent `sakimori run` step should write its JSON audit log."
     required: false
-    default: "coronarium.log.json"
+    default: "sakimori.log.json"
 
 outputs:
   bin:
-    description: "Absolute path to the installed coronarium binary."
+    description: "Absolute path to the installed sakimori binary."
     value: ${{ steps.linux.outputs.bin || steps.windows.outputs.bin }}
   bpf:
-    description: "Absolute path to the installed coronarium.bpf.o (Linux only)."
+    description: "Absolute path to the installed sakimori.bpf.o (Linux only)."
     value: ${{ steps.linux.outputs.bpf }}
 
 runs:
@@ -49,9 +49,9 @@ runs:
           version="${GITHUB_ACTION_REF:-}"
         fi
         if [[ -z "${version}" || "${version}" == "main" || "${version}" == "latest" ]]; then
-          version=$(gh release view --repo bokuweb/coronarium --json tagName -q .tagName)
+          version=$(gh release view --repo bokuweb/sakimori --json tagName -q .tagName)
         fi
-        echo "Installing coronarium ${version} for Linux"
+        echo "Installing sakimori ${version} for Linux"
 
         arch=$(uname -m)
         case "${arch}" in
@@ -60,30 +60,30 @@ runs:
           *) echo "::error::unsupported Linux arch: ${arch}"; exit 1 ;;
         esac
 
-        asset="coronarium-${target}.tar.gz"
+        asset="sakimori-${target}.tar.gz"
         workdir=$(mktemp -d)
         cd "${workdir}"
         gh release download "${version}" \
-          --repo bokuweb/coronarium \
+          --repo bokuweb/sakimori \
           --pattern "${asset}" \
           --pattern "${asset}.sha256"
         sha256sum -c "${asset}.sha256"
         tar -xzf "${asset}"
 
-        dest="${RUNNER_TEMP}/coronarium"
+        dest="${RUNNER_TEMP}/sakimori"
         mkdir -p "${dest}"
-        mv "coronarium-${target}/coronarium" "${dest}/coronarium"
-        mv "coronarium-${target}/coronarium.bpf.o" "${dest}/coronarium.bpf.o"
-        chmod +x "${dest}/coronarium"
+        mv "sakimori-${target}/sakimori" "${dest}/sakimori"
+        mv "sakimori-${target}/sakimori.bpf.o" "${dest}/sakimori.bpf.o"
+        chmod +x "${dest}/sakimori"
 
-        echo "bin=${dest}/coronarium" >> "${GITHUB_OUTPUT}"
-        echo "bpf=${dest}/coronarium.bpf.o" >> "${GITHUB_OUTPUT}"
-        echo "CORONARIUM_BPF_OBJ=${dest}/coronarium.bpf.o" >> "${GITHUB_ENV}"
-        echo "CORONARIUM_BIN=${dest}/coronarium" >> "${GITHUB_ENV}"
-        echo "CORONARIUM_POLICY=${{ inputs.policy }}" >> "${GITHUB_ENV}"
-        echo "CORONARIUM_MODE=${{ inputs.mode }}" >> "${GITHUB_ENV}"
-        echo "CORONARIUM_LOG=${{ inputs.log }}" >> "${GITHUB_ENV}"
-        echo "CORONARIUM_OS=linux" >> "${GITHUB_ENV}"
+        echo "bin=${dest}/sakimori" >> "${GITHUB_OUTPUT}"
+        echo "bpf=${dest}/sakimori.bpf.o" >> "${GITHUB_OUTPUT}"
+        echo "SAKIMORI_BPF_OBJ=${dest}/sakimori.bpf.o" >> "${GITHUB_ENV}"
+        echo "SAKIMORI_BIN=${dest}/sakimori" >> "${GITHUB_ENV}"
+        echo "SAKIMORI_POLICY=${{ inputs.policy }}" >> "${GITHUB_ENV}"
+        echo "SAKIMORI_MODE=${{ inputs.mode }}" >> "${GITHUB_ENV}"
+        echo "SAKIMORI_LOG=${{ inputs.log }}" >> "${GITHUB_ENV}"
+        echo "SAKIMORI_OS=linux" >> "${GITHUB_ENV}"
 
     # --------------- Windows ---------------
     - id: windows
@@ -97,15 +97,15 @@ runs:
         $version = $env:INPUT_VERSION
         if ([string]::IsNullOrEmpty($version)) { $version = $env:GITHUB_ACTION_REF }
         if ([string]::IsNullOrEmpty($version) -or $version -eq "main" -or $version -eq "latest") {
-          $version = gh release view --repo bokuweb/coronarium --json tagName -q .tagName
+          $version = gh release view --repo bokuweb/sakimori --json tagName -q .tagName
         }
-        Write-Host "Installing coronarium $version for Windows"
+        Write-Host "Installing sakimori $version for Windows"
 
         $target = "x86_64-pc-windows-msvc"
-        $asset = "coronarium-$target.tar.gz"
-        $workdir = New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\coronarium-download" | Select-Object -ExpandProperty FullName
+        $asset = "sakimori-$target.tar.gz"
+        $workdir = New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\sakimori-download" | Select-Object -ExpandProperty FullName
         Push-Location $workdir
-        gh release download $version --repo bokuweb/coronarium --pattern $asset --pattern "$asset.sha256"
+        gh release download $version --repo bokuweb/sakimori --pattern $asset --pattern "$asset.sha256"
 
         # Manual checksum verify (sha256sum is not on Windows by default but
         # certutil is — still, a couple lines of pwsh is simpler).
@@ -118,42 +118,42 @@ runs:
         tar -xzf $asset
         Pop-Location
 
-        $dest = "$env:RUNNER_TEMP\coronarium"
+        $dest = "$env:RUNNER_TEMP\sakimori"
         New-Item -ItemType Directory -Force -Path $dest | Out-Null
-        Move-Item -Force "$workdir\coronarium-$target\coronarium-win.exe" "$dest\coronarium-win.exe"
+        Move-Item -Force "$workdir\sakimori-$target\sakimori-win.exe" "$dest\sakimori-win.exe"
 
         # Expose the same env / output names as Linux so downstream steps
         # can be written once and work on both.
-        "bin=$dest\coronarium-win.exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-        "CORONARIUM_BIN=$dest\coronarium-win.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-        "CORONARIUM_POLICY=${{ inputs.policy }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-        "CORONARIUM_MODE=${{ inputs.mode }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-        "CORONARIUM_LOG=${{ inputs.log }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-        "CORONARIUM_OS=windows" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "bin=$dest\sakimori-win.exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        "SAKIMORI_BIN=$dest\sakimori-win.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "SAKIMORI_POLICY=${{ inputs.policy }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "SAKIMORI_MODE=${{ inputs.mode }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "SAKIMORI_LOG=${{ inputs.log }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "SAKIMORI_OS=windows" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
     # --------------- anything else (macOS) ---------------
     - if: runner.os != 'Linux' && runner.os != 'Windows'
       shell: bash
       run: |
-        echo "::error::coronarium supports Linux + Windows only (runner=${RUNNER_OS})"
+        echo "::error::sakimori supports Linux + Windows only (runner=${RUNNER_OS})"
         exit 1
 
     # --------------- info step (both OSes) ---------------
     - shell: bash
       if: runner.os == 'Linux'
       run: |
-        if [[ -f "${CORONARIUM_POLICY}" ]]; then
-          "${CORONARIUM_BIN}" check-policy --policy "${CORONARIUM_POLICY}" >/dev/null
-          echo "✓ policy validated: ${CORONARIUM_POLICY}"
+        if [[ -f "${SAKIMORI_POLICY}" ]]; then
+          "${SAKIMORI_BIN}" check-policy --policy "${SAKIMORI_POLICY}" >/dev/null
+          echo "✓ policy validated: ${SAKIMORI_POLICY}"
         else
-          echo "::notice::policy file '${CORONARIUM_POLICY}' not found — the next 'coronarium run' step should point --policy somewhere real."
+          echo "::notice::policy file '${SAKIMORI_POLICY}' not found — the next 'sakimori run' step should point --policy somewhere real."
         fi
         echo ""
-        echo "Coronarium (Linux) installed. Wrap the command you want to supervise like:"
-        echo "    - run: sudo -E \$CORONARIUM_BIN run --policy <path> --mode \$CORONARIUM_MODE --log \$CORONARIUM_LOG --summary \$GITHUB_STEP_SUMMARY -- <your command>"
+        echo "Sakimori (Linux) installed. Wrap the command you want to supervise like:"
+        echo "    - run: sudo -E \$SAKIMORI_BIN run --policy <path> --mode \$SAKIMORI_MODE --log \$SAKIMORI_LOG --summary \$GITHUB_STEP_SUMMARY -- <your command>"
 
     - shell: pwsh
       if: runner.os == 'Windows'
       run: |
-        Write-Host "Coronarium (Windows) installed. Wrap the command you want to supervise like:"
-        Write-Host "    - run: & `"$env:CORONARIUM_BIN`" --policy <path> --mode $env:CORONARIUM_MODE --log $env:CORONARIUM_LOG --summary $env:GITHUB_STEP_SUMMARY -- <your command>"
+        Write-Host "Sakimori (Windows) installed. Wrap the command you want to supervise like:"
+        Write-Host "    - run: & `"$env:SAKIMORI_BIN`" --policy <path> --mode $env:SAKIMORI_MODE --log $env:SAKIMORI_LOG --summary $env:GITHUB_STEP_SUMMARY -- <your command>"

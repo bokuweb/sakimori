@@ -1,6 +1,6 @@
 # The BPF crate is built with:
-#   cargo +nightly build --manifest-path crates/coronarium-ebpf/Cargo.toml \
+#   cargo +nightly build --manifest-path crates/sakimori-ebpf/Cargo.toml \
 #     --target bpfel-unknown-none -Z build-std=core --release
 # This config is intentionally empty for the userspace workspace; BPF-specific
-# settings live inside crates/coronarium-ebpf to avoid leaking into hosts that
+# settings live inside crates/sakimori-ebpf to avoid leaking into hosts that
 # don't have the bpf target installed.

@@ -1,4 +1,4 @@
-# Contributing to coronarium
+# Contributing to sakimori
 
 Thanks for your interest in contributing! A few things to know before
 you open a pull request.
@@ -67,7 +67,7 @@ require either (a) only affecting code written after the change, or
 
 - Run `cargo fmt` and `cargo clippy --all-targets --all-features` before
   pushing.
-- Add tests for new behaviour. The handler traits in `coronarium-core`
+- Add tests for new behaviour. The handler traits in `sakimori-core`
   are designed to be mockable — prefer testing logic against a fake
   rather than spinning up real I/O.
 - Don't assert on exact error message strings; use substring matches so
