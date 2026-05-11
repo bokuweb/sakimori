@@ -243,6 +243,15 @@ fn check_pidfile_unused(path: &Path) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn pid_is_alive(pid: u32) -> bool {
+    // Guard the i32 cast: `libc::pid_t` is `i32`, so `as` truncation
+    // would turn `u32` values >= 2^31 into negative pid_t. kill(2)
+    // treats negative pids as process-group identifiers (and `-1` as
+    // "every process the caller may signal") — a completely different
+    // syscall from "is pid N alive". Anything outside positive i32 is
+    // not a real pid; report it as dead.
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
     // kill(pid, 0) returns 0 if the signal could be sent (i.e. the
     // process exists and we have permission), or -1 with errno set.
     // ESRCH means "no such process"; EPERM means "exists but we can't
@@ -314,13 +323,30 @@ mod tests {
 
     #[test]
     fn check_pidfile_unused_ignores_stale_pid() {
-        // u32::MAX is overwhelmingly unlikely to be a live pid on Linux
-        // (max_pid is typically 2^22). If this ever fails on a weird
-        // setup, it's a real race, not a flake.
+        // Pick a pid that's safely above any reasonable Linux pid_max
+        // (default 2^22 = 4194304) but still within positive i32 so it
+        // exercises the kill→ESRCH path rather than the range guard.
+        // If this ever fails on a weird system it's a real race, not a
+        // flake.
+        const STALE: u32 = 2_000_000_000;
         let tmp = tempdir();
         let path = tmp.join("stale.pid");
-        std::fs::write(&path, format!("{}\n", u32::MAX)).unwrap();
+        std::fs::write(&path, format!("{STALE}\n")).unwrap();
         check_pidfile_unused(&path).expect("stale pid should not block startup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn check_pidfile_unused_rejects_out_of_range_pid() {
+        // u32::MAX cast to pid_t (i32) wraps to -1, which kill(2) reads
+        // as "every process the caller may signal" — a completely
+        // different operation. Guard must treat that as "not a real
+        // pid → dead" rather than letting it through to kill().
+        let tmp = tempdir();
+        let path = tmp.join("oor.pid");
+        std::fs::write(&path, format!("{}\n", u32::MAX)).unwrap();
+        check_pidfile_unused(&path)
+            .expect("out-of-range pid must be treated as dead and not block startup");
     }
 
     #[cfg(target_os = "linux")]
