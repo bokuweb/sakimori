@@ -1,5 +1,14 @@
 //! Decoding ring-buffer frames produced by the eBPF side into [`Event`].
 //! The enum itself lives in `sakimori-core` so Windows shares it.
+//!
+//! Note: every decode below intentionally reads `header.tgid`, not
+//! `header.pid`. The eBPF side splits `bpf_get_current_pid_tgid()`
+//! into the kernel's two senses — `header.pid` is the kernel's
+//! per-thread `task->pid` (= TID), `header.tgid` is `task->tgid`
+//! (= the POSIX process ID, which is what `getpid()` /
+//! `std::process::id()` returns). Users who read the audit log
+//! expect the latter, and the supervisor-self filter in
+//! `loader::ingest` only works against the latter.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -28,7 +37,7 @@ pub fn decode(bytes: &[u8]) -> Option<Event> {
 fn decode_exec(bytes: &[u8]) -> Option<Event> {
     let ev: ExecEvent = read_pod(bytes)?;
     Some(Event::Exec {
-        pid: ev.header.pid,
+        pid: ev.header.tgid,
         uid: ev.header.uid,
         comm: cstr(&ev.header.comm),
         filename: cstr(&ev.filename),
@@ -41,7 +50,7 @@ fn decode_exec(bytes: &[u8]) -> Option<Event> {
 fn decode_connect4(bytes: &[u8]) -> Option<Event> {
     let ev: Connect4Event = read_pod(bytes)?;
     Some(Event::Connect {
-        pid: ev.header.pid,
+        pid: ev.header.tgid,
         uid: ev.header.uid,
         comm: cstr(&ev.header.comm),
         daddr: Ipv4Addr::from(u32::from_be(ev.daddr)).to_string(),
@@ -56,7 +65,7 @@ fn decode_connect4(bytes: &[u8]) -> Option<Event> {
 fn decode_connect6(bytes: &[u8]) -> Option<Event> {
     let ev: Connect6Event = read_pod(bytes)?;
     Some(Event::Connect {
-        pid: ev.header.pid,
+        pid: ev.header.tgid,
         uid: ev.header.uid,
         comm: cstr(&ev.header.comm),
         daddr: Ipv6Addr::from(ev.daddr).to_string(),
@@ -71,7 +80,7 @@ fn decode_connect6(bytes: &[u8]) -> Option<Event> {
 fn decode_open(bytes: &[u8]) -> Option<Event> {
     let ev: OpenEvent = read_pod(bytes)?;
     Some(Event::Open {
-        pid: ev.header.pid,
+        pid: ev.header.tgid,
         uid: ev.header.uid,
         comm: cstr(&ev.header.comm),
         filename: cstr(&ev.filename),
