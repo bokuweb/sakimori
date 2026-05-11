@@ -126,11 +126,34 @@ function installBinary() {
   // Bash for the heavy lifting — sha256sum + tar + gh are all available
   // on the standard GitHub-hosted runner image, and replicating them in
   // node would be 50 lines of boilerplate for no win.
+  //
+  // Version resolution handles three flavours of ${GITHUB_ACTION_REF}:
+  //   empty / "main" / "latest"   → newest release overall
+  //   "v<MAJOR>" (e.g. "v0")      → newest "v<MAJOR>.*" release. This is
+  //                                 the floating tag a `uses: bokuweb/
+  //                                 sakimori/job@v0` reference resolves
+  //                                 to; the moving git tag exists but
+  //                                 there's no Release object with that
+  //                                 literal name, so `gh release download
+  //                                 v0` 404s. Map to latest-in-major.
+  //   anything else               → used verbatim (concrete release tag).
   const script = `
 set -euo pipefail
 version="${versionExpr}"
 if [[ -z "$version" || "$version" == "main" || "$version" == "latest" ]]; then
   version=$(gh release view --repo bokuweb/sakimori --json tagName -q .tagName)
+elif [[ "$version" =~ ^v[0-9]+$ ]]; then
+  # "v0", "v1", ... moving tags don't have matching Release objects
+  # (release.yml's moving-tag job only force-pushes the git ref).
+  # Walk the release list and pick the newest entry whose tag starts
+  # with "v<MAJOR>." — this is what users mean when they pin to @v<MAJOR>.
+  major="\${version#v}"
+  version=$(gh api "repos/bokuweb/sakimori/releases" \\
+    --jq "[.[] | select(.tag_name | startswith(\\"v\${major}.\\")) | .tag_name] | first")
+  if [[ -z "$version" || "$version" == "null" ]]; then
+    echo "::error::no v\${major}.* release found on bokuweb/sakimori" >&2
+    exit 1
+  fi
 fi
 echo "Installing sakimori $version ($target) into ${installDir}"
 workdir=$(mktemp -d)

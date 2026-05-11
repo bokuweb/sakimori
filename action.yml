@@ -73,6 +73,19 @@ runs:
         fi
         if [[ -z "${version}" || "${version}" == "main" || "${version}" == "latest" ]]; then
           version=$(gh release view --repo bokuweb/sakimori --json tagName -q .tagName)
+        elif [[ "${version}" =~ ^v[0-9]+$ ]]; then
+          # "v0", "v1", ... moving tags don't have matching Release
+          # objects (release.yml's moving-tag job only force-pushes
+          # the git ref). Walk the release list and pick the newest
+          # entry whose tag starts with "v<MAJOR>." — this is what
+          # users mean when they pin to @v<MAJOR>.
+          major="${version#v}"
+          version=$(gh api "repos/bokuweb/sakimori/releases" \
+            --jq "[.[] | select(.tag_name | startswith(\"v${major}.\")) | .tag_name] | first")
+          if [[ -z "${version}" || "${version}" == "null" ]]; then
+            echo "::error::no v${major}.* release found on bokuweb/sakimori" >&2
+            exit 1
+          fi
         fi
         echo "Installing sakimori ${version} for Linux"
 
@@ -121,6 +134,17 @@ runs:
         if ([string]::IsNullOrEmpty($version)) { $version = $env:GITHUB_ACTION_REF }
         if ([string]::IsNullOrEmpty($version) -or $version -eq "main" -or $version -eq "latest") {
           $version = gh release view --repo bokuweb/sakimori --json tagName -q .tagName
+        } elseif ($version -match '^v[0-9]+$') {
+          # "v0", "v1", ... moving tags have no matching Release object;
+          # resolve to the newest "v<MAJOR>.*" release. Mirrors the
+          # Linux branch above.
+          $major = $version.Substring(1)
+          $version = gh api "repos/bokuweb/sakimori/releases" `
+            --jq "[.[] | select(.tag_name | startswith(`"v$major.`")) | .tag_name] | first"
+          if ([string]::IsNullOrEmpty($version) -or $version -eq "null") {
+            Write-Host "::error::no v$major.* release found on bokuweb/sakimori"
+            exit 1
+          }
         }
         Write-Host "Installing sakimori $version for Windows"
 
