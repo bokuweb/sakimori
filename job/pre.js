@@ -41,10 +41,21 @@ function setEnv(name, value) {
 }
 
 if (process.platform !== "linux") {
-  fail(
-    "bokuweb/sakimori/job is Linux-only. For Windows or single-step " +
-      "supervision use bokuweb/sakimori with the `run:` input.",
+  // A step-level `if: runner.os == 'Linux'` on the consumer side only
+  // gates this action's `main`; pre/post still fire on every matrix
+  // entry by default (the GitHub Actions `pre-if` / `post-if` controls
+  // are action-side, not consumer-side). So a workflow with a Linux +
+  // macOS + Windows matrix would hard-fail the macOS and Windows
+  // entries here if we exited non-zero. Silently no-op instead —
+  // matches the composite `bokuweb/sakimori@v0` behaviour, which
+  // simply skips its `if: runner.os == 'Linux'` install step on
+  // other platforms.
+  console.log(
+    `bokuweb/sakimori/job: no-op on ${process.platform} ` +
+      "(this action is Linux-only; use bokuweb/sakimori with `run:` " +
+      "for Windows / single-step supervision).",
   );
+  process.exit(0);
 }
 
 function detectContainer() {
