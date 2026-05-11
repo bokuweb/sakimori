@@ -34,6 +34,7 @@ fn decode_exec(bytes: &[u8]) -> Option<Event> {
         filename: cstr(&ev.filename),
         argv0: cstr(&ev.argv0),
         denied: ev.header.verdict == VERDICT_DENY,
+        source: None,
     })
 }
 
@@ -48,6 +49,7 @@ fn decode_connect4(bytes: &[u8]) -> Option<Event> {
         protocol: ev.protocol,
         denied: ev.header.verdict == VERDICT_DENY,
         hostname: None,
+        source: None,
     })
 }
 
@@ -62,6 +64,7 @@ fn decode_connect6(bytes: &[u8]) -> Option<Event> {
         protocol: ev.protocol,
         denied: ev.header.verdict == VERDICT_DENY,
         hostname: None,
+        source: None,
     })
 }
 
@@ -74,6 +77,7 @@ fn decode_open(bytes: &[u8]) -> Option<Event> {
         filename: cstr(&ev.filename),
         flags: ev.flags,
         denied: ev.header.verdict == VERDICT_DENY,
+        source: None,
     })
 }
 

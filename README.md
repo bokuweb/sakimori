@@ -615,6 +615,19 @@ The HTML report includes:
 - filter box matching across all fields
 - dark-mode aware, self-contained (no external CSS/JS)
 
+**Per-event source attribution (Linux):** the supervisor walks
+`/proc/<pid>/{status,cmdline}` PPid chains at event time and tags
+each event with the originating package manager (npm, pnpm, yarn,
+cargo, pip, uv, poetry, dotnet, go, maven, gradle, bundler,
+composer). That shows up as a `source: { package_manager, root_argv,
+chain }` field on every JSON-log event and as a "Sources" top-N
+table in the step summary, so a connect to `evil.example` reads as
+"came from `npm install foo@1.2.3`" rather than just "from pid
+12345 (sh)". Best-effort — pids that have already exited by the
+time the userspace drain reads the ringbuf get `source: null` and
+fall into the `(unattributed)` row. Windows ETW supervisor doesn't
+attach attribution yet.
+
 ---
 
 ## CI usage (GitHub Actions)

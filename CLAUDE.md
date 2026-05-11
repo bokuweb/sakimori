@@ -230,13 +230,22 @@ of value-per-implementation-cost.
     Text + JSON output, `--strict` escalates Warn → Error. Tag→SHA
     auto-resolution via the GitHub API is deferred — it requires
     auth and turns the offline tool into a network one.
-11. **Per-step / per-PID source attribution** — today the JSON log
-    has `pid` + `comm`, but harden-runner's value-add is being
-    able to say "this outbound call came from `npm install
-    foo@1.2.3`'s postinstall script". Achievable by walking the
-    process tree at event time and attaching the originating
-    package manager argv to the event record. Linux-first via
-    `/proc/<pid>/status` PPid chain.
+11. **Per-step / per-PID source attribution** — ✅ implemented in
+    v0.23. Linux drain task walks the PPid chain via
+    `/proc/<pid>/{status,cmdline}` for each event and attaches an
+    `attribution::Attribution` (full chain + first matching
+    package-manager argv) to the event before it's stored in
+    Stats. Recognised package managers: npm, pnpm, yarn, cargo,
+    pip (incl. `pip3.x`), uv, poetry, dotnet, go, maven, gradle,
+    bundler, composer. The supervisor's own pid is excluded from
+    the chain. Surfaces in the JSON log as a `source` field on
+    every event and in the step summary as a "Sources" top-N
+    table grouping events by originating package manager — the
+    "wait, what's `npm install foo@1.2.3` doing connecting to
+    that?" answer harden-runner gives. Best-effort: if the event
+    pid has already exited by drain time the attribution is
+    `None` and the event is unaffected. Non-Linux supervisors
+    (Windows ETW) leave `source: None` for now.
 
 Explicitly **out of scope** (different product philosophy, not
 a missing feature):

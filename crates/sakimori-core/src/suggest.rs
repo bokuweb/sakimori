@@ -189,6 +189,7 @@ mod tests {
             protocol: 6,
             denied: false,
             hostname: host.map(|s| s.into()),
+            source: None,
         }
     }
     fn open(filename: &str) -> Event {
@@ -199,6 +200,7 @@ mod tests {
             filename: filename.into(),
             flags: 0,
             denied: false,
+            source: None,
         }
     }
     fn exec(filename: &str) -> Event {
@@ -209,6 +211,7 @@ mod tests {
             filename: filename.into(),
             argv0: filename.into(),
             denied: false,
+            source: None,
         }
     }
 
