@@ -176,6 +176,110 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
    CONFIG_BPF_KPROBE_OVERRIDE and a well-timed kprobe.
 5. **macOS live block** — either a Network Extension (heavy, needs
    signing) or an HTTPS proxy (see #2).
+6. **Retroactive CVE notification for past installs** — log every
+   resolved install the proxy sees to a local append-only file
+   (`~/.sakimori/installs.jsonl`: ecosystem, name, version,
+   resolved_at, project_path, attribution) and add
+   `sakimori advisories scan` that batch-queries
+   [OSV.dev](https://osv.dev)'s `POST /v1/querybatch` for matching
+   advisories. Local-first: no server, no upload, private dep
+   trees never leave the machine. OSV covers npm / crates.io /
+   PyPI / NuGet so one client handles all four ecosystems.
+
+   For team-wide push notifications, we ship **`sakimori-hub`** as
+   an optional self-hostable companion: a small Rust service with
+   a native `POST /ingest` endpoint that accepts the
+   `InstallEvent` JSON schema, keeps an OSV mirror, runs the
+   advisory-vs-install JOIN server-side, and dispatches webhooks
+   / email / Slack when a past install matches a newly-published
+   advisory. It is **strictly opt-in self-host** — there will be
+   no Anthropic/coronarium-operated instance. Centralised SaaS
+   remains out of scope; sakimori-hub is "here's the server you
+   can run yourself if you want push notifications across a team."
+
+   On top of (not instead of) the native `/ingest`, the proxy
+   also offers an **opt-in OTLP exporter** (`sakimori proxy start
+   --otlp-endpoint <url>`) that emits each install as an OTLP
+   LogRecord with `package.*` attributes (`package.ecosystem`,
+   `package.name`, `package.version`, `package.resolved_at`,
+   `package.project_path`). This lets users fan installs out to
+   any existing observability backend — Datadog / Honeycomb / Loki
+   / a self-run otel-collector — without standing up sakimori-hub.
+   The two transports coexist: pick `/ingest` for advisory push
+   notifications, OTLP for general observability, both for either.
+
+   **npx** works for free here (same `registry.npmjs.org` path
+   the npm rewriter already handles); **Homebrew** does *not* fit
+   minimumReleaseAge (formula updates are PRs to a git repo, not
+   registry publishes with structured publish-time per version)
+   but its installs can still be logged via HTTPS_PROXY for the
+   advisory-scan side.
+
+   **`InstallEvent.execution_mode`** — the schema distinguishes
+   two install shapes, because retroactive CVE notification means
+   different things for each:
+
+   - `persistent` (`npm install`, `cargo add`, `pip install`,
+     `dotnet add package`, etc.) — the package lands in a lockfile
+     and stays there. Advisory notification → "bump and re-install"
+     remediation. Standard SCA model.
+   - `ephemeral` (`npx`, `pnpm dlx`, `yarn dlx`, `uvx`,
+     `pipx run`, `cargo install`, `go run <remote>`, etc.) — the
+     package is fetched, executed once, and (often) cached but not
+     pinned in any project lockfile. Advisory notification cannot
+     mean "bump"; it means **"this code ran on your machine on
+     <date> with the running user's privileges — investigate
+     potential compromise"**. The host UI must surface these
+     differently (different colour / different recommended action)
+     so reviewers don't try to "fix" them by editing a lockfile
+     that doesn't reference them.
+
+   Classification happens at proxy time from the User-Agent and
+   the URL path shape (e.g. `npm` UA + a fetch under
+   `/<pkg>/-/<pkg>-<ver>.tgz` without a preceding packument GET
+   pattern matching a project resolution → `ephemeral`; same fetch
+   following a packument GET from `node` + `npm-cli` context →
+   `persistent`). When ambiguous, default to `persistent` and let
+   the host UI mark it `mode: unknown` rather than mis-categorise
+   as ephemeral and hide a real dependency.
+
+   This is one of sakimori-hub's strongest differentiators —
+   Dependabot / Snyk / Socket only see what's committed to a repo
+   lockfile, so they fundamentally cannot notify on `npx` /
+   `pipx run` / `cargo install` history. sakimori is positioned
+   at the fetch layer, so it can.
+
+   **Competitive landscape note**: no shipped product covers all
+   four axes simultaneously — *package-aware* + *execution
+   history* + *developer endpoint* + *retroactive advisory JOIN*.
+   SCA tools (Snyk / Socket / Phylum / Dependabot) are
+   package-aware but lockfile-scoped, so ephemeral runs are
+   invisible. EDR / XDR (CrowdStrike, SentinelOne, Defender for
+   Endpoint, Elastic Security) record every exec but see only
+   `node` + argv, not "this was `npx leftpad@1.2.3`" — the
+   advisory→exec correlation is manual threat-hunting, not a
+   product feature. Registry firewalls (Sonatype Nexus Firewall,
+   JFrog Xray) sit at the right layer but target enterprise
+   artifact repos, not developer laptops. The gap exists because
+   SCA is repo-bound and EDR's abstraction stops at the process
+   tree; bridging them needs a fetch-layer agent on the endpoint,
+   which is exactly where sakimori already lives.
+
+   **Alert-fatigue caveat** (don't ship this naïvely): if every
+   low-severity advisory triggers a "you may have executed this 3
+   weeks ago" notification, the signal drowns immediately. The
+   ephemeral-mode notifier must be gated on at least:
+   (a) severity ≥ High or known-exploited (KEV / GHSA `actively
+   exploited`),
+   (b) the advisory implicates install-time or run-time code paths
+   (postinstall script, build-backend hook, or RCE in the imported
+   surface — not e.g. a ReDoS in a code path the one-shot never
+   touched),
+   (c) package-popularity / typosquat heuristics to deprioritise
+   obvious noise.
+   These filters should be tunable and default conservative; the
+   "investigate compromise" framing is high-cost-per-alert and
+   loses credibility fast if it cries wolf.
 
 ### harden-runner parity gaps (tracked but not yet scheduled)
 
