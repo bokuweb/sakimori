@@ -651,7 +651,7 @@ jobs:
       # execution is not supported for local action"), so we resolve
       # the action at the PR head SHA (or the push SHA) instead. Same
       # repo, so the ref is always public and reachable.
-      - uses: bokuweb/sakimori/job@${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: bokuweb/sakimori/job@${{ github.sha }}
         with:
           policy: ${{ runner.temp }}/policy.yml
           mode: audit
