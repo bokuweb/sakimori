@@ -12,10 +12,12 @@
 //! the respective binary crates.
 
 pub mod actions;
+pub mod advisories;
 pub mod attribution;
 pub mod deps;
 pub mod events;
 pub mod html;
+pub mod installs;
 pub mod matcher;
 pub mod policy;
 pub mod report;

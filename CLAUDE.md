@@ -176,15 +176,22 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
    CONFIG_BPF_KPROBE_OVERRIDE and a well-timed kprobe.
 5. **macOS live block** — either a Network Extension (heavy, needs
    signing) or an HTTPS proxy (see #2).
-6. **Retroactive CVE notification for past installs** — log every
-   resolved install the proxy sees to a local append-only file
-   (`~/.sakimori/installs.jsonl`: ecosystem, name, version,
-   resolved_at, project_path, attribution) and add
-   `sakimori advisories scan` that batch-queries
+6. **Retroactive CVE notification for past installs** — local-first
+   half landed: the proxy's pinned-install path now appends every
+   resolved fetch to `~/.sakimori/installs.jsonl`
+   (`InstallEvent { ecosystem, name, version, resolved_at,
+   execution_mode, user_agent }` — `project_path` and richer
+   attribution come next), and `sakimori advisories scan` reads
+   that log, dedupes by `(eco, name, version)`, and batch-queries
    [OSV.dev](https://osv.dev)'s `POST /v1/querybatch` for matching
-   advisories. Local-first: no server, no upload, private dep
-   trees never leave the machine. OSV covers npm / crates.io /
-   PyPI / NuGet so one client handles all four ecosystems.
+   advisories. Hits exit non-zero so it slots into cron / CI.
+   `execution_mode` classification is currently best-effort from
+   the User-Agent (`npx` / `pipx` / `uvx` / `cargo-install` →
+   ephemeral; known package managers → persistent; everything
+   else → unknown). The proxy logger is on by default; opt out
+   with `sakimori proxy start --no-install-log`. Local-first: no
+   server, no upload, private dep trees never leave the machine —
+   only `(eco, name, version)` tuples are sent to OSV.
 
    For team-wide push notifications, we ship **`sakimori-hub`** as
    an optional self-hostable companion: a small Rust service with

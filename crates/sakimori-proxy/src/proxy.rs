@@ -18,6 +18,8 @@ use hudsucker::{
     rcgen::KeyPair,
 };
 
+use sakimori_core::installs::{ExecutionMode, InstallEvent, InstallLogger};
+
 use crate::ca::{CaFiles, ensure_ca, trust_instructions};
 use crate::decision::{AgeOracle, Decider, Decision};
 use crate::nuget_flatcontainer_client::NugetFlatContainerClient;
@@ -76,6 +78,14 @@ pub struct ProxyConfig {
     /// is unrestricted — current behaviour. See
     /// [`crate::host_allow::HostMatcher`] for pattern grammar.
     pub network_allow: Option<crate::host_allow::HostMatcher>,
+    /// Append-only install log. `Some(path)` overrides the location;
+    /// `None` uses [`InstallLogger::default_path`]. To disable
+    /// logging entirely, set [`Self::install_log_enabled`] to `false`.
+    pub install_log_path: Option<std::path::PathBuf>,
+    /// Master switch for the install logger. Defaults to `true` —
+    /// the local-first audit log is the foundation of
+    /// `sakimori advisories scan`.
+    pub install_log_enabled: bool,
 }
 
 impl ProxyConfig {
@@ -95,8 +105,48 @@ impl ProxyConfig {
             user_agent: format!("sakimori-proxy/{}", env!("CARGO_PKG_VERSION")),
             oracle: None,
             network_allow: None,
+            install_log_path: None,
+            install_log_enabled: true,
         })
     }
+}
+
+/// Best-effort classification of how the package was being installed.
+/// Falls back to `Unknown` when the User-Agent doesn't give us enough
+/// signal. Per CLAUDE.md roadmap #6, we default ambiguous cases to
+/// `Unknown` rather than mis-classify as `Ephemeral` — the host UI
+/// can surface unknowns to the user separately.
+pub(crate) fn classify_execution_mode(user_agent: &str) -> ExecutionMode {
+    let ua = user_agent.to_ascii_lowercase();
+    // Known one-shot runners. Order matters only for readability:
+    // each substring is unambiguous.
+    if ua.contains("npx")
+        || ua.contains("pnpm/dlx")
+        || ua.contains("yarn dlx")
+        || ua.contains("uvx")
+        || ua.contains("pipx")
+        || ua.contains("cargo-install")
+    {
+        return ExecutionMode::Ephemeral;
+    }
+    // Known persistent package managers. UA strings vary across
+    // versions; we look for a stable prefix.
+    if ua.starts_with("npm/")
+        || ua.starts_with("pnpm/")
+        || ua.starts_with("yarn/")
+        || ua.starts_with("cargo ")
+        || ua.starts_with("cargo/")
+        || ua.starts_with("pip/")
+        || ua.starts_with("poetry/")
+        || ua.starts_with("uv/")
+        || ua.starts_with("nuget")
+        || ua.contains("nuget command line")
+        || ua.contains("nuget xplat command line")
+        || ua.contains("dotnet")
+    {
+        return ExecutionMode::Persistent;
+    }
+    ExecutionMode::Unknown
 }
 
 /// Start the proxy and run until it errors.
@@ -193,6 +243,16 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
             matcher.len(),
         );
     }
+    let install_logger = if cfg.install_log_enabled {
+        let path = cfg
+            .install_log_path
+            .clone()
+            .unwrap_or_else(InstallLogger::default_path);
+        log::info!("install log: {}", path.display());
+        Some(Arc::new(InstallLogger::at(path)))
+    } else {
+        None
+    };
     let handler = SakimoriHandler {
         parsers: Arc::new(default_parsers()),
         decider,
@@ -202,6 +262,7 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
         nuget_flat: NugetFlatContainerClient::new(cfg.user_agent.clone()),
         pypi_simple: PypiSimpleClient::new(cfg.user_agent.clone()),
         network_allow: cfg.network_allow.map(Arc::new),
+        install_logger,
     };
 
     // `.build()` in hudsucker 0.22 returns Proxy<…> directly; no Result.
@@ -295,6 +356,8 @@ struct SakimoriHandler {
     /// API so we can silently filter the PEP 503 HTML Simple index
     /// (which has no dates inline).
     pypi_simple: PypiSimpleClient,
+    /// Append-only install log. `None` disables logging.
+    install_logger: Option<Arc<InstallLogger>>,
     /// Hostname allow-list. `None` (or empty) → unrestricted egress.
     /// `Some(non-empty)` → default-deny: any CONNECT or plain-HTTP
     /// request whose target host doesn't match returns 403 before
@@ -352,6 +415,12 @@ impl HttpHandler for SakimoriHandler {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("identity"),
         );
+        let user_agent = req
+            .headers()
+            .get(http::header::USER_AGENT)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         match parse_for_host(&self.parsers, &host, &path) {
             ParseResult::Pinned {
                 ecosystem,
@@ -360,7 +429,22 @@ impl HttpHandler for SakimoriHandler {
             } => {
                 let now = Utc::now();
                 match self.decider.decide(ecosystem, &name, &version, now) {
-                    Decision::Allow => RequestOrResponse::Request(req),
+                    Decision::Allow => {
+                        if let Some(logger) = self.install_logger.as_ref() {
+                            let mode = classify_execution_mode(&user_agent);
+                            let mut ev =
+                                InstallEvent::new(ecosystem, &name, &version).with_mode(mode);
+                            if !user_agent.is_empty() {
+                                ev = ev.with_user_agent(&user_agent);
+                            }
+                            if let Err(e) = logger.record(&ev) {
+                                // Non-fatal: an unwritable install log
+                                // must not break package installs.
+                                log::warn!("install log write failed: {e:#}");
+                            }
+                        }
+                        RequestOrResponse::Request(req)
+                    }
                     Decision::Deny { reason } => {
                         log::warn!("deny {host}{path}: {reason}");
                         RequestOrResponse::Response(deny_response(&reason))
@@ -698,6 +782,57 @@ fn deny_response(reason: &str) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_execution_mode_recognises_one_shot_runners() {
+        for ua in [
+            "npx/1.0",
+            "node npx mode",
+            "uvx/0.3",
+            "pipx/1.2",
+            "cargo-install 0.1",
+            "pnpm/dlx 9",
+            "yarn dlx",
+        ] {
+            assert_eq!(
+                classify_execution_mode(ua),
+                ExecutionMode::Ephemeral,
+                "{ua} should be ephemeral"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_execution_mode_recognises_persistent_managers() {
+        for ua in [
+            "npm/10.0.0 node/20.0.0",
+            "pnpm/9.0.0",
+            "yarn/1.22.0",
+            "cargo 1.80.0 (1.80.0)",
+            "cargo/1.80",
+            "pip/24.0",
+            "poetry/1.8",
+            "uv/0.4",
+            "NuGet/6.10.0",
+            "NuGet xplat command line/6.10",
+            "dotnet/8.0",
+        ] {
+            assert_eq!(
+                classify_execution_mode(ua),
+                ExecutionMode::Persistent,
+                "{ua} should be persistent"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_execution_mode_defaults_unknown_for_strange_ua() {
+        assert_eq!(classify_execution_mode(""), ExecutionMode::Unknown);
+        assert_eq!(
+            classify_execution_mode("Mozilla/5.0 just a browser"),
+            ExecutionMode::Unknown
+        );
+    }
 
     #[test]
     fn should_intercept_matches_known_hosts_case_insensitively() {

@@ -144,6 +144,33 @@ pub enum Command {
         #[command(subcommand)]
         cmd: DaemonCommand,
     },
+    /// Retroactive CVE notification: read the proxy's install log and
+    /// query OSV.dev for advisories that affect installs you've
+    /// already done. Local-first — only `(ecosystem, name, version)`
+    /// tuples are sent to OSV; project paths, User-Agents, and
+    /// timestamps never leave the machine.
+    Advisories {
+        #[command(subcommand)]
+        cmd: AdvisoriesCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AdvisoriesCommand {
+    /// Query OSV.dev for advisories matching every install in the log.
+    /// Exits non-zero if any hits are found.
+    Scan(AdvisoriesScanArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct AdvisoriesScanArgs {
+    /// Override the install-log path. Defaults to
+    /// `~/.sakimori/installs.jsonl`.
+    #[arg(long)]
+    pub install_log: Option<PathBuf>,
+    /// Emit machine-readable JSON instead of the default human report.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -596,6 +623,16 @@ pub struct ProxyStartArgs {
     /// `$XDG_CONFIG_HOME/sakimori` (or `~/.config/sakimori`).
     #[arg(long)]
     pub config_dir: Option<PathBuf>,
+    /// Disable the local install log
+    /// (`~/.sakimori/installs.jsonl`). The log is the input for
+    /// `sakimori advisories scan`; turning it off opts out of
+    /// retroactive CVE notification.
+    #[arg(long)]
+    pub no_install_log: bool,
+    /// Override the install-log path. Defaults to
+    /// `~/.sakimori/installs.jsonl`.
+    #[arg(long)]
+    pub install_log: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -858,6 +895,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 user_agent: format!("sakimori-proxy/{}", env!("CARGO_PKG_VERSION")),
                 oracle: None,
                 network_allow,
+                install_log_path: args.install_log,
+                install_log_enabled: !args.no_install_log,
             };
             sakimori_proxy::run(cfg).await?;
             Ok(())
@@ -930,7 +969,55 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Daemon {
             cmd: DaemonCommand::Stop(args),
         } => run_daemon_stop(args),
+        Command::Advisories {
+            cmd: AdvisoriesCommand::Scan(args),
+        } => run_advisories_scan(args),
     }
+}
+
+fn run_advisories_scan(args: AdvisoriesScanArgs) -> Result<()> {
+    use sakimori_core::advisories::{LiveOsvBatch, scan};
+    use sakimori_core::installs::{ExecutionMode, InstallLogger};
+
+    let path = args.install_log.unwrap_or_else(InstallLogger::default_path);
+    let logger = InstallLogger::at(&path);
+    let oracle = LiveOsvBatch::new(format!("sakimori/{}", env!("CARGO_PKG_VERSION")));
+    let report = scan(&logger, &oracle)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "scanned {} install(s), {} unique package(s) from {}",
+            report.installs_scanned,
+            report.unique_packages,
+            path.display()
+        );
+        if report.hits.is_empty() {
+            println!("no matching advisories");
+        } else {
+            println!("{} package(s) implicated:\n", report.hits.len());
+            for hit in &report.hits {
+                let tag = match hit.execution_mode {
+                    ExecutionMode::Persistent => "persistent",
+                    ExecutionMode::Ephemeral => "ephemeral — code ran on this machine",
+                    ExecutionMode::Unknown => "unknown mode",
+                };
+                println!(
+                    "  {} {}@{}  [{}]\n    {}",
+                    hit.ecosystem,
+                    hit.name,
+                    hit.version,
+                    tag,
+                    hit.advisory_ids.join(", "),
+                );
+            }
+        }
+    }
+    if !report.hits.is_empty() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 async fn run_daemon_start(args: DaemonStartArgs) -> Result<()> {

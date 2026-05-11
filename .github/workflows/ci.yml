@@ -131,6 +131,7 @@ jobs:
           ./target/release/sakimori proxy start \
               --listen 127.0.0.1:18910 \
               --min-age 365d \
+              --install-log "$RUNNER_TEMP/installs.jsonl" \
               > "$RUNNER_TEMP/proxy.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/proxy.pid"
           # Wait for the listener.
@@ -231,9 +232,59 @@ jobs:
           assert v > 50, f"suspicious drop ratio: direct={d} via={v}"
           print(f"ok nuget: direct={d} via={v}")
           PY
+      - name: pinned tarball fetch — proxy records an InstallEvent
+        run: |
+          set -euo pipefail
+          # Pick a stable, old-enough lodash version so the age filter
+          # (--min-age 365d) doesn't deny it.
+          curl -fsS --cacert "$CA" -x http://127.0.0.1:18910 \
+            -o /dev/null \
+            -A 'npm/10.0.0 node/20.0.0 ci/true' \
+            https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz
+          test -f "$RUNNER_TEMP/installs.jsonl"
+          echo "--- installs.jsonl ---"
+          cat "$RUNNER_TEMP/installs.jsonl"
+          python3 - <<'PY'
+          import json, os, sys
+          path = os.path.join(os.environ["RUNNER_TEMP"], "installs.jsonl")
+          rows = [json.loads(l) for l in open(path) if l.strip()]
+          hits = [r for r in rows
+                  if r["ecosystem"] == "npm"
+                  and r["name"] == "lodash"
+                  and r["version"] == "4.17.21"]
+          assert hits, f"no install event recorded for lodash@4.17.21: {rows}"
+          # The npm/10.x UA we sent should classify as `persistent`.
+          assert hits[0]["execution_mode"] == "persistent", hits[0]
+          assert "user_agent" in hits[0]
+          print(f"✓ proxy recorded {len(hits)} install event(s) for lodash@4.17.21")
+          PY
+
+      - name: advisories scan against proxy-recorded log finds nothing
+        # End-to-end happy-path: the log the proxy just wrote is
+        # readable by `advisories scan`, and lodash@4.17.21 has no
+        # advisories so the exit code is clean.
+        run: |
+          set -euxo pipefail
+          ./target/release/sakimori advisories scan \
+              --install-log "$RUNNER_TEMP/installs.jsonl" \
+              --json > "$RUNNER_TEMP/proxy-scan.json"
+          python3 - <<'PY'
+          import json, os
+          r = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "proxy-scan.json")))
+          assert r["installs_scanned"] >= 1, r
+          assert r["hits"] == [], r
+          print("ok no advisories for lodash@4.17.21")
+          PY
+
       - name: Show proxy log on success
         if: always()
         run: tail -40 "$RUNNER_TEMP/proxy.log" || true
+      - name: Upload proxy install log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-installs-log
+          path: ${{ runner.temp }}/installs.jsonl
       - name: Stop proxy
         if: always()
         run: |
@@ -756,6 +807,160 @@ jobs:
             ${{ runner.temp }}/sakimori-job.html
             ${{ runner.temp }}/sakimori-daemon.stdout.log
             ${{ runner.temp }}/sakimori-daemon.stderr.log
+
+  advisories-smoke:
+    # Cross-OS end-to-end for `sakimori advisories scan` + the proxy's
+    # install logger. Two things we want to prove on every supported
+    # host OS:
+    #
+    #   1. The install-log file format (`InstallEvent` JSONL) is
+    #      readable on the OS — path-handling, line-ending, encoding,
+    #      `$HOME` defaulting all behave.
+    #   2. A scan against real OSV.dev with a known-malicious entry
+    #      flags it, exits non-zero, and surfaces the GHSA ID. The
+    #      negative control (a benign entry) does NOT appear.
+    #
+    # We don't run the proxy here — that's covered by `proxy-smoke`
+    # and `proxy-action-smoke`. Instead we hand-write an installs.jsonl
+    # so the test stays hermetic against package-manager UA drift.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build sakimori
+        run: cargo build --release -p sakimori
+      - name: Resolve sakimori binary path
+        run: |
+          set -euxo pipefail
+          case "$RUNNER_OS" in
+            Windows) bin="$GITHUB_WORKSPACE/target/release/sakimori.exe" ;;
+            *)       bin="$GITHUB_WORKSPACE/target/release/sakimori" ;;
+          esac
+          test -x "$bin"
+          echo "SAKIMORI_BIN=$bin" >> "$GITHUB_ENV"
+
+      - name: Run unit tests for new modules
+        # Quick belt-and-braces — the workspace `cargo test` in
+        # `userspace` only runs on Linux. We want the platform-neutral
+        # crates exercised on macOS / Windows too, especially the
+        # filesystem append path in `installs`.
+        run: "cargo test -p sakimori-core installs:: advisories::"
+
+      - name: Hand-craft an installs.jsonl with one known-malicious entry
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/sakimori"
+          # event-stream@3.3.6 is the canonical reference malicious
+          # npm release (GHSA-mh6f-8j2x-4483 / OSV) — published 2018,
+          # still indexed, and very stable across OSV refreshes.
+          # Paired with a benign entry to prove the negative side.
+          python3 - <<PY > "$RUNNER_TEMP/sakimori/installs.jsonl"
+          import json
+          rows = [
+              {"ecosystem":"npm","name":"event-stream","version":"3.3.6",
+               "resolved_at":"2026-01-01T00:00:00Z","execution_mode":"persistent",
+               "user_agent":"npm/10.0.0 node/20.0.0"},
+              {"ecosystem":"npm","name":"left-pad","version":"1.3.0",
+               "resolved_at":"2026-01-02T00:00:00Z","execution_mode":"persistent",
+               "user_agent":"npm/10.0.0 node/20.0.0"},
+          ]
+          for r in rows:
+              print(json.dumps(r))
+          PY
+          cat "$RUNNER_TEMP/sakimori/installs.jsonl"
+
+      - name: scan — known-malicious flagged, exits non-zero, JSON shape correct
+        run: |
+          set -euo pipefail
+          set +e
+          "$SAKIMORI_BIN" advisories scan \
+            --install-log "$RUNNER_TEMP/sakimori/installs.jsonl" \
+            --json > "$RUNNER_TEMP/scan.json"
+          rc=$?
+          set -e
+          echo "exit_code=$rc"
+          cat "$RUNNER_TEMP/scan.json"
+          if [ "$rc" = "0" ]; then
+            echo "::error::advisories scan exited 0 despite a known-malicious entry"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os, sys
+          report = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "scan.json")))
+          assert report["installs_scanned"] == 2, report
+          assert report["unique_packages"] == 2, report
+          hits = report["hits"]
+          assert len(hits) >= 1, hits
+          es = [h for h in hits if h["name"] == "event-stream" and h["version"] == "3.3.6"]
+          assert es, f"expected event-stream@3.3.6 in hits: {hits}"
+          assert es[0]["ecosystem"] == "npm"
+          assert es[0]["execution_mode"] == "persistent"
+          assert any(i.startswith("GHSA-") or i.startswith("MAL-") for i in es[0]["advisory_ids"]), es[0]
+          # Negative control: left-pad@1.3.0 has no advisories (it's
+          # famous for breaking the internet, not for malware).
+          assert not any(h["name"] == "left-pad" for h in hits), hits
+          print(f"ok: {len(hits)} hit(s), event-stream advisories: {es[0]['advisory_ids']}")
+          PY
+
+      - name: scan — empty log is a clean success
+        run: |
+          set -euxo pipefail
+          : > "$RUNNER_TEMP/sakimori/empty.jsonl"
+          "$SAKIMORI_BIN" advisories scan \
+            --install-log "$RUNNER_TEMP/sakimori/empty.jsonl" \
+            --json > "$RUNNER_TEMP/scan-empty.json"
+          python3 - <<'PY'
+          import json, os
+          r = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "scan-empty.json")))
+          assert r["installs_scanned"] == 0, r
+          assert r["unique_packages"] == 0, r
+          assert r["hits"] == [], r
+          print("ok empty")
+          PY
+
+      - name: scan — missing log file is a clean success (treated as empty)
+        run: |
+          set -euxo pipefail
+          "$SAKIMORI_BIN" advisories scan \
+            --install-log "$RUNNER_TEMP/sakimori/nope.jsonl" \
+            --json > "$RUNNER_TEMP/scan-missing.json"
+          python3 - <<'PY'
+          import json, os
+          r = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "scan-missing.json")))
+          assert r["installs_scanned"] == 0, r
+          assert r["hits"] == [], r
+          print("ok missing")
+          PY
+
+      - name: proxy start accepts --no-install-log / --install-log flags
+        # Surface-level CLI test — we don't actually run the proxy
+        # here (proxy-smoke does that). Just prove the flags parse on
+        # every OS so a typo can't slip in on a platform we don't
+        # otherwise exercise.
+        run: |
+          set -euxo pipefail
+          "$SAKIMORI_BIN" proxy start --help > "$RUNNER_TEMP/proxy-help.txt"
+          grep -q -- "--no-install-log" "$RUNNER_TEMP/proxy-help.txt"
+          grep -q -- "--install-log" "$RUNNER_TEMP/proxy-help.txt"
+          echo "ok: install-log flags exposed on $RUNNER_OS"
+
+      - name: Upload scan outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: advisories-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/sakimori/installs.jsonl
+            ${{ runner.temp }}/scan.json
+            ${{ runner.temp }}/scan-empty.json
+            ${{ runner.temp }}/scan-missing.json
 
   proxy-action-smoke:
     # Verifies that `bokuweb/sakimori/proxy@v0` (the JS-action wrapper
