@@ -1,0 +1,55 @@
+name: "sakimori-proxy"
+description: |
+  Start `sakimori proxy` in the background and route every HTTPS
+  request from subsequent steps in this job through it. The proxy
+  silently filters too-young versions out of crates.io / npm / pypi /
+  nuget metadata responses, giving CI the pnpm-style
+  "minimumReleaseAge" auto-fallback for every ecosystem.
+
+  Works on Linux, macOS, and Windows GitHub-hosted runners. The
+  proxy keeps running until the post-step (end of job) kills it.
+author: "bokuweb"
+branding:
+  icon: "shield"
+  color: "red"
+
+inputs:
+  min-age:
+    description: |
+      Minimum package age (same grammar as `sakimori deps check`,
+      e.g. `7d`, `12h`). Versions younger than this are invisible to
+      the resolver.
+    required: false
+    default: "7d"
+  listen:
+    description: "Address the proxy listens on."
+    required: false
+    default: "127.0.0.1:8910"
+  fail-on-missing:
+    description: |
+      Treat unknown publish dates as a deny. Default fails open
+      (allow through) so a flaky registry doesn't brick the build.
+    required: false
+    default: "false"
+  version:
+    description: |
+      sakimori release tag to download. Defaults to the floating
+      `v0` tag, which always tracks the newest `v0.x.y` release.
+    required: false
+    default: "v0"
+  token:
+    description: "GitHub token for `gh release download`."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  ca-cert:
+    description: |
+      Absolute path to the proxy's root CA PEM. Also exported as
+      CARGO_HTTP_CAINFO / PIP_CERT / NODE_EXTRA_CA_CERTS /
+      REQUESTS_CA_BUNDLE / SSL_CERT_FILE via $GITHUB_ENV.
+
+runs:
+  using: node20
+  main: "main.js"
+  post: "post.js"

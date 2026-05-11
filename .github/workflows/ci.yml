@@ -756,3 +756,104 @@ jobs:
             ${{ runner.temp }}/sakimori-job.html
             ${{ runner.temp }}/sakimori-daemon.stdout.log
             ${{ runner.temp }}/sakimori-daemon.stderr.log
+
+  proxy-action-smoke:
+    # Verifies that `bokuweb/sakimori/proxy@v0` (the JS-action wrapper
+    # that spawns `sakimori proxy start` and exports HTTPS_PROXY via
+    # $GITHUB_ENV) actually works on all three supported OSes. The
+    # existing `proxy-smoke` job tests the proxy *binary* directly;
+    # this one tests the action wiring.
+    #
+    # Builds sakimori locally on each matrix entry and pre-sets
+    # SAKIMORI_BIN so the action skips its `gh release download` and
+    # exercises the binary built from THIS PR's code. Without that
+    # escape hatch we'd be testing whatever the published `@v0`
+    # binary happens to be — which currently lacks Windows proxy
+    # support, and even after release.yml learns to cross-build for
+    # Windows the action wouldn't be testable here until after the
+    # next tag goes out (chicken-and-egg).
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build sakimori (main binary; cross-OS via cfg-gated eBPF deps)
+        run: cargo build --release -p sakimori
+
+      - name: Prepare SAKIMORI_BIN env
+        run: |
+          set -euxo pipefail
+          case "$RUNNER_OS" in
+            Windows) bin="$GITHUB_WORKSPACE/target/release/sakimori.exe" ;;
+            *)       bin="$GITHUB_WORKSPACE/target/release/sakimori" ;;
+          esac
+          test -x "$bin"
+          echo "SAKIMORI_BIN=$bin" >> "$GITHUB_ENV"
+
+      # Pick an uncommon port to avoid colliding with anything the
+      # runner image might be listening on.
+      - uses: ./proxy
+        with:
+          min-age: 7d
+          listen: 127.0.0.1:18910
+
+      - name: Verify env vars are exported to subsequent steps
+        run: |
+          set -euxo pipefail
+          test -n "$HTTPS_PROXY"
+          test -n "$NODE_EXTRA_CA_CERTS"
+          test -f "$NODE_EXTRA_CA_CERTS"
+          echo "HTTPS_PROXY=$HTTPS_PROXY"
+          echo "CA=$NODE_EXTRA_CA_CERTS"
+
+      - name: Verify the proxy is reachable (TCP probe)
+        run: |
+          set -euxo pipefail
+          # Cross-OS TCP-port probe. The action's main job is to
+          # spawn the proxy + export env; this confirms the spawn
+          # actually produced a listening server that survives into
+          # this later step.
+          node -e "
+          const net = require('net');
+          const s = net.createConnection({ host: '127.0.0.1', port: 18910 }, () => {
+            console.log('proxy port open');
+            s.destroy();
+          });
+          s.on('error', e => { console.error('proxy port closed:', e.message); process.exit(1); });
+          "
+
+      # Rewriter end-to-end verification runs on Linux only — the
+      # existing `proxy-smoke` job covers it more thoroughly than we
+      # can here. On Windows the Git-Bash curl uses the schannel
+      # TLS backend, which ignores `--cacert` and doesn't trust our
+      # self-signed MITM CA without an explicit certutil install
+      # into the system store. That's out of scope: trusting the CA
+      # on Windows runners is the consumer's responsibility (e.g.
+      # via `bokuweb/sakimori proxy install-ca`), not the action's.
+      - name: Verify rewriter pruned recent serde versions (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          # Direct fetch — bypass our own env exports so we don't
+          # measure through the proxy by accident.
+          direct=$(env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy \
+                   curl -fsS https://index.crates.io/se/rd/serde | wc -l | tr -d ' ')
+          via=$(curl -fsS --cacert "$NODE_EXTRA_CA_CERTS" -x "$HTTPS_PROXY" \
+                  https://index.crates.io/se/rd/serde | wc -l | tr -d ' ')
+          echo "serde versions: direct=$direct via=$via"
+          if [ "$via" -gt "$direct" ]; then
+            echo "::error::proxy returned MORE versions than direct fetch ($via > $direct) — rewriter broken"
+            exit 1
+          fi
+          if [ "$via" -lt 50 ]; then
+            echo "::error::proxy kept implausibly few versions ($via) — rewriter likely returned empty body"
+            exit 1
+          fi
+          echo "✓ proxy is filtering crates.io responses on $RUNNER_OS"

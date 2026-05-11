@@ -679,21 +679,35 @@ attach attribution yet.
 
 ### Minimal: run every install through the proxy
 
+Works on **Linux, macOS, and Windows** GitHub-hosted runners (Windows
+requires sakimori v0.34.3 or newer — earlier Windows release tarballs
+ship only `sakimori-win.exe`, the ETW supervisor, which has no proxy
+subcommand). The proxy starts in the background as the action's main
+step, exports `HTTPS_PROXY` + the CA bundle for every common HTTPS
+client via `$GITHUB_ENV`, and survives across `run:` step boundaries
+until the post-step kills it at end-of-job.
+
 ```yaml
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      # Starts sakimori proxy in the background and appends
-      # HTTPS_PROXY + CA-bundle env vars to $GITHUB_ENV for later steps.
+      # Spawns `sakimori proxy start` detached and appends
+      # HTTPS_PROXY / CARGO_HTTP_CAINFO / NODE_EXTRA_CA_CERTS /
+      # PIP_CERT / REQUESTS_CA_BUNDLE / SSL_CERT_FILE to $GITHUB_ENV
+      # for every step after this one.
       - uses: bokuweb/sakimori/proxy@v0
         with:
           min-age: 7d
 
-      - run: npm ci          # flows through the proxy
-      - run: cargo test      # flows through the proxy
+      - run: npm ci          # routed through the proxy
+      - run: cargo test      # routed through the proxy
+      - run: pip install -r requirements.txt   # routed through the proxy
 ```
 
 Inputs:
@@ -704,6 +718,13 @@ Inputs:
 | `listen` | `127.0.0.1:8910` | Proxy listen address. |
 | `fail-on-missing` | `false` | Treat unknown publish dates as deny. |
 | `version` | `v0` | sakimori release tag to download. |
+| `token` | `${{ github.token }}` | Used by `gh release download`. |
+
+Outputs:
+
+| output | description |
+|---|---|
+| `ca-cert` | Absolute path to the proxy's root CA PEM. Also exported via `$GITHUB_ENV` as `CARGO_HTTP_CAINFO`, `PIP_CERT`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, and `SSL_CERT_FILE`. |
 
 ### Alternative: lockfile-only pre-flight check
 
