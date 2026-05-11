@@ -235,9 +235,14 @@ of value-per-implementation-cost.
     local action, or docker `@sha256:` digest), Warn (first-party
     `actions/*` / `github/*` with a mutable tag — risky but lower
     blast radius), or Error (third-party with a mutable tag/branch).
-    Text + JSON output, `--strict` escalates Warn → Error. Tag→SHA
-    auto-resolution via the GitHub API is deferred — it requires
-    auth and turns the offline tool into a network one.
+    Text + JSON output, `--strict` escalates Warn → Error. Opt-in
+    Tag→SHA auto-resolution via `--resolve` (v0.34): `GithubResolver`
+    hits `GET /repos/{o}/{r}/commits/{ref}`, caches per
+    `(owner, repo, ref)`, surfaces the resolved SHA as `→ resolved:
+    <sha>` in text mode and `resolved_sha` in JSON. Failures
+    (rate-limit, removed action) populate `resolve_error` per
+    finding without aborting the audit. Reads `GITHUB_TOKEN` from
+    the env to lift the rate limit from 60/hour to 5000/hour.
 11. **Per-step / per-PID source attribution** — ✅ implemented in
     v0.23. Linux drain task walks the PPid chain via
     `/proc/<pid>/{status,cmdline}` for each event and attaches an

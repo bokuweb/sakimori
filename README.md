@@ -526,17 +526,25 @@ suppresses the non-zero exit when you only want the report.
 Static analysis for `.github/workflows/*.yml`. Walks every `uses:`
 in the workflow and flags any reference that isn't pinned to a
 40-char commit SHA — the supply-chain analogue of an unpinned
-dependency. Offline, no GitHub API calls.
+dependency. Offline by default; opt into the GitHub API with
+`--resolve` when you want the suggested replacement SHA inline.
 
 ```bash
-coronarium actions audit .github/workflows/*.yml
+sakimori actions audit .github/workflows/*.yml
 
 # Machine-readable.
-coronarium actions audit --format json .github/workflows/ci.yml
+sakimori actions audit --format json .github/workflows/ci.yml
 
 # Treat first-party (actions/*, github/*) mutable refs as blocking
 # too — useful once you've already pinned all your third-party deps.
-coronarium actions audit --strict .github/workflows/*.yml
+sakimori actions audit --strict .github/workflows/*.yml
+
+# Look up the current SHA each mutable @<ref> resolves to via the
+# GitHub REST API. Reads $GITHUB_TOKEN from the env to lift the
+# rate limit from 60/hour to 5000/hour. The output gets a
+# `→ resolved: <sha>` line per finding (text) or a `resolved_sha`
+# field (JSON) so you can copy-paste the right pinned form.
+sakimori actions audit --resolve .github/workflows/*.yml
 ```
 
 Severity:
@@ -550,7 +558,9 @@ Severity:
 Exit code: `1` when at least one error is present (or any warn,
 under `--strict`); `0` otherwise. Composite-action `action.yml`
 files are ignored — only workflow files (those with a top-level
-`jobs:` block) are walked.
+`jobs:` block) are walked. Resolution failures (rate-limit, removed
+action) appear as `→ resolve failed: …` per finding without
+aborting the audit.
 
 ### `run`
 

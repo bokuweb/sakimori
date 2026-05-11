@@ -22,11 +22,14 @@
 //! - [`Severity::Ok`]: 40-char hex SHA, local action (`./...`), or a
 //!   docker image reference with a digest.
 //!
+//! Tag→SHA resolution is opt-in via the [`Resolver`] trait
+//! ([`GithubResolver`] uses the GitHub REST API). Without one, the
+//! audit stays fully offline and just flags problems.
+//!
 //! Out of scope (intentionally): walking `action.yml` composite
-//! action files, resolving tags to SHAs via the GitHub API
-//! (offline tool), and detecting `actions/*` published from a fork.
+//! action files; detecting `actions/*` published from a fork.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -51,11 +54,51 @@ pub struct Finding {
     pub uses: String,
     pub severity: Severity,
     pub message: String,
+    /// Set when the caller passed a [`Resolver`] and the mutable
+    /// `@<ref>` resolved to a 40-char commit SHA — gives the user
+    /// the exact replacement they should pin to. Skipped for OK
+    /// (already-pinned) findings, local actions, and lookup
+    /// failures (those are surfaced via [`Self::resolve_error`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_sha: Option<String>,
+    /// Reason the resolver couldn't produce a SHA. Only set when a
+    /// resolver was wired in *and* it returned an error — silent
+    /// skips (no resolver, OK finding, local action) leave both
+    /// `resolved_sha` and `resolve_error` as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolve_error: Option<String>,
 }
 
 impl Finding {
     pub fn is_blocking(&self) -> bool {
         matches!(self.severity, Severity::Error)
+    }
+
+    /// Owner/repo extracted from `uses` if it's a `<owner>/<repo>...@<ref>`
+    /// form. `None` for local (`./...`) and docker actions, and for
+    /// any malformed input.
+    fn owner_repo(&self) -> Option<(&str, &str)> {
+        let trimmed = self.uses.trim();
+        if trimmed.starts_with("./")
+            || trimmed.starts_with("../")
+            || trimmed.starts_with("docker://")
+        {
+            return None;
+        }
+        let path = trimmed.split_once('@').map(|(p, _)| p).unwrap_or(trimmed);
+        let mut parts = path.splitn(3, '/');
+        let owner = parts.next()?;
+        let repo = parts.next()?;
+        if owner.is_empty() || repo.is_empty() {
+            return None;
+        }
+        Some((owner, repo))
+    }
+
+    /// `<ref>` from `uses` (everything after `@`), or `None` when no
+    /// `@` is present.
+    fn reference(&self) -> Option<&str> {
+        self.uses.split_once('@').map(|(_, r)| r)
     }
 }
 
@@ -161,6 +204,8 @@ fn classify_finding(job: String, step: Option<String>, uses: &str) -> Finding {
         uses: uses.to_string(),
         severity,
         message,
+        resolved_sha: None,
+        resolve_error: None,
     }
 }
 
@@ -262,6 +307,145 @@ fn owner_of(uses: &str) -> Option<&str> {
         return None;
     }
     path.split('/').next().filter(|s| !s.is_empty())
+}
+
+// --- tag→SHA resolution ---------------------------------------------------
+
+/// Resolves a (`owner`, `repo`, `<ref>`) triple to a 40-char commit
+/// SHA. Trait so the audit core stays offline by default and so
+/// tests can substitute a deterministic fake.
+pub trait Resolver {
+    /// Returns the resolved SHA on success. The contract is "the
+    /// commit `<ref>` currently points at" — caller should treat
+    /// `Ok` as "this SHA is what `@<ref>` would resolve to right
+    /// now", which is exactly what the user should pin to.
+    fn resolve(&self, owner: &str, repo: &str, reference: &str) -> Result<String>;
+}
+
+/// Walk findings and ask `resolver` to fill in a SHA for every
+/// non-OK row that points at a `<owner>/<repo>@<ref>`. Rows
+/// without a parseable owner/repo or already-pinned rows are left
+/// alone. Lookups are cached per `(owner, repo, ref)` so a workflow
+/// that uses `actions/checkout@v4` ten times only hits the API once.
+///
+/// Failures populate `Finding::resolve_error` rather than aborting
+/// — one rate-limited or removed action shouldn't kill the whole
+/// audit.
+pub fn resolve_all(findings: &mut [Finding], resolver: &dyn Resolver) {
+    let mut cache: HashMap<(String, String, String), Result<String, String>> = HashMap::new();
+    for f in findings.iter_mut() {
+        if matches!(f.severity, Severity::Ok) {
+            continue;
+        }
+        let Some((owner, repo)) = f.owner_repo() else {
+            continue;
+        };
+        let Some(reference) = f.reference() else {
+            continue;
+        };
+        // Already a SHA → nothing to resolve.
+        if is_sha40(reference) {
+            continue;
+        }
+        let key = (owner.to_string(), repo.to_string(), reference.to_string());
+        let entry = cache.entry(key).or_insert_with(|| {
+            resolver
+                .resolve(owner, repo, reference)
+                .map_err(|e| format!("{e:#}"))
+        });
+        match entry {
+            Ok(sha) => f.resolved_sha = Some(sha.clone()),
+            Err(msg) => f.resolve_error = Some(msg.clone()),
+        }
+    }
+}
+
+/// `Resolver` backed by the GitHub REST API. Reads `GITHUB_TOKEN`
+/// from the environment when present (raises the rate limit from
+/// 60 req/hour unauthenticated to 5000 authenticated). Network
+/// timeouts are hard-coded conservatively — the caller usually
+/// audits a handful of unique refs, not a flood.
+///
+/// Endpoint: `GET /repos/{owner}/{repo}/commits/{ref}` returns a
+/// commit object whose `.sha` we extract. This works for tags and
+/// branches alike (GitHub resolves the ref through to the commit
+/// for us; for an annotated tag the API peels the tag automatically).
+pub struct GithubResolver {
+    user_agent: String,
+    token: Option<String>,
+    timeout: std::time::Duration,
+}
+
+impl GithubResolver {
+    pub fn new(user_agent: impl Into<String>) -> Self {
+        Self {
+            user_agent: user_agent.into(),
+            token: std::env::var("GITHUB_TOKEN").ok(),
+            timeout: std::time::Duration::from_secs(15),
+        }
+    }
+
+    pub fn with_token(mut self, token: Option<String>) -> Self {
+        self.token = token;
+        self
+    }
+
+    pub fn with_timeout(mut self, t: std::time::Duration) -> Self {
+        self.timeout = t;
+        self
+    }
+}
+
+impl Resolver for GithubResolver {
+    fn resolve(&self, owner: &str, repo: &str, reference: &str) -> Result<String> {
+        // Percent-encode the ref since branches like `feature/x` contain `/`
+        // and tags can technically include `+` etc. owner/repo are validated
+        // upstream by the YAML parser; we still sanity-check shape here
+        // because passing an empty segment to GitHub returns a misleading
+        // 404.
+        if owner.is_empty() || repo.is_empty() || reference.is_empty() {
+            anyhow::bail!("empty owner/repo/ref");
+        }
+        let url = format!(
+            "https://api.github.com/repos/{owner}/{repo}/commits/{}",
+            url_encode_ref(reference)
+        );
+        let mut req = ureq::get(&url)
+            .set("user-agent", &self.user_agent)
+            .set("accept", "application/vnd.github+json")
+            .timeout(self.timeout);
+        if let Some(t) = &self.token {
+            req = req.set("authorization", &format!("Bearer {t}"));
+        }
+        let resp = req.call().with_context(|| format!("GET {url}"))?;
+        if resp.status() != 200 {
+            anyhow::bail!("HTTP {} from {url}", resp.status());
+        }
+        let body: serde_json::Value = resp.into_json().context("parsing commit JSON")?;
+        let sha = body
+            .get("sha")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.len() == 40)
+            .ok_or_else(|| anyhow::anyhow!("`sha` field missing or not 40 chars"))?;
+        Ok(sha.to_string())
+    }
+}
+
+/// Tiny percent-encoder for the chars we actually see in tag/branch
+/// names. Avoids pulling `urlencoding` for one call site.
+fn url_encode_ref(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -434,9 +618,158 @@ jobs:
             uses: "x".into(),
             severity: s,
             message: String::new(),
+            resolved_sha: None,
+            resolve_error: None,
         };
         assert!(!mk(Severity::Ok).is_blocking());
         assert!(!mk(Severity::Warn).is_blocking());
         assert!(mk(Severity::Error).is_blocking());
+    }
+
+    /// Static-map resolver — every test that exercises `resolve_all`
+    /// uses one to keep the assertions deterministic and offline.
+    struct FakeResolver {
+        map: std::collections::HashMap<(String, String, String), Result<String, String>>,
+    }
+    impl FakeResolver {
+        fn new() -> Self {
+            Self {
+                map: std::collections::HashMap::new(),
+            }
+        }
+        fn ok(mut self, owner: &str, repo: &str, r: &str, sha: &str) -> Self {
+            self.map
+                .insert((owner.into(), repo.into(), r.into()), Ok(sha.into()));
+            self
+        }
+        fn err(mut self, owner: &str, repo: &str, r: &str, msg: &str) -> Self {
+            self.map
+                .insert((owner.into(), repo.into(), r.into()), Err(msg.into()));
+            self
+        }
+    }
+    impl Resolver for FakeResolver {
+        fn resolve(&self, owner: &str, repo: &str, reference: &str) -> Result<String> {
+            match self.map.get(&(owner.into(), repo.into(), reference.into())) {
+                Some(Ok(s)) => Ok(s.clone()),
+                Some(Err(e)) => anyhow::bail!("{e}"),
+                None => anyhow::bail!("no fixture for {owner}/{repo}@{reference}"),
+            }
+        }
+    }
+
+    fn fake_finding(uses: &str) -> Finding {
+        let (sev, msg) = classify(uses);
+        Finding {
+            job: "j".into(),
+            step: None,
+            uses: uses.into(),
+            severity: sev,
+            message: msg,
+            resolved_sha: None,
+            resolve_error: None,
+        }
+    }
+
+    #[test]
+    fn resolve_all_fills_sha_for_mutable_refs_and_skips_pinned_ones() {
+        let sha40 = "b4ffde65f46336ab88eb53be808477a3936bae11";
+        let mut findings = vec![
+            fake_finding("actions/checkout@v4"),       // Warn → resolve
+            fake_finding("foo/bar@main"),              // Error → resolve
+            fake_finding(&format!("foo/baz@{sha40}")), // Ok → skip
+            fake_finding("./local-action"),            // Ok local → skip
+        ];
+        let r = FakeResolver::new()
+            .ok("actions", "checkout", "v4", sha40)
+            .ok(
+                "foo",
+                "bar",
+                "main",
+                "0000000000000000000000000000000000000000",
+            );
+        resolve_all(&mut findings, &r);
+
+        assert_eq!(findings[0].resolved_sha.as_deref(), Some(sha40));
+        assert_eq!(findings[0].resolve_error, None);
+        assert_eq!(
+            findings[1].resolved_sha.as_deref(),
+            Some("0000000000000000000000000000000000000000")
+        );
+        assert!(findings[2].resolved_sha.is_none()); // already pinned
+        assert!(findings[3].resolved_sha.is_none()); // local action
+    }
+
+    #[test]
+    fn resolve_all_caches_repeated_lookups() {
+        // Two findings on the same (owner, repo, ref) should hit the
+        // resolver exactly once. The fake doesn't count calls
+        // directly, but if the cache is broken the second call
+        // would error (the fixture only matches once if we use a
+        // counting wrapper) — simpler check: drop the fixture and
+        // observe both findings still get the same answer because
+        // of cache, OR both fail with the same error.
+        struct Counter {
+            inner: FakeResolver,
+            calls: std::cell::Cell<u32>,
+        }
+        impl Resolver for Counter {
+            fn resolve(&self, o: &str, r: &str, x: &str) -> Result<String> {
+                self.calls.set(self.calls.get() + 1);
+                self.inner.resolve(o, r, x)
+            }
+        }
+        let r = Counter {
+            inner: FakeResolver::new().ok("a", "b", "v1", "1".repeat(40).as_str()),
+            calls: std::cell::Cell::new(0),
+        };
+        let mut findings = vec![
+            fake_finding("a/b@v1"),
+            fake_finding("a/b@v1"),
+            fake_finding("a/b@v1"),
+        ];
+        resolve_all(&mut findings, &r);
+        assert_eq!(r.calls.get(), 1, "expected one cached resolve");
+        for f in &findings {
+            assert!(f.resolved_sha.is_some());
+        }
+    }
+
+    #[test]
+    fn resolve_all_records_error_per_finding_without_aborting() {
+        let mut findings = vec![
+            fake_finding("good/repo@v1"),
+            fake_finding("rate/limited@v1"),
+        ];
+        let sha = "a".repeat(40);
+        let r = FakeResolver::new().ok("good", "repo", "v1", &sha).err(
+            "rate",
+            "limited",
+            "v1",
+            "HTTP 403 from api.github.com",
+        );
+        resolve_all(&mut findings, &r);
+        assert_eq!(findings[0].resolved_sha.as_deref(), Some(sha.as_str()));
+        assert!(findings[0].resolve_error.is_none());
+        assert!(findings[1].resolved_sha.is_none());
+        let err = findings[1].resolve_error.as_deref().unwrap();
+        assert!(err.contains("HTTP 403"), "{err}");
+    }
+
+    #[test]
+    fn finding_owner_repo_extraction_handles_subpath_and_local() {
+        let f = fake_finding("foo/bar/sub/path@v1");
+        assert_eq!(f.owner_repo(), Some(("foo", "bar")));
+        let f = fake_finding("./local");
+        assert_eq!(f.owner_repo(), None);
+        let f = fake_finding("docker://alpine:3");
+        assert_eq!(f.owner_repo(), None);
+    }
+
+    #[test]
+    fn url_encode_ref_handles_slashes_and_pluses() {
+        assert_eq!(url_encode_ref("v4"), "v4");
+        assert_eq!(url_encode_ref("feature/x"), "feature%2Fx");
+        assert_eq!(url_encode_ref("v1.0+build"), "v1.0%2Bbuild");
     }
 }
