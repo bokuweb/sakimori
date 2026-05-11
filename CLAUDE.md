@@ -249,6 +249,38 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
    `pipx run` / `cargo install` history. sakimori is positioned
    at the fetch layer, so it can.
 
+   **Competitive landscape note**: no shipped product covers all
+   four axes simultaneously — *package-aware* + *execution
+   history* + *developer endpoint* + *retroactive advisory JOIN*.
+   SCA tools (Snyk / Socket / Phylum / Dependabot) are
+   package-aware but lockfile-scoped, so ephemeral runs are
+   invisible. EDR / XDR (CrowdStrike, SentinelOne, Defender for
+   Endpoint, Elastic Security) record every exec but see only
+   `node` + argv, not "this was `npx leftpad@1.2.3`" — the
+   advisory→exec correlation is manual threat-hunting, not a
+   product feature. Registry firewalls (Sonatype Nexus Firewall,
+   JFrog Xray) sit at the right layer but target enterprise
+   artifact repos, not developer laptops. The gap exists because
+   SCA is repo-bound and EDR's abstraction stops at the process
+   tree; bridging them needs a fetch-layer agent on the endpoint,
+   which is exactly where sakimori already lives.
+
+   **Alert-fatigue caveat** (don't ship this naïvely): if every
+   low-severity advisory triggers a "you may have executed this 3
+   weeks ago" notification, the signal drowns immediately. The
+   ephemeral-mode notifier must be gated on at least:
+   (a) severity ≥ High or known-exploited (KEV / GHSA `actively
+   exploited`),
+   (b) the advisory implicates install-time or run-time code paths
+   (postinstall script, build-backend hook, or RCE in the imported
+   surface — not e.g. a ReDoS in a code path the one-shot never
+   touched),
+   (c) package-popularity / typosquat heuristics to deprioritise
+   obvious noise.
+   These filters should be tunable and default conservative; the
+   "investigate compromise" framing is high-cost-per-alert and
+   loses credibility fast if it cries wolf.
+
 ### harden-runner parity gaps (tracked but not yet scheduled)
 
 These are features `step-security/harden-runner` ships that
