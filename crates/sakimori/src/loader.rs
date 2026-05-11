@@ -427,6 +427,10 @@ mod tests {
     use sakimori_core::policy::{FilePolicy, ProcessPolicy};
 
     fn make_open_event_bytes(pid: u32, filename: &str) -> Vec<u8> {
+        make_open_event_bytes_pid_tgid(pid, pid, filename)
+    }
+
+    fn make_open_event_bytes_pid_tgid(pid: u32, tgid: u32, filename: &str) -> Vec<u8> {
         let mut path_buf = [0u8; PATH_LEN];
         let bytes = filename.as_bytes();
         path_buf[..bytes.len()].copy_from_slice(bytes);
@@ -435,7 +439,7 @@ mod tests {
                 kind: EVENT_KIND_OPEN,
                 verdict: VERDICT_ALLOW,
                 pid,
-                tgid: pid,
+                tgid,
                 uid: 0,
                 _pad: 0,
                 comm: [0u8; COMM_LEN],
@@ -488,5 +492,41 @@ mod tests {
 
         ingest(&mut stats, &raw, &fm, &em, None, 99999);
         assert_eq!(stats.observed, 1);
+    }
+
+    /// Regression for the v0.32.0 file-block CI failure. The eBPF
+    /// program splits `bpf_get_current_pid_tgid()` into `header.pid`
+    /// (kernel TID) and `header.tgid` (POSIX PID). Userspace decode
+    /// must read tgid, otherwise:
+    ///
+    /// - The supervisor's own tokio worker threads have TID ≠ tgid,
+    ///   so the supervisor-self filter wouldn't catch them
+    ///   (re-introducing the /proc-read feedback loop).
+    /// - cat opens /etc/shadow on a different thread of the same
+    ///   process; the audit log would show TID, not the PID a
+    ///   human or the test grep-script expects.
+    #[test]
+    fn ingest_treats_event_pid_as_posix_tgid_not_kernel_tid() {
+        // Synthetic event from a worker thread of the supervisor:
+        // TID 9999, tgid (POSIX PID) 4242. Filter must match.
+        let supervisor_pid = 4242;
+        let raw = make_open_event_bytes_pid_tgid(9999, supervisor_pid, "/proc/2109/cmdline");
+        let mut stats = Stats::default();
+        let fm = FileMatcher::from_policy(&FilePolicy::default());
+        let em = ExecMatcher::from_policy(&ProcessPolicy::default());
+
+        ingest(&mut stats, &raw, &fm, &em, None, supervisor_pid);
+        assert_eq!(
+            stats.observed, 0,
+            "event from supervisor's worker thread (TID != tgid) must be filtered by tgid match"
+        );
+
+        // And the inverse: a real supervised-tree event whose TID
+        // happens to collide with supervisor_pid (rare but possible
+        // PID-namespace edge case) should still be kept, because
+        // the filter looks at tgid.
+        let raw = make_open_event_bytes_pid_tgid(supervisor_pid, 5555, "/etc/passwd");
+        ingest(&mut stats, &raw, &fm, &em, None, supervisor_pid);
+        assert_eq!(stats.observed, 1, "tgid 5555 != supervisor 4242 → keep");
     }
 }
