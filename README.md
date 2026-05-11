@@ -706,7 +706,45 @@ of silently falling back.
 - run: cargo test   # only reached if the check passed
 ```
 
-### eBPF-supervised test run (Linux + Windows)
+### eBPF-supervised test run — one-step form (Linux + Windows)
+
+The simplest form: pass the command you want supervised via the
+`run:` input. The action installs sakimori AND wraps the command
+with `sakimori run` for you — no separate `sudo -E env "PATH=$PATH"
+"$SAKIMORI_BIN" run …` step required.
+
+```yaml
+strategy:
+  matrix:
+    os: [ubuntu-latest, windows-latest]
+runs-on: ${{ matrix.os }}
+steps:
+  - uses: actions/checkout@v4
+  - uses: bokuweb/sakimori@v0
+    with:
+      policy: .github/sakimori.yml
+      mode: audit
+      html: sakimori-report.html
+      run: |
+        corepack enable
+        cargo test
+        pnpm install --frozen-lockfile
+        pnpm test
+```
+
+On Linux the script runs under
+`sudo -E env "PATH=$PATH" "$SAKIMORI_BIN" run … -- bash -euxo pipefail -c '<run>'`;
+on Windows under `& $env:SAKIMORI_BIN … -- pwsh -NoProfile -Command "<run>"`.
+`--summary` defaults to `$GITHUB_STEP_SUMMARY` and `--log` defaults
+to the `log:` input (`sakimori.log.json`). Add `snapshot-workspace:
+<dir>` to also catch on-disk tampering.
+
+### eBPF-supervised test run — explicit form (Linux + Windows)
+
+If you need more control over the wrapper invocation, omit `run:`
+and write the `sakimori run` step yourself. The action exports
+`$SAKIMORI_BIN`, `$SAKIMORI_POLICY`, `$SAKIMORI_MODE`, and
+`$SAKIMORI_LOG` for you.
 
 ```yaml
 strategy:

@@ -22,6 +22,29 @@ inputs:
     description: "Where the subsequent `sakimori run` step should write its JSON audit log."
     required: false
     default: "sakimori.log.json"
+  run:
+    description: |
+      Optional shell script to supervise. If set, the action installs sakimori
+      AND runs the script under `sakimori run` automatically — no separate
+      step needed. On Linux the script is executed with
+      `sudo -E env "PATH=$PATH" "$SAKIMORI_BIN" run … -- bash -euxo pipefail -c '<run>'`;
+      on Windows with `& $env:SAKIMORI_BIN run … -- pwsh -NoProfile -Command "<run>"`.
+      Leave empty (default) to keep the install-only behaviour and write the
+      `sakimori run` invocation yourself in a later step.
+    required: false
+    default: ""
+  html:
+    description: "Path to write the HTML report to (passed as `--html`). Only used when `run` is set."
+    required: false
+    default: "sakimori-report.html"
+  summary:
+    description: "Path the supervised run should append its step-summary markdown to (passed as `--summary`). Defaults to $GITHUB_STEP_SUMMARY. Only used when `run` is set."
+    required: false
+    default: ""
+  snapshot-workspace:
+    description: "If set, passed as `--snapshot-workspace <path>` to take a workspace tamper-detection baseline before and after the supervised command. Only used when `run` is set."
+    required: false
+    default: ""
 
 outputs:
   bin:
@@ -149,11 +172,88 @@ runs:
           echo "::notice::policy file '${SAKIMORI_POLICY}' not found — the next 'sakimori run' step should point --policy somewhere real."
         fi
         echo ""
-        echo "Sakimori (Linux) installed. Wrap the command you want to supervise like:"
-        echo "    - run: sudo -E \$SAKIMORI_BIN run --policy <path> --mode \$SAKIMORI_MODE --log \$SAKIMORI_LOG --summary \$GITHUB_STEP_SUMMARY -- <your command>"
+        if [[ -z "${INPUT_RUN}" ]]; then
+          echo "Sakimori (Linux) installed. Wrap the command you want to supervise like:"
+          echo "    - run: sudo -E \$SAKIMORI_BIN run --policy <path> --mode \$SAKIMORI_MODE --log \$SAKIMORI_LOG --summary \$GITHUB_STEP_SUMMARY -- <your command>"
+          echo ""
+          echo "Or, to let this action wrap the command for you, pass it via the 'run:' input."
+        fi
+      env:
+        INPUT_RUN: ${{ inputs.run }}
 
     - shell: pwsh
       if: runner.os == 'Windows'
+      env:
+        INPUT_RUN: ${{ inputs.run }}
       run: |
-        Write-Host "Sakimori (Windows) installed. Wrap the command you want to supervise like:"
-        Write-Host "    - run: & `"$env:SAKIMORI_BIN`" --policy <path> --mode $env:SAKIMORI_MODE --log $env:SAKIMORI_LOG --summary $env:GITHUB_STEP_SUMMARY -- <your command>"
+        if ([string]::IsNullOrEmpty($env:INPUT_RUN)) {
+          Write-Host "Sakimori (Windows) installed. Wrap the command you want to supervise like:"
+          Write-Host "    - run: & `"$env:SAKIMORI_BIN`" --policy <path> --mode $env:SAKIMORI_MODE --log $env:SAKIMORI_LOG --summary $env:GITHUB_STEP_SUMMARY -- <your command>"
+          Write-Host ""
+          Write-Host "Or, to let this action wrap the command for you, pass it via the 'run:' input."
+        }
+
+    # --------------- Optional supervised-run (Linux) ---------------
+    # Only fires when the caller set `with: run: |\n  …`. Mirrors the
+    # canonical `sudo -E env "PATH=$PATH" "$SAKIMORI_BIN" run …` snippet
+    # from the README so callers don't have to copy it by hand.
+    - name: sakimori run (Linux)
+      if: runner.os == 'Linux' && inputs.run != ''
+      shell: bash
+      env:
+        INPUT_RUN: ${{ inputs.run }}
+        INPUT_HTML: ${{ inputs.html }}
+        INPUT_SUMMARY: ${{ inputs.summary }}
+        INPUT_SNAPSHOT_WORKSPACE: ${{ inputs.snapshot-workspace }}
+      run: |
+        set -euo pipefail
+        args=(
+          run
+          --policy "${SAKIMORI_POLICY}"
+          --mode   "${SAKIMORI_MODE}"
+          --log    "${SAKIMORI_LOG}"
+        )
+        if [[ -n "${INPUT_HTML}" ]]; then
+          args+=(--html "${INPUT_HTML}")
+        fi
+        summary_path="${INPUT_SUMMARY:-${GITHUB_STEP_SUMMARY:-}}"
+        if [[ -n "${summary_path}" ]]; then
+          args+=(--summary "${summary_path}")
+        fi
+        if [[ -n "${INPUT_SNAPSHOT_WORKSPACE}" ]]; then
+          args+=(--snapshot-workspace "${INPUT_SNAPSHOT_WORKSPACE}")
+        fi
+        # `sudo -E` preserves env *except* PATH (sudo always resets it
+        # to secure_path). Re-inject the runner user's PATH so the
+        # supervised child can find pnpm / cargo / rustup-installed
+        # toolchains.
+        sudo -E env "PATH=$PATH" "${SAKIMORI_BIN}" "${args[@]}" \
+          -- bash -euxo pipefail -c "${INPUT_RUN}"
+
+    # --------------- Optional supervised-run (Windows) ---------------
+    - name: sakimori run (Windows)
+      if: runner.os == 'Windows' && inputs.run != ''
+      shell: pwsh
+      env:
+        INPUT_RUN: ${{ inputs.run }}
+        INPUT_HTML: ${{ inputs.html }}
+        INPUT_SUMMARY: ${{ inputs.summary }}
+        INPUT_SNAPSHOT_WORKSPACE: ${{ inputs.snapshot-workspace }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $cliArgs = @(
+          "--policy", $env:SAKIMORI_POLICY,
+          "--log",    $env:SAKIMORI_LOG
+        )
+        if (-not [string]::IsNullOrEmpty($env:INPUT_HTML)) {
+          $cliArgs += @("--html", $env:INPUT_HTML)
+        }
+        $summaryPath = if ([string]::IsNullOrEmpty($env:INPUT_SUMMARY)) { $env:GITHUB_STEP_SUMMARY } else { $env:INPUT_SUMMARY }
+        if (-not [string]::IsNullOrEmpty($summaryPath)) {
+          $cliArgs += @("--summary", $summaryPath)
+        }
+        if (-not [string]::IsNullOrEmpty($env:INPUT_SNAPSHOT_WORKSPACE)) {
+          $cliArgs += @("--snapshot-workspace", $env:INPUT_SNAPSHOT_WORKSPACE)
+        }
+        & $env:SAKIMORI_BIN @cliArgs -- pwsh -NoProfile -Command $env:INPUT_RUN
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
