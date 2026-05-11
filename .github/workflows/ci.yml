@@ -759,15 +759,19 @@ jobs:
 
   proxy-action-smoke:
     # Verifies that `bokuweb/sakimori/proxy@v0` (the JS-action wrapper
-    # that downloads the binary, starts the proxy, and exports
-    # HTTPS_PROXY via $GITHUB_ENV) actually works on all three
-    # supported OSes. The existing `proxy-smoke` job tests the proxy
-    # *binary* directly; this one tests the action wiring.
+    # that spawns `sakimori proxy start` and exports HTTPS_PROXY via
+    # $GITHUB_ENV) actually works on all three supported OSes. The
+    # existing `proxy-smoke` job tests the proxy *binary* directly;
+    # this one tests the action wiring.
     #
-    # Uses `uses: ./proxy` so we test the code in *this* PR.
-    # `./` action references skip pre/post hooks, but the proxy action
-    # only declares main + post — post is "kill the proxy" cleanup
-    # which the runner image teardown handles anyway. main runs.
+    # Builds sakimori locally on each matrix entry and pre-sets
+    # SAKIMORI_BIN so the action skips its `gh release download` and
+    # exercises the binary built from THIS PR's code. Without that
+    # escape hatch we'd be testing whatever the published `@v0`
+    # binary happens to be — which currently lacks Windows proxy
+    # support, and even after release.yml learns to cross-build for
+    # Windows the action wouldn't be testable here until after the
+    # next tag goes out (chicken-and-egg).
     strategy:
       fail-fast: false
       matrix:
@@ -778,6 +782,20 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build sakimori (main binary; cross-OS via cfg-gated eBPF deps)
+        run: cargo build --release -p sakimori
+
+      - name: Prepare SAKIMORI_BIN env
+        run: |
+          set -euxo pipefail
+          case "$RUNNER_OS" in
+            Windows) bin="$GITHUB_WORKSPACE/target/release/sakimori.exe" ;;
+            *)       bin="$GITHUB_WORKSPACE/target/release/sakimori" ;;
+          esac
+          test -x "$bin"
+          echo "SAKIMORI_BIN=$bin" >> "$GITHUB_ENV"
 
       # Pick an uncommon port to avoid colliding with anything the
       # runner image might be listening on.
@@ -794,18 +812,16 @@ jobs:
           test -f "$NODE_EXTRA_CA_CERTS"
           echo "HTTPS_PROXY=$HTTPS_PROXY"
           echo "CA=$NODE_EXTRA_CA_CERTS"
-          # cross-OS test that the daemon is alive: the curl below
-          # is the actually-useful proof.
 
       - name: Verify a request is routed through the proxy and rewritten
         run: |
           set -euxo pipefail
           # crates.io's sparse index for `serde` returns one JSONL
           # line per version. The proxy's `--min-age 7d` filter
-          # removes any version published in the last week — so the
-          # via-proxy response must have FEWER lines than the direct
-          # one (or the same, if no versions have been published in
-          # the past week, which is unlikely for serde).
+          # removes any version published in the last week, so the
+          # via-proxy response must have <= the direct line count.
+          # serde gets a release roughly weekly, so we expect strict
+          # < almost always.
           direct=$(curl -fsS https://index.crates.io/se/rd/serde | wc -l | tr -d ' ')
           via=$(curl -fsS --cacert "$NODE_EXTRA_CA_CERTS" -x "$HTTPS_PROXY" \
                   https://index.crates.io/se/rd/serde | wc -l | tr -d ' ')
@@ -818,4 +834,4 @@ jobs:
             echo "::error::proxy kept implausibly few versions ($via) — rewriter likely returned empty body"
             exit 1
           fi
-          echo "✓ proxy is filtering crates.io responses"
+          echo "✓ proxy is filtering crates.io responses on $RUNNER_OS"

@@ -679,11 +679,13 @@ attach attribution yet.
 
 ### Minimal: run every install through the proxy
 
-Works on **Linux, macOS, and Windows** GitHub-hosted runners. The
-proxy starts in the background as the action's main step, exports
-`HTTPS_PROXY` + the CA bundle for every common HTTPS client via
-`$GITHUB_ENV`, and survives across `run:` step boundaries until the
-post-step kills it at end-of-job.
+Works on **Linux, macOS, and Windows** GitHub-hosted runners (Windows
+requires sakimori v0.34.3 or newer — earlier Windows release tarballs
+ship only `sakimori-win.exe`, the ETW supervisor, which has no proxy
+subcommand). The proxy starts in the background as the action's main
+step, exports `HTTPS_PROXY` + the CA bundle for every common HTTPS
+client via `$GITHUB_ENV`, and survives across `run:` step boundaries
+until the post-step kills it at end-of-job.
 
 ```yaml
 jobs:

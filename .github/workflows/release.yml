@@ -111,9 +111,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build sakimori-win
+      - name: Build sakimori-win (ETW supervisor)
         working-directory: crates/sakimori-win
         run: cargo build --release
+      - name: Build sakimori (main binary — proxy / deps / actions /...)
+        # eBPF features are cfg-gated to target_os = "linux", so the
+        # main crate compiles on Windows without aya / nix / libc.
+        # The resulting `sakimori.exe` is what `bokuweb/sakimori/proxy@v0`
+        # spawns for `sakimori proxy start`.
+        run: cargo build --release -p sakimori
 
       - name: Package tarball
         shell: pwsh
@@ -122,6 +128,7 @@ jobs:
           $staging = "staging\$name"
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
           Copy-Item "crates\sakimori-win\target\release\sakimori-win.exe" "$staging\sakimori-win.exe"
+          Copy-Item "target\release\sakimori.exe" "$staging\sakimori.exe"
           Copy-Item README.md "$staging\" -ErrorAction SilentlyContinue
           tar -czf "$name.tar.gz" -C staging $name
           $hash = (Get-FileHash "$name.tar.gz" -Algorithm SHA256).Hash.ToLower()

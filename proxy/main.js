@@ -48,6 +48,13 @@ function setOutput(name, value) {
 
 // Resolve (triple, binName) for the current OS/arch. Matches the
 // release-artefact naming in release.yml.
+//
+// Windows note: we ask for `sakimori.exe`, NOT `sakimori-win.exe`.
+// The two are different binaries: sakimori-win is the ETW
+// supervisor (no proxy subcommand); sakimori is the main binary
+// that ships the proxy. Both are packed in the Windows tarball
+// from v0.34.3+. For older releases see the docs — the proxy
+// subcommand isn't available on Windows there.
 function platformAsset() {
   const arch = os.arch();
   if (process.platform === "linux") {
@@ -59,7 +66,7 @@ function platformAsset() {
     return { triple: `${a}-apple-darwin`, binName: "sakimori" };
   }
   if (process.platform === "win32") {
-    return { triple: "x86_64-pc-windows-msvc", binName: "sakimori-win.exe" };
+    return { triple: "x86_64-pc-windows-msvc", binName: "sakimori.exe" };
   }
   fail(`unsupported platform: ${process.platform}`);
 }
@@ -168,8 +175,6 @@ async function waitForListen(host, port, deadlineMs) {
 (async () => {
   const { triple, binName } = platformAsset();
   const token = input("token") || process.env.GITHUB_TOKEN || "";
-  const versionExpr = input("version") || process.env.GITHUB_ACTION_REF || "";
-  const version = resolveVersion(versionExpr, token);
   const listen = input("listen", "127.0.0.1:8910");
   const minAge = input("min-age", "7d");
   const failOnMissing = input("fail-on-missing") === "true";
@@ -182,19 +187,35 @@ async function waitForListen(host, port, deadlineMs) {
   const configDir = path.join(tmpDir, "config");
   fs.mkdirSync(configDir, { recursive: true });
 
-  console.log(`sakimori-proxy: installing ${version} (${triple}) into ${tmpDir}`);
-  downloadAndExtract(version, triple, tmpDir, token);
-
-  const binPath = path.join(tmpDir, `sakimori-${triple}`, binName);
-  if (!fs.existsSync(binPath)) {
-    // Help debug layout issues if the release tarball ever changes shape.
-    let listing = "";
-    try {
-      listing = fs.readdirSync(tmpDir).join(", ");
-    } catch {
-      /* ignore */
+  // SAKIMORI_BIN escape hatch — skip download when a caller (the
+  // CI smoke matrix, an air-gapped runner, …) has already placed a
+  // working binary on disk and set the env. Matches the pattern
+  // bokuweb/sakimori/job@v0 already uses.
+  const presetBin = process.env.SAKIMORI_BIN || "";
+  let binPath;
+  if (presetBin && fs.existsSync(presetBin)) {
+    notice(`sakimori-proxy: using pre-installed sakimori at ${presetBin}`);
+    binPath = presetBin;
+  } else {
+    const versionExpr = input("version") || process.env.GITHUB_ACTION_REF || "";
+    const version = resolveVersion(versionExpr, token);
+    console.log(
+      `sakimori-proxy: installing ${version} (${triple}) into ${tmpDir}`,
+    );
+    downloadAndExtract(version, triple, tmpDir, token);
+    binPath = path.join(tmpDir, `sakimori-${triple}`, binName);
+    if (!fs.existsSync(binPath)) {
+      // Help debug layout issues if the release tarball ever changes shape.
+      let listing = "";
+      try {
+        listing = fs.readdirSync(tmpDir).join(", ");
+      } catch {
+        /* ignore */
+      }
+      fail(
+        `expected binary at ${binPath} but not found; tmpDir contains: ${listing}`,
+      );
     }
-    fail(`expected binary at ${binPath} but not found; tmpDir contains: ${listing}`);
   }
   if (process.platform !== "win32") {
     fs.chmodSync(binPath, 0o755);
