@@ -268,6 +268,17 @@ Options:
                                fall back to the live API for
                                entries the mirror hasn't indexed.
   --osv-mirror-url <URL>       Override mirror URL (e.g. self-hosted).
+  --network-allow <HOST>       Hostname egress allow-list (repeatable).
+                               Patterns: `host.example.com` (exact) or
+                               `*.example.com` (any subdomain, excludes
+                               apex). When set, the proxy default-denies
+                               every CONNECT/HTTP whose target host
+                               doesn't match, returning 403. Off by
+                               default — without any flag, every host
+                               passes through.
+  --network-allow-file <PATH>  Read additional `--network-allow`
+                               patterns from a file (one per line;
+                               `#` comments / blank lines skipped).
   --config-dir <PATH>          Override CA / config directory.
                                Defaults to $XDG_CONFIG_HOME/sakimori
                                on Unix, %LOCALAPPDATA%\sakimori on
@@ -277,6 +288,21 @@ Options:
 **First-run side effect**: generates a self-signed root CA at the
 config dir and prints the OS-specific trust command. Subsequent runs
 reuse the existing CA.
+
+**Egress allow-list** closes the eBPF-by-IP gap: when you also run
+`sakimori run` with a network policy, the kernel layer enforces by
+resolved IP and loses against CDN rotation. The proxy's hostname
+filter sees the SNI / `Host:` value the client actually asked for,
+so an entry like `*.githubusercontent.com` matches every rotating
+CDN IP automatically — the same convention `step-security/harden-runner`
+users are used to:
+
+```bash
+sakimori proxy start \
+    --network-allow api.github.com \
+    --network-allow '*.githubusercontent.com' \
+    --network-allow registry.npmjs.org
+```
 
 ### `proxy install-ca` / `uninstall-ca`
 

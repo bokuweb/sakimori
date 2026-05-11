@@ -70,6 +70,12 @@ pub struct ProxyConfig {
     pub user_agent: String,
     /// Override to inject a fake oracle in tests.
     pub oracle: Option<Box<dyn AgeOracle>>,
+    /// Optional egress allow-list. When `Some` and non-empty, the
+    /// proxy default-denies every host not on the list (including
+    /// CONNECT requests for non-MITM'd hosts). When `None`, egress
+    /// is unrestricted — current behaviour. See
+    /// [`crate::host_allow::HostMatcher`] for pattern grammar.
+    pub network_allow: Option<crate::host_allow::HostMatcher>,
 }
 
 impl ProxyConfig {
@@ -88,6 +94,7 @@ impl ProxyConfig {
             ca_files: CaFiles::at_default_location()?,
             user_agent: format!("sakimori-proxy/{}", env!("CARGO_PKG_VERSION")),
             oracle: None,
+            network_allow: None,
         })
     }
 }
@@ -178,6 +185,14 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
         typosquat,
     });
 
+    if let Some(matcher) = cfg.network_allow.as_ref()
+        && !matcher.is_empty()
+    {
+        log::info!(
+            "egress allow-list active: {} pattern(s) — non-matching CONNECT/HTTP returns 403",
+            matcher.len(),
+        );
+    }
     let handler = SakimoriHandler {
         parsers: Arc::new(default_parsers()),
         decider,
@@ -186,6 +201,7 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
         require_provenance: cfg.require_provenance,
         nuget_flat: NugetFlatContainerClient::new(cfg.user_agent.clone()),
         pypi_simple: PypiSimpleClient::new(cfg.user_agent.clone()),
+        network_allow: cfg.network_allow.map(Arc::new),
     };
 
     // `.build()` in hudsucker 0.22 returns Proxy<…> directly; no Result.
@@ -215,6 +231,47 @@ fn should_intercept(host: &str, parsers: &[Box<dyn RegistryParser>]) -> bool {
     parsers.iter().any(|p| host.eq_ignore_ascii_case(p.host()))
 }
 
+/// Decide whether an incoming request should be denied by the
+/// hostname allow-list. Returns `None` to allow (or when the
+/// matcher is empty / disabled), `Some(reason)` to deny.
+///
+/// CONNECT requests carry the target host in `req.uri().authority()`;
+/// plain HTTP requests in the `Host:` header. Picking the right one
+/// matters because hudsucker invokes `handle_request` for the
+/// CONNECT itself — a denied CONNECT must short-circuit before the
+/// upstream tunnel opens.
+///
+/// Extracted so the deny decision can be unit-tested without
+/// constructing hudsucker's `HttpContext`.
+fn egress_deny_reason(
+    matcher: &crate::host_allow::HostMatcher,
+    method: &http::Method,
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
+) -> Option<String> {
+    if matcher.is_empty() {
+        return None;
+    }
+    let target = if method == http::Method::CONNECT {
+        uri.authority()
+            .map(|a| a.as_str().to_string())
+            .unwrap_or_default()
+    } else {
+        headers
+            .get(http::header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string)
+            .unwrap_or_default()
+    };
+    if matcher.allows(&target) {
+        None
+    } else {
+        Some(format!(
+            "egress denied: host `{target}` not on the allow-list"
+        ))
+    }
+}
+
 #[derive(Clone)]
 struct SakimoriHandler {
     parsers: Arc<Vec<Box<dyn RegistryParser>>>,
@@ -238,6 +295,11 @@ struct SakimoriHandler {
     /// API so we can silently filter the PEP 503 HTML Simple index
     /// (which has no dates inline).
     pypi_simple: PypiSimpleClient,
+    /// Hostname allow-list. `None` (or empty) → unrestricted egress.
+    /// `Some(non-empty)` → default-deny: any CONNECT or plain-HTTP
+    /// request whose target host doesn't match returns 403 before
+    /// hudsucker tunnels or MITMs anything.
+    network_allow: Option<Arc<crate::host_allow::HostMatcher>>,
 }
 
 impl HttpHandler for SakimoriHandler {
@@ -246,6 +308,17 @@ impl HttpHandler for SakimoriHandler {
         _ctx: &HttpContext,
         req: Request<Body>,
     ) -> RequestOrResponse {
+        // Hostname egress allow-list — runs before everything else.
+        if let Some(matcher) = self.network_allow.as_deref()
+            && let Some(reason) =
+                egress_deny_reason(matcher, req.method(), req.uri(), req.headers())
+        {
+            log::warn!("egress deny: {} {}", req.method(), reason);
+            self.last_host = None;
+            self.last_path = None;
+            return RequestOrResponse::Response(deny_response(&reason));
+        }
+
         // Host header is required; without it we can't route.
         let host = req
             .headers()
@@ -823,5 +896,83 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("minimum-release-age")
         );
+    }
+
+    fn matcher(pats: &[&str]) -> crate::host_allow::HostMatcher {
+        crate::host_allow::HostMatcher::from_patterns(pats.iter().copied()).unwrap()
+    }
+
+    #[test]
+    fn egress_deny_reason_passes_when_matcher_empty() {
+        let m = crate::host_allow::HostMatcher::default();
+        let mut h = http::HeaderMap::new();
+        h.insert(http::header::HOST, "anywhere.example".parse().unwrap());
+        let r = egress_deny_reason(&m, &http::Method::GET, &"/".parse().unwrap(), &h);
+        assert!(r.is_none(), "empty matcher = feature off, must allow");
+    }
+
+    #[test]
+    fn egress_deny_reason_uses_uri_authority_for_connect() {
+        // CONNECT requests put the target in the URI's authority,
+        // not in the Host header. Filtering on Host would let
+        // every CONNECT through.
+        let m = matcher(&["api.github.com"]);
+        let h = http::HeaderMap::new();
+        // Allowed CONNECT.
+        let allowed = egress_deny_reason(
+            &m,
+            &http::Method::CONNECT,
+            &"api.github.com:443".parse().unwrap(),
+            &h,
+        );
+        assert!(allowed.is_none());
+        // Denied CONNECT.
+        let denied = egress_deny_reason(
+            &m,
+            &http::Method::CONNECT,
+            &"evil.example:443".parse().unwrap(),
+            &h,
+        );
+        let reason = denied.expect("expected deny");
+        assert!(reason.contains("evil.example:443"), "{reason}");
+    }
+
+    #[test]
+    fn egress_deny_reason_uses_host_header_for_plain_http() {
+        let m = matcher(&["api.github.com"]);
+        let mut h = http::HeaderMap::new();
+        h.insert(http::header::HOST, "evil.example".parse().unwrap());
+        let denied = egress_deny_reason(&m, &http::Method::GET, &"/".parse().unwrap(), &h);
+        assert!(denied.is_some());
+
+        h.insert(http::header::HOST, "api.github.com".parse().unwrap());
+        let allowed = egress_deny_reason(&m, &http::Method::GET, &"/".parse().unwrap(), &h);
+        assert!(allowed.is_none());
+    }
+
+    #[test]
+    fn egress_deny_reason_treats_missing_host_as_deny() {
+        // Missing/blank Host with a non-empty allow-list must NOT
+        // silently slip through. Empty target falls through to
+        // `matcher.allows("")` which is false → deny.
+        let m = matcher(&["api.github.com"]);
+        let h = http::HeaderMap::new();
+        let denied = egress_deny_reason(&m, &http::Method::GET, &"/".parse().unwrap(), &h);
+        assert!(
+            denied.is_some(),
+            "missing Host with allow-list active must deny"
+        );
+    }
+
+    #[test]
+    fn egress_deny_reason_honours_wildcard_subdomain() {
+        let m = matcher(&["*.githubusercontent.com"]);
+        let allowed = egress_deny_reason(
+            &m,
+            &http::Method::CONNECT,
+            &"avatars.githubusercontent.com:443".parse().unwrap(),
+            &http::HeaderMap::new(),
+        );
+        assert!(allowed.is_none());
     }
 }

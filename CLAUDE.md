@@ -197,15 +197,20 @@ of value-per-implementation-cost.
    under a commented `# observed_exec` block. Reduces the "stare
    at the log and hand-craft the policy" friction that today
    blocks teams from flipping `mode: audit` → `mode: block`.
-8. **SNI-based egress in the proxy** — extend `coronarium proxy`
-   to honour a `network.allow` style hostname list at the CONNECT
-   layer (parse SNI from the TLS ClientHello, match against the
-   policy, return 403 on miss). Today the eBPF path enforces by
-   resolved IP, which loses against CDN rotation; doing it at the
-   proxy gives FQDN/wildcard semantics that match what
-   harden-runner users expect (`*.githubusercontent.com:443`
-   etc.). Doable on top of the existing hudsucker stack; depends
-   on `install-gate` already being on the user's shell.
+8. **SNI / hostname-based egress in the proxy** — ✅ implemented
+   in v0.33. New `--network-allow <pattern>` (repeatable) and
+   `--network-allow-file <path>` flags on `sakimori proxy start`
+   configure a default-deny hostname allow-list enforced at
+   `handle_request`. CONNECT requests pull the target from
+   `req.uri().authority()`; plain HTTP from the `Host:` header; a
+   missing Host with the policy active is treated as deny (no
+   silent slip-through). Pattern grammar in `host_allow.rs`:
+   `host.example.com` (exact, case-insensitive), `*.example.com`
+   (any subdomain, excludes the apex by design); embedded `*` is
+   a parse error. Off by default. Closes the eBPF-by-IP weakness
+   against CDN rotation — every `*.githubusercontent.com` IP that
+   happens to be live this minute resolves correctly because we
+   filter by the SNI/Host name the client actually asked for.
 9. **Workspace tamper detection** — ✅ implemented in v0.22 as
    standalone `coronarium workspace snapshot <dir>` +
    `coronarium workspace diff <baseline.json> <dir>`. Walks every

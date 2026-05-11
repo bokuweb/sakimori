@@ -18,6 +18,33 @@ fn ca_files_for(dir: Option<PathBuf>) -> anyhow::Result<sakimori_proxy::ca::CaFi
     })
 }
 
+/// Build the proxy's egress allow-list from `--network-allow` flags
+/// plus an optional file. Returns `None` (= "feature off") when no
+/// patterns came from either source — `Some(empty)` would also work
+/// but `None` lets the proxy skip the per-request check entirely.
+fn build_network_allow(
+    flags: &[String],
+    file: &Option<PathBuf>,
+) -> Result<Option<sakimori_proxy::host_allow::HostMatcher>> {
+    let mut all: Vec<String> = flags.to_vec();
+    if let Some(path) = file {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --network-allow-file {}", path.display()))?;
+        for line in text.lines() {
+            let trimmed = line.split('#').next().unwrap_or("").trim();
+            if !trimmed.is_empty() {
+                all.push(trimmed.to_string());
+            }
+        }
+    }
+    if all.is_empty() {
+        return Ok(None);
+    }
+    let matcher = sakimori_proxy::host_allow::HostMatcher::from_patterns(all)
+        .map_err(|(pat, e)| anyhow::anyhow!("--network-allow `{pat}`: {e}"))?;
+    Ok(Some(matcher))
+}
+
 /// Parse a simple `<N><unit>` duration (e.g. `7d`, `12h`, `30m`, `3600s`).
 /// Bare numbers default to days. Used by proxy/watch-style CLI flags
 /// where pulling in humantime feels overkill.
@@ -415,6 +442,22 @@ pub struct ProxyStartArgs {
     /// Override the typosquat mirror URL.
     #[arg(long)]
     pub typosquat_mirror_url: Option<String>,
+    /// Hostname egress allow-list. Repeatable. When set, the proxy
+    /// default-denies every CONNECT / HTTP request whose target
+    /// host doesn't match an entry, returning 403. Patterns:
+    ///
+    /// - `host.example.com` — exact (case-insensitive)
+    /// - `*.example.com` — any subdomain (does NOT match the apex)
+    ///
+    /// Embedded `*` is a parse error. Off by default; without any
+    /// `--network-allow` flag the proxy passes every host through.
+    #[arg(long = "network-allow", value_name = "HOST")]
+    pub network_allow: Vec<String>,
+    /// Read additional `--network-allow` patterns from a file (one
+    /// per line; `#` comments and blank lines are skipped). Layered
+    /// on top of any `--network-allow` flags.
+    #[arg(long)]
+    pub network_allow_file: Option<PathBuf>,
     /// Override the CA/config directory. Defaults to
     /// `$XDG_CONFIG_HOME/sakimori` (or `~/.config/sakimori`).
     #[arg(long)]
@@ -647,6 +690,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         } => {
             let min_age = parse_simple_duration(&args.min_age)?;
             let ca_files = ca_files_for(args.config_dir)?;
+            let network_allow = build_network_allow(&args.network_allow, &args.network_allow_file)?;
             let cfg = sakimori_proxy::ProxyConfig {
                 listen: args.listen,
                 min_age,
@@ -661,6 +705,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 ca_files,
                 user_agent: format!("sakimori-proxy/{}", env!("CARGO_PKG_VERSION")),
                 oracle: None,
+                network_allow,
             };
             sakimori_proxy::run(cfg).await?;
             Ok(())
