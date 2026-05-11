@@ -45,7 +45,32 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
+    /// Supervised-run lifecycle: we own a fresh cgroup the supervised
+    /// command will be enrolled into via `pre_exec`. Use [`Supervisor::
+    /// start_with_cgroup`] for job-scoped daemon mode where the cgroup
+    /// already exists.
     pub async fn start(policy: Policy, mode: Mode, dns_refresh: Duration) -> Result<Self> {
+        let cgroup = match Cgroup::create() {
+            Ok(c) => Some(c),
+            Err(err) => {
+                log::warn!("cgroup creation failed ({err:#}); network policy will be degraded");
+                None
+            }
+        };
+        Self::start_with_cgroup(policy, mode, dns_refresh, cgroup).await
+    }
+
+    /// Like [`Supervisor::start`] but uses a caller-provided cgroup. The
+    /// caller is responsible for the cgroup's lifecycle; in particular,
+    /// pass a [`Cgroup`] from [`Cgroup::observe_existing`] for job-scoped
+    /// observation (no migration, attach to an existing cgroup's hierarchy
+    /// so its descendants are observed).
+    pub async fn start_with_cgroup(
+        policy: Policy,
+        mode: Mode,
+        dns_refresh: Duration,
+        cgroup: Option<Cgroup>,
+    ) -> Result<Self> {
         let stats = Arc::new(Mutex::new(Stats::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let file_matcher = Arc::new(FileMatcher::from_policy(&policy.file));
@@ -62,14 +87,6 @@ impl Supervisor {
                  the roadmap."
             );
         }
-
-        let cgroup = match Cgroup::create() {
-            Ok(c) => Some(c),
-            Err(err) => {
-                log::warn!("cgroup creation failed ({err:#}); network policy will be degraded");
-                None
-            }
-        };
 
         #[cfg(target_os = "linux")]
         let bpf = {
@@ -261,6 +278,24 @@ impl Supervisor {
     #[allow(dead_code)]
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// Block until SIGTERM / SIGINT arrives, then return. Daemon-mode
+    /// callers use this in place of [`Supervisor::run_child`]: there's no
+    /// supervised process for the daemon to wait on, so the lifetime is
+    /// "until someone tells us to stop".
+    #[cfg(target_os = "linux")]
+    pub async fn wait_for_shutdown(&self) -> Result<()> {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate())
+            .map_err(|e| anyhow::anyhow!("installing SIGTERM handler: {e}"))?;
+        let mut intr = signal(SignalKind::interrupt())
+            .map_err(|e| anyhow::anyhow!("installing SIGINT handler: {e}"))?;
+        tokio::select! {
+            _ = term.recv() => log::info!("daemon: received SIGTERM, shutting down"),
+            _ = intr.recv() => log::info!("daemon: received SIGINT, shutting down"),
+        }
+        Ok(())
     }
 }
 

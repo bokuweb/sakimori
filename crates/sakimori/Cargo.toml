@@ -31,3 +31,4 @@ futures = { workspace = true }
 aya = { workspace = true }
 aya-log = { workspace = true }
 nix = { workspace = true }
+libc = "0.2"

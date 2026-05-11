@@ -597,3 +597,162 @@ jobs:
             /tmp/sakimori-block.log.json
             /tmp/sakimori-file.log.json
             /tmp/sakimori-exec.log.json
+
+  job-scoped-smoke:
+    # Proves `bokuweb/sakimori/job@v0` (the JS-action wrapper that
+    # supervises every step of a job via a single daemon) actually
+    # observes traffic from steps it didn't run itself.
+    needs: [userspace, ebpf]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build sakimori (host arch)
+        run: cargo build --release -p sakimori
+      - uses: actions/download-artifact@v4
+        with:
+          name: sakimori-bpf
+          path: bpf
+      - name: Prepare pre-installed binary
+        run: |
+          mkdir -p "$RUNNER_TEMP/sakimori-pre"
+          cp target/release/sakimori "$RUNNER_TEMP/sakimori-pre/sakimori"
+          cp bpf/sakimori "$RUNNER_TEMP/sakimori-pre/sakimori.bpf.o"
+          chmod +x "$RUNNER_TEMP/sakimori-pre/sakimori"
+          echo "SAKIMORI_BIN=$RUNNER_TEMP/sakimori-pre/sakimori" >> "$GITHUB_ENV"
+          echo "SAKIMORI_BPF_OBJ=$RUNNER_TEMP/sakimori-pre/sakimori.bpf.o" >> "$GITHUB_ENV"
+      - name: Write audit policy
+        run: |
+          # Audit only — the smoke is about cross-step *observation*,
+          # not enforcement (that's already proved by the `smoke` job
+          # above). One deny per kind so the report shows verdict mix.
+          cat > "$RUNNER_TEMP/policy.yml" <<'EOF'
+          mode: audit
+          network:
+            default: allow
+            deny:
+              - target: 1.1.1.1
+                ports: [443]
+          file:
+            default: allow
+            deny:
+              - /etc/os-release
+          process:
+            deny_exec:
+              - /usr/bin/whoami
+          EOF
+
+      # Start the daemon by hand instead of via `uses: bokuweb/sakimori/job`.
+      # Two GitHub-Actions limitations make the wrapper unreachable from
+      # CI on the same PR:
+      #   1. Local refs (`uses: ./job`) silently skip pre/post hooks,
+      #      so the daemon never starts and the assertion can't run.
+      #   2. Step-level `uses:` doesn't accept `${{ }}` expressions,
+      #      so we can't pin to ${github.sha} of the current PR either.
+      # The full wrapper is exercised post-release via consumer-smoke.yml
+      # against the published release; here we exercise the daemon's
+      # cross-step observation mechanics, which is the actually-novel
+      # piece. The wrapper's role is just to invoke this same CLI from
+      # pre.js/post.js.
+      - name: Start daemon (mimics pre.js)
+        run: |
+          set -euo pipefail
+          # Background the daemon attached to *this* step's parent pid
+          # (= Runner.Worker, the common ancestor of every step in the
+          # job). Detached + stdio redirected so it survives the step.
+          setsid sudo -n -E "$SAKIMORI_BIN" daemon start \
+            --observe-cgroup-of "$PPID" \
+            --policy "$RUNNER_TEMP/policy.yml" \
+            --mode audit \
+            --log "$RUNNER_TEMP/sakimori-job.log.json" \
+            --html "$RUNNER_TEMP/sakimori-job.html" \
+            --pid-file "$RUNNER_TEMP/sakimori-job.pid" \
+            > "$RUNNER_TEMP/sakimori-daemon.stdout.log" \
+            2> "$RUNNER_TEMP/sakimori-daemon.stderr.log" \
+            < /dev/null &
+          disown
+          # Poll for ready (pid-file appears only after BPF attach
+          # succeeds). 20s budget matches pre.js.
+          deadline=$(( $(date +%s) + 20 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            if [ -f "$RUNNER_TEMP/sakimori-job.pid" ]; then
+              echo "daemon ready (pid $(cat "$RUNNER_TEMP/sakimori-job.pid")), observing cgroup of PPID=$PPID"
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "::error::daemon did not become ready in 20s"
+          echo "--- daemon stderr ---"
+          cat "$RUNNER_TEMP/sakimori-daemon.stderr.log" || true
+          exit 1
+
+      # Three separate steps the daemon must observe. If cross-step
+      # cgroup inheritance is broken, only one will appear in the log.
+      - name: Step A (whoami → exec deny)
+        run: /usr/bin/whoami >/dev/null 2>&1 || true
+      - name: Step B (cat os-release → open deny)
+        run: cat /etc/os-release >/dev/null 2>&1 || true
+      - name: Step C (curl 1.1.1.1 → connect deny)
+        run: curl -s -o /dev/null -m 5 https://1.1.1.1 || true
+
+      # post hook will fire here when this job ends, writing the JSON
+      # log + HTML. The assertions below run BEFORE post, so we read
+      # the log via an explicit `daemon stop` first — re-using the
+      # daemon's own flush path is the only way to observe the file
+      # within the same job (the daemon writes only on SIGTERM).
+      - name: Force-flush the daemon and inspect log
+        run: |
+          set -euo pipefail
+          sudo -n -E "$SAKIMORI_BIN" daemon stop \
+            --pid-file "$RUNNER_TEMP/sakimori-job.pid"
+          # Echo daemon stderr — surfaces ringbuf warnings, attach
+          # errors, etc.
+          if [ -s "$RUNNER_TEMP/sakimori-daemon.stderr.log" ]; then
+            echo "--- daemon stderr ---"
+            cat "$RUNNER_TEMP/sakimori-daemon.stderr.log"
+          fi
+          test -f "$RUNNER_TEMP/sakimori-job.log.json"
+          python3 - <<'PY'
+          import json, os, sys
+          path = os.path.join(os.environ["RUNNER_TEMP"], "sakimori-job.log.json")
+          # The explicit `daemon stop` above is the only flush in this
+          # job — post.js's stop will no-op (pid-file already gone) —
+          # so the log contains exactly one JSON document.
+          log = json.load(open(path))
+          print(f"observed={log['observed']} denied={log['denied']} samples={len(log['samples'])}")
+          # Job-scoped observation must capture events from at least
+          # two distinct steps. Without cross-step cgroup inheritance,
+          # we'd see events from only the step where the daemon was
+          # spawned (or nothing at all).
+          kinds = {}
+          for s in log["samples"]:
+              kinds[s["kind"]] = kinds.get(s["kind"], 0) + 1
+          print(f"kinds: {kinds}")
+          missing = [k for k in ("exec", "open", "connect") if kinds.get(k, 0) == 0]
+          if missing:
+              print(f"::error::job-scoped daemon missed events of kind(s): {missing}")
+              sys.exit(1)
+          # The whole point: at least one exec sample whose filename
+          # is /usr/bin/whoami (proves Step A's process was observed,
+          # which only happens if the daemon's cgroup attach caught
+          # a process forked by the runner *after* pre.js).
+          if not any(
+              s["kind"] == "exec"
+              and (s.get("filename") == "/usr/bin/whoami" or s.get("argv0") == "/usr/bin/whoami")
+              for s in log["samples"]
+          ):
+              print("::error::no /usr/bin/whoami exec sample — cross-step observation failed")
+              print(json.dumps([s for s in log['samples'] if s['kind'] == 'exec'], indent=2))
+              sys.exit(1)
+          print("✓ cross-step observation confirmed: events from steps A/B/C are all in the log")
+          PY
+      - name: Upload job-scoped audit log + html
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sakimori-job-report
+          path: |
+            ${{ runner.temp }}/sakimori-job.log.json
+            ${{ runner.temp }}/sakimori-job.html
+            ${{ runner.temp }}/sakimori-daemon.stdout.log
+            ${{ runner.temp }}/sakimori-daemon.stderr.log

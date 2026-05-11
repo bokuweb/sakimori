@@ -135,6 +135,99 @@ pub enum Command {
         #[command(subcommand)]
         cmd: WorkspaceCommand,
     },
+    /// Job-scoped supervised mode: attach to an existing cgroup v2
+    /// hierarchy (typically the GitHub Actions runner's worker process)
+    /// and observe every step the runner spawns until told to stop. The
+    /// counterpart to `run`, which is tied to a single child process tree.
+    /// Linux-only.
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DaemonCommand {
+    /// Attach eBPF programs to an existing cgroup and park until SIGTERM.
+    /// Runs in the foreground; the caller is responsible for backgrounding
+    /// (e.g. `setsid sakimori daemon start … &`).
+    Start(DaemonStartArgs),
+    /// Send SIGTERM to the daemon identified by `--pid-file` and wait for
+    /// it to flush its report and exit. Idempotent: a missing pid-file or
+    /// a dead pid both count as success.
+    Stop(DaemonStopArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct DaemonStartArgs {
+    /// Policy file (YAML or JSON). Defaults to a permissive audit-only
+    /// policy when omitted, same as `sakimori run`.
+    #[arg(long, short = 'p', env = "SAKIMORI_POLICY")]
+    pub policy: Option<PathBuf>,
+
+    /// Override the policy's `mode`.
+    #[arg(long, value_enum)]
+    pub mode: Option<Mode>,
+
+    /// Where to write the JSON audit log when the daemon shuts down.
+    /// `-` for stdout.
+    #[arg(long, default_value = "-")]
+    pub log: String,
+
+    /// Optional path to write a human-readable summary at shutdown.
+    /// Typically `$GITHUB_STEP_SUMMARY`.
+    #[arg(long, env = "GITHUB_STEP_SUMMARY")]
+    pub summary: Option<PathBuf>,
+
+    /// Optional path to write a self-contained HTML audit report at
+    /// shutdown.
+    #[arg(long)]
+    pub html: Option<PathBuf>,
+
+    /// File the daemon writes its pid to once eBPF programs are
+    /// attached and observation is live. `daemon stop` reads from
+    /// the same path. The daemon also removes the file on clean exit.
+    #[arg(long, value_name = "FILE")]
+    pub pid_file: PathBuf,
+
+    /// Attach to the cgroup v2 hierarchy that this pid is already in,
+    /// so every descendant the cgroup spawns (= every subsequent step
+    /// in a GitHub Actions job) is observed. No process migration: we
+    /// leave the runner's own cgroup management untouched.
+    #[arg(long, value_name = "PID")]
+    pub observe_cgroup_of: u32,
+
+    /// Allow attaching to the root cgroup (`/`). Refused by default
+    /// because it would observe every process on the host. Only set
+    /// this on a single-tenant runner where that's actually what you
+    /// want.
+    #[arg(long)]
+    pub allow_root_cgroup: bool,
+
+    /// Same semantics as `sakimori run --dns-refresh-interval`.
+    #[arg(long, default_value_t = 15, value_name = "SECS")]
+    pub dns_refresh_interval: u64,
+
+    /// Free-form label written into the JSON log / HTML report's
+    /// `command` field. Daemon mode doesn't exec anything itself, so
+    /// this is just metadata describing what the surrounding job is
+    /// doing (e.g. "ci: build + test").
+    #[arg(long, default_value = "sakimori daemon (job-scoped)")]
+    pub command_label: String,
+}
+
+#[derive(Debug, Parser)]
+pub struct DaemonStopArgs {
+    /// Same pid-file the matching `daemon start` was given.
+    #[arg(long, value_name = "FILE")]
+    pub pid_file: PathBuf,
+
+    /// How long to wait for the daemon to exit after SIGTERM, in
+    /// seconds. We don't escalate to SIGKILL — if the daemon's stuck,
+    /// the report would be incomplete anyway, and a half-written
+    /// report is worse than an obvious timeout.
+    #[arg(long, default_value_t = 30, value_name = "SECS")]
+    pub timeout_secs: u64,
 }
 
 #[derive(Debug, Subcommand)]
@@ -799,7 +892,40 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Workspace {
             cmd: WorkspaceCommand::Diff(args),
         } => run_workspace_diff(args),
+        Command::Daemon {
+            cmd: DaemonCommand::Start(args),
+        } => run_daemon_start(args).await,
+        Command::Daemon {
+            cmd: DaemonCommand::Stop(args),
+        } => run_daemon_stop(args),
     }
+}
+
+async fn run_daemon_start(args: DaemonStartArgs) -> Result<()> {
+    let mode_override = args.mode.map(|m| match m {
+        Mode::Audit => policy::Mode::Audit,
+        Mode::Block => policy::Mode::Block,
+    });
+    crate::daemon::start(crate::daemon::DaemonStartArgs {
+        policy_path: args.policy,
+        mode_override,
+        log: args.log,
+        summary: args.summary,
+        html: args.html,
+        pid_file: args.pid_file,
+        observe_cgroup_of: args.observe_cgroup_of,
+        allow_root_cgroup: args.allow_root_cgroup,
+        dns_refresh: Duration::from_secs(args.dns_refresh_interval),
+        command_label: args.command_label,
+    })
+    .await
+}
+
+fn run_daemon_stop(args: DaemonStopArgs) -> Result<()> {
+    crate::daemon::stop(crate::daemon::DaemonStopArgs {
+        pid_file: args.pid_file,
+        timeout: Duration::from_secs(args.timeout_secs),
+    })
 }
 
 fn tamper_options(skip: Vec<String>, max_file_bytes: u64) -> sakimori_core::tamper::Options {

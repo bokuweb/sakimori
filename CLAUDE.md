@@ -259,6 +259,46 @@ of value-per-implementation-cost.
     pid has already exited by drain time the attribution is
     `None` and the event is unaffected. Non-Linux supervisors
     (Windows ETW) leave `source: None` for now.
+12. **Job-scoped supervised mode** — ✅ implemented across two surfaces.
+    - **Binary** (v0.35): `sakimori daemon start` / `daemon stop`.
+      `start --observe-cgroup-of <pid>` reads `/proc/<pid>/cgroup`,
+      finds the v2 unified path, and attaches connect4/connect6 +
+      tracepoint programs to *that existing cgroup* — no process
+      migration. The runner's own cgroup management is left untouched
+      and cgroup v2 descendant inheritance does the cross-step work
+      for free. Daemon parks until SIGTERM, then writes the same
+      JSON / step-summary / HTML report `sakimori run` produces.
+      `stop` sends SIGTERM via the pid-file and waits for clean
+      exit; idempotent on missing / stale pid-files. Block-mode
+      denial surfaces via `::error::` annotations from the daemon's
+      stderr + a non-zero post-step exit code parsed back from the
+      JSON log (the daemon's own exit code can't propagate through
+      `stop`).
+    - **Action** (`bokuweb/sakimori/job@v0`): subpath JS action with
+      pre/main/post hooks. `pre.js` installs sakimori, spawns
+      `sudo sakimori daemon start --observe-cgroup-of $PPID`
+      detached with stdio→files, and polls for the pid-file before
+      letting other steps run. `post.js` issues `daemon stop`,
+      drains the daemon's stderr, and re-parses the JSON log to
+      fail the job in block mode. Zero JS deps — pre/main/post read
+      `INPUT_*` straight from env and shell out for the heavy
+      lifting. Linux only. The original composite
+      `bokuweb/sakimori@v0` (single-step + Windows) is untouched.
+
+      `pre.js` honours pre-set `SAKIMORI_BIN` + `SAKIMORI_BPF_OBJ`
+      env to skip the `gh release download` path — used by the
+      `job-scoped-smoke` CI job to test the action against a
+      locally-built binary, also useful for air-gapped mirrors.
+
+      **Out of scope for this iteration**: container jobs
+      (`jobs.<id>.container:`) — the host-side cgroup attach can't
+      reach steps that run inside the container. `pre.js` detects
+      `/.dockerenv` and known container-y `/proc/1/cgroup` patterns
+      and emits a `::warning::` rather than hard-failing, since the
+      daemon's own attach error is the real source of truth. Also
+      out of scope: matrix / reusable-workflow shards (each is its
+      own Runner.Worker = its own job = needs its own
+      `bokuweb/sakimori/job@v0`).
 
 Explicitly **out of scope** (different product philosophy, not
 a missing feature):

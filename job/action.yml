@@ -1,0 +1,60 @@
+name: "sakimori (job-scoped)"
+description: |
+  Audit every step of a GitHub Actions job with a single eBPF supervisor.
+  Attaches to the runner's cgroup v2 at job pre-time and writes the audit
+  log / step summary / HTML report at post-time. Linux only.
+author: "bokuweb"
+branding:
+  icon: "shield"
+  color: "red"
+
+inputs:
+  policy:
+    description: "Path to the policy file (YAML or JSON)."
+    required: false
+    default: ".github/sakimori.yml"
+  mode:
+    description: "audit | block. Overrides `mode:` in the policy file."
+    required: false
+    default: "audit"
+  version:
+    description: "Sakimori release tag to install. Defaults to whatever tag this action was referenced as; `latest` resolves the newest release."
+    required: false
+    default: ""
+  log:
+    description: "JSON audit log destination (relative paths resolve against $GITHUB_WORKSPACE)."
+    required: false
+    default: "sakimori.log.json"
+  html:
+    description: "HTML report destination. Empty string disables."
+    required: false
+    default: "sakimori-report.html"
+  summary:
+    description: "Step-summary markdown destination. Defaults to $GITHUB_STEP_SUMMARY."
+    required: false
+    default: ""
+  token:
+    description: "GitHub token used to download the sakimori release tarball."
+    required: false
+    default: ${{ github.token }}
+  allow-root-cgroup:
+    description: |
+      Allow attaching to the root cgroup ("/"). Refused by default because
+      it would observe every process on the host. Only set this on a
+      single-tenant runner where that's actually what you want.
+    required: false
+    default: "false"
+
+outputs:
+  bin:
+    description: "Absolute path to the installed sakimori binary."
+  log:
+    description: "Resolved absolute path to the JSON audit log written at post-time."
+  pidfile:
+    description: "Path to the daemon's pid-file (useful for advanced workflows that want to call `daemon stop` early)."
+
+runs:
+  using: node20
+  pre: "pre.js"
+  main: "main.js"
+  post: "post.js"

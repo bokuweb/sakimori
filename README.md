@@ -716,6 +716,44 @@ of silently falling back.
 - run: cargo test   # only reached if the check passed
 ```
 
+### eBPF-supervised test run — job-scoped form (Linux only)
+
+Use `bokuweb/sakimori/job@v0` when you want a single audit log covering
+**every step in the job** instead of just one wrapped command. The
+action's pre-hook spawns a background eBPF supervisor attached to the
+runner-worker's cgroup; cgroup v2 inheritance means every step the
+runner forks afterwards (`actions/checkout`, your `run:` blocks,
+`actions/upload-artifact`, ...) is observed by the same supervisor.
+The post-hook flushes the JSON log / step summary / HTML report and
+fails the job if `mode: block` denied anything.
+
+```yaml
+runs-on: ubuntu-latest
+steps:
+  - uses: bokuweb/sakimori/job@v0   # MUST come before checkout so the
+    with:                           # supervisor is up first
+      policy: .github/sakimori.yml
+      mode: block
+      html: sakimori-report.html
+
+  - uses: actions/checkout@v4
+  - run: corepack enable
+  - run: pnpm install --frozen-lockfile
+  - run: pnpm build
+  - run: pnpm test
+  # post-hook of bokuweb/sakimori/job runs here automatically
+```
+
+Limitations: Linux runners only (Windows needs a different kernel
+hook), and **container jobs** (`jobs.<id>.container:`) are unsupported
+because the host-side cgroup attach can't reach steps that run inside
+the container. Matrix shards and reusable-workflow callers are each
+their own job and need their own `bokuweb/sakimori/job@v0`. Note also
+that the audit log is only written at post-time, so `actions/upload-
+artifact` *inside the same job* can't see it — upload it from a
+downstream job, or use the `bokuweb/sakimori@v0` one-step form below
+if you need the artifact mid-job.
+
 ### eBPF-supervised test run — one-step form (Linux + Windows)
 
 The simplest form: pass the command you want supervised via the

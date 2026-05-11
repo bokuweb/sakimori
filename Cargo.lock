@@ -1888,6 +1888,7 @@ dependencies = [
  "futures",
  "hickory-resolver",
  "ipnet",
+ "libc",
  "log",
  "nix",
  "sakimori-common",

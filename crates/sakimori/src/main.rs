@@ -2,6 +2,7 @@
 
 mod cgroup;
 mod cli;
+mod daemon;
 mod doctor;
 mod enforcer;
 mod events;
