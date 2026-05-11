@@ -176,6 +176,24 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
    CONFIG_BPF_KPROBE_OVERRIDE and a well-timed kprobe.
 5. **macOS live block** — either a Network Extension (heavy, needs
    signing) or an HTTPS proxy (see #2).
+6. **Retroactive CVE notification for past installs** — log every
+   resolved install the proxy sees to a local append-only file
+   (`~/.sakimori/installs.jsonl`: ecosystem, name, version,
+   resolved_at, project_path) and add `sakimori advisories scan`
+   that batch-queries [OSV.dev](https://osv.dev)'s
+   `POST /v1/querybatch` for matching advisories. Local-first:
+   no server, no upload, private dep trees never leave the machine.
+   OSV covers npm / crates.io / PyPI / NuGet so one client handles
+   all four ecosystems. A central-server / push-notification mode
+   (ingest endpoint + Postgres + OSV mirror + webhook dispatcher)
+   is a possible follow-up but must remain opt-in self-host —
+   centralised SaaS is explicitly out of scope per the philosophy
+   above. **npx** works for free here (same `registry.npmjs.org`
+   path the npm rewriter already handles); **Homebrew** does *not*
+   fit minimumReleaseAge (formula updates are PRs to a git repo,
+   not registry publishes with structured publish-time per version)
+   but its installs can still be logged via HTTPS_PROXY for the
+   advisory-scan side.
 
 ### harden-runner parity gaps (tracked but not yet scheduled)
 
