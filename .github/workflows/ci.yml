@@ -646,7 +646,12 @@ jobs:
       # SAKIMORI_BIN / SAKIMORI_BPF_OBJ and skips the gh release
       # download path, so this exercises the JS-action wiring against
       # the locally-built binary instead of the published release.
-      - uses: ./job
+      #
+      # Note: `uses: ./job` would NOT trigger pre/post hooks ("pre
+      # execution is not supported for local action"), so we resolve
+      # the action at the PR head SHA (or the push SHA) instead. Same
+      # repo, so the ref is always public and reachable.
+      - uses: bokuweb/sakimori/job@${{ github.event.pull_request.head.sha || github.sha }}
         with:
           policy: ${{ runner.temp }}/policy.yml
           mode: audit
