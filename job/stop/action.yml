@@ -1,0 +1,47 @@
+name: "sakimori-job-stop"
+description: |
+  Stop the sakimori daemon spawned by `bokuweb/sakimori/job@v0`,
+  flushing its JSON audit log + HTML report + step summary to
+  disk. Use this when you want to upload those files via
+  `actions/upload-artifact` from inside the same job — the
+  daemon's own post-hook writes them at end-of-job, which is too
+  late for an in-job upload.
+
+  Idempotent: a missing pid-file (because the daemon already
+  stopped, or never started on this matrix entry) is a no-op.
+
+  Linux only — matches `bokuweb/sakimori/job@v0`. Other runners
+  silently no-op so this is safe to drop into a cross-OS workflow.
+
+author: "bokuweb"
+branding:
+  icon: "shield"
+  color: "red"
+
+runs:
+  using: composite
+  steps:
+    - if: runner.os == 'Linux'
+      shell: bash
+      env:
+        # Pulled from $GITHUB_ENV by the matching `job@v0` main step.
+        # We re-read them here rather than accept them as `with:`
+        # inputs so the consumer doesn't have to know they exist.
+        BIN: ${{ env.SAKIMORI_BIN }}
+        PIDFILE: ${{ env.SAKIMORI_JOB_PIDFILE }}
+      run: |
+        set -euo pipefail
+        if [ -z "${BIN:-}" ] || [ -z "${PIDFILE:-}" ]; then
+          echo "sakimori-job-stop: SAKIMORI_BIN / SAKIMORI_JOB_PIDFILE unset — " \
+               "either bokuweb/sakimori/job@v0 wasn't used in this job or " \
+               "its pre-step failed. Nothing to flush."
+          exit 0
+        fi
+        if [ ! -f "$PIDFILE" ]; then
+          echo "sakimori-job-stop: pid-file $PIDFILE missing — daemon already stopped."
+          exit 0
+        fi
+        # `sudo -n -E` mirrors the main action's pre.js, which spawns
+        # the daemon as root via the same invocation. We pass -E to
+        # preserve env so the binary can read GITHUB_STEP_SUMMARY etc.
+        sudo -n -E "$BIN" daemon stop --pid-file "$PIDFILE"
