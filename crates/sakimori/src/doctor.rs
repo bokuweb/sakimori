@@ -122,6 +122,12 @@ pub struct DoctorInputs {
     /// Path to the daemon unit (launchd plist / systemd unit).
     /// `None` means "skip this check".
     pub daemon_unit_path: Option<PathBuf>,
+    /// Path to a `sakimori daemon start --pid-file` file. When set,
+    /// doctor reads the pid and reports whether the daemon process
+    /// is still alive — useful for catching "the daemon died mid-job
+    /// and nothing told me" situations on long-running runners.
+    /// `None` means "skip this check".
+    pub daemon_pidfile: Option<PathBuf>,
 }
 
 /// Run every check with the given inputs. Pure-ish — does read the
@@ -141,7 +147,78 @@ pub fn run_checks(inp: &DoctorInputs) -> Vec<CheckResult> {
     if let Some(d) = &inp.daemon_unit_path {
         out.push(check_daemon_unit(d));
     }
+    if let Some(p) = &inp.daemon_pidfile {
+        out.push(check_daemon_pidfile(p));
+    }
     out
+}
+
+fn check_daemon_pidfile(path: &Path) -> CheckResult {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return CheckResult::warn(
+                "sakimori daemon",
+                format!("no pid-file at {}", path.display()),
+                "start it from the action's pre-step or `sakimori daemon start`",
+            );
+        }
+        Err(e) => {
+            return CheckResult::fail(
+                "sakimori daemon",
+                format!("reading {}: {e}", path.display()),
+                "check filesystem permissions",
+            );
+        }
+    };
+    let pid: u32 = match contents.trim().parse() {
+        Ok(p) => p,
+        Err(_) => {
+            return CheckResult::fail(
+                "sakimori daemon",
+                format!("pid-file {} is malformed: {:?}", path.display(), contents),
+                "remove the file and restart the daemon",
+            );
+        }
+    };
+    if daemon_pid_is_alive(pid) {
+        CheckResult::ok(
+            "sakimori daemon",
+            format!("pid {pid} alive ({})", path.display()),
+        )
+    } else {
+        CheckResult::fail(
+            "sakimori daemon",
+            format!(
+                "pid {pid} from {} is no longer alive — daemon crashed or was killed",
+                path.display()
+            ),
+            "inspect the daemon's stderr log (next to the pid-file) and restart",
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_pid_is_alive(pid: u32) -> bool {
+    // Mirrors `daemon::pid_is_alive` — kept as a private dup to avoid
+    // exposing that function publicly. See its comment for the i32-wrap
+    // / EPERM rationale.
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if r == 0 {
+        return true;
+    }
+    let errno = unsafe { *libc::__errno_location() };
+    errno == libc::EPERM
+}
+
+#[cfg(not(target_os = "linux"))]
+fn daemon_pid_is_alive(_pid: u32) -> bool {
+    // No daemon on non-Linux yet; report dead so the doctor check fires
+    // a clear "daemon not running" message instead of a misleading OK.
+    false
 }
 
 fn check_ca_file(path: &Path) -> CheckResult {
@@ -370,5 +447,59 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let r = check_proxy_listening(addr);
         assert_eq!(r.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn daemon_pidfile_missing_is_warn_not_fail() {
+        // Daemon is intentionally ephemeral (only running during a job),
+        // so absence is informational, not an error.
+        let d = std::env::temp_dir().join(format!(
+            "sakimori-doctor-test-{}-pid-missing",
+            std::process::id()
+        ));
+        let r = check_daemon_pidfile(&d);
+        assert_eq!(r.status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn daemon_pidfile_malformed_is_fail() {
+        let d = std::env::temp_dir().join(format!(
+            "sakimori-doctor-test-{}-pid-bad",
+            std::process::id()
+        ));
+        std::fs::write(&d, "not-a-pid\n").unwrap();
+        let r = check_daemon_pidfile(&d);
+        assert_eq!(r.status, CheckStatus::Fail);
+        std::fs::remove_file(&d).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_pidfile_with_live_pid_is_ok() {
+        // Our own pid is alive — the check should report OK.
+        let d = std::env::temp_dir().join(format!(
+            "sakimori-doctor-test-{}-pid-live",
+            std::process::id()
+        ));
+        std::fs::write(&d, format!("{}\n", std::process::id())).unwrap();
+        let r = check_daemon_pidfile(&d);
+        assert_eq!(r.status, CheckStatus::Ok);
+        std::fs::remove_file(&d).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_pidfile_with_dead_pid_is_fail() {
+        // Same sentinel as daemon::tests::check_pidfile_unused_ignores_stale_pid
+        // — comfortably above Linux pid_max but inside positive i32.
+        const STALE: u32 = 2_000_000_000;
+        let d = std::env::temp_dir().join(format!(
+            "sakimori-doctor-test-{}-pid-stale",
+            std::process::id()
+        ));
+        std::fs::write(&d, format!("{STALE}\n")).unwrap();
+        let r = check_daemon_pidfile(&d);
+        assert_eq!(r.status, CheckStatus::Fail);
+        std::fs::remove_file(&d).ok();
     }
 }

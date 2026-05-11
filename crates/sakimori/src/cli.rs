@@ -214,6 +214,33 @@ pub struct DaemonStartArgs {
     /// doing (e.g. "ci: build + test").
     #[arg(long, default_value = "sakimori daemon (job-scoped)")]
     pub command_label: String,
+
+    /// Path to a workspace snapshot file (produced by
+    /// `sakimori workspace snapshot <dir>`). When set, the daemon
+    /// re-snapshots `--workspace-dir` at shutdown and surfaces the
+    /// diff under `workspace_drift` in the report. Must be set
+    /// together with `--workspace-dir`.
+    ///
+    /// Unlike `sakimori run --snapshot-workspace`, the daemon does
+    /// NOT take the baseline itself — daemon mode starts before
+    /// checkout (so the workspace would be empty at start time).
+    /// Take the baseline yourself after checkout, in a separate
+    /// step.
+    #[arg(long, value_name = "FILE")]
+    pub workspace_baseline: Option<PathBuf>,
+
+    /// Directory to re-snapshot + diff against `--workspace-baseline`
+    /// at shutdown. Must match the directory the baseline was taken
+    /// from.
+    #[arg(long, value_name = "DIR")]
+    pub workspace_dir: Option<PathBuf>,
+
+    /// Extra directory basenames to skip during the post-shutdown
+    /// snapshot — must match what was passed to
+    /// `sakimori workspace snapshot` when the baseline was taken,
+    /// otherwise added/removed entries will fire spuriously.
+    #[arg(long = "workspace-skip", value_name = "NAME")]
+    pub workspace_skip: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -455,6 +482,11 @@ pub struct DoctorArgs {
     /// would target for the detected shell.
     #[arg(long)]
     pub rc: Option<PathBuf>,
+    /// Path to a `sakimori daemon start --pid-file` file. When given,
+    /// doctor reads the pid and reports whether the daemon process is
+    /// alive. Skipped when omitted.
+    #[arg(long, value_name = "FILE")]
+    pub daemon_pidfile: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -917,6 +949,9 @@ async fn run_daemon_start(args: DaemonStartArgs) -> Result<()> {
         allow_root_cgroup: args.allow_root_cgroup,
         dns_refresh: Duration::from_secs(args.dns_refresh_interval),
         command_label: args.command_label,
+        workspace_baseline: args.workspace_baseline,
+        workspace_dir: args.workspace_dir,
+        workspace_skip: args.workspace_skip,
     })
     .await
 }
@@ -1419,6 +1454,7 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
         expected_https_proxy,
         rc_path,
         daemon_unit_path,
+        daemon_pidfile: args.daemon_pidfile,
     };
     let results = crate::doctor::run_checks(&inputs);
     print!("{}", crate::doctor::render_report(&results));

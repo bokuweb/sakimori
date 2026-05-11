@@ -50,6 +50,29 @@ pub struct DaemonStartArgs {
     /// Daemon mode doesn't exec anything itself; this is a free-form
     /// description of what the surrounding job is doing.
     pub command_label: String,
+    /// Path to a pre-taken workspace snapshot (as produced by
+    /// `sakimori workspace snapshot`). When set, the daemon takes a
+    /// fresh snapshot of [`workspace_dir`](Self::workspace_dir) at
+    /// shutdown and surfaces the diff in the report under
+    /// `workspace_drift`. Required to be set alongside
+    /// `workspace_dir`; either both or neither.
+    ///
+    /// Unlike `sakimori run --snapshot-workspace`, the baseline is
+    /// *not* taken by the daemon — the daemon's whole point is to
+    /// start observing before checkout happens, so the workspace
+    /// is empty at start time. Callers (typically the JS action
+    /// wrapper or a CI step) take the baseline themselves after
+    /// checkout and hand the file path here.
+    pub workspace_baseline: Option<PathBuf>,
+    /// Directory the daemon re-snapshots at shutdown to compute the
+    /// drift diff. Must match whatever directory produced
+    /// `workspace_baseline`.
+    pub workspace_dir: Option<PathBuf>,
+    /// Extra directory basenames to skip during the workspace
+    /// snapshot, on top of the built-in build-artefact list. Must
+    /// match what was passed to `sakimori workspace snapshot`
+    /// when the baseline was taken.
+    pub workspace_skip: Vec<String>,
 }
 
 /// Parameters for `sakimori daemon stop`.
@@ -76,6 +99,23 @@ pub async fn start(args: DaemonStartArgs) -> Result<()> {
     // output paths would collide and we'd have no clean way to stop
     // them individually. Loud-fail.
     check_pidfile_unused(&args.pid_file)?;
+
+    // Validate workspace-tamper args eagerly: either both or neither.
+    // Note we *don't* require the baseline file to exist yet — the
+    // expected wrapper flow is "daemon start before checkout, take
+    // baseline after checkout, diff at shutdown". So the baseline
+    // file is allowed to be absent here; it's read at shutdown, and
+    // `compute_workspace_drift` fails soft (warn + drop drift section)
+    // if it still isn't there. That keeps audit logs flowing even
+    // when the user forgets the snapshot step.
+    if args.workspace_baseline.is_some() != args.workspace_dir.is_some() {
+        anyhow::bail!(
+            "--workspace-baseline and --workspace-dir must be set together \
+             (either both or neither). The baseline is read at shutdown from \
+             --workspace-baseline and diffed against a fresh snapshot of \
+             --workspace-dir."
+        );
+    }
 
     let cgroup = Cgroup::observe_existing(args.observe_cgroup_of, args.allow_root_cgroup)
         .context("attaching to existing cgroup")?;
@@ -104,6 +144,15 @@ pub async fn start(args: DaemonStartArgs) -> Result<()> {
     let mut stats = supervisor.shutdown().await?;
     crate::resolve_hostnames::resolve(&mut stats).await;
 
+    // Workspace tamper diff. Non-fatal: log + summary still go out
+    // without `workspace_drift` if the snapshot or read fails — same
+    // policy as `sakimori run`.
+    let drift = compute_workspace_drift(
+        args.workspace_baseline.as_deref(),
+        args.workspace_dir.as_deref(),
+        &args.workspace_skip,
+    );
+
     let report = ReportArgs {
         log: &args.log,
         summary: args.summary.as_deref(),
@@ -111,9 +160,11 @@ pub async fn start(args: DaemonStartArgs) -> Result<()> {
         command: args.command_label.as_str(),
         mode,
         policy: &policy,
-        workspace_drift: None,
+        workspace_drift: drift.as_ref().filter(|d| !d.is_clean()),
     };
     sakimori_core::report::write(&report, &stats)?;
+
+    let drift_violation = drift.as_ref().map(|d| !d.is_clean()).unwrap_or(false);
 
     // Block-mode parity with `sakimori run`: any denied event flips the
     // exit code so the surrounding job fails.
@@ -124,7 +175,63 @@ pub async fn start(args: DaemonStartArgs) -> Result<()> {
         );
         std::process::exit(1);
     }
+    if drift_violation && matches!(mode, Mode::Block) {
+        let n = drift.as_ref().map(|d| d.total()).unwrap_or(0);
+        eprintln!(
+            "::error title=sakimori::workspace tamper detected: {n} files added/modified/removed during the supervised job"
+        );
+        std::process::exit(1);
+    }
     Ok(())
+}
+
+/// Take a fresh snapshot of `dir`, diff against the baseline file. Returns
+/// `None` (and logs) on any error so a bad-config / bad-fs situation doesn't
+/// silently drop the entire audit log.
+fn compute_workspace_drift(
+    baseline_path: Option<&Path>,
+    workspace_dir: Option<&Path>,
+    skip_extra: &[String],
+) -> Option<sakimori_core::tamper::Diff> {
+    let (baseline_path, workspace_dir) = match (baseline_path, workspace_dir) {
+        (Some(b), Some(d)) => (b, d),
+        _ => return None,
+    };
+    let baseline_json = match std::fs::read_to_string(baseline_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!(
+                "workspace tamper: reading baseline {} failed: {e}",
+                baseline_path.display()
+            );
+            return None;
+        }
+    };
+    let baseline = match sakimori_core::tamper::Snapshot::from_json(&baseline_json) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!(
+                "workspace tamper: parsing baseline {} failed: {e}",
+                baseline_path.display()
+            );
+            return None;
+        }
+    };
+    let opts = sakimori_core::tamper::Options {
+        skip_extra: skip_extra.to_vec(),
+        ..Default::default()
+    };
+    let current = match sakimori_core::tamper::Snapshot::take(workspace_dir, &opts) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!(
+                "workspace tamper: snapshotting {} failed: {e}",
+                workspace_dir.display()
+            );
+            return None;
+        }
+    };
+    Some(sakimori_core::tamper::diff(&baseline, &current))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -371,5 +478,53 @@ mod tests {
         let p = base.join(unique);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn workspace_drift_returns_none_when_args_unset() {
+        // Both unset: feature is off, return None (no warning).
+        let r = compute_workspace_drift(None, None, &[]);
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn workspace_drift_returns_none_when_baseline_missing() {
+        let tmp = tempdir();
+        let missing = tmp.join("nope.json");
+        let r = compute_workspace_drift(Some(&missing), Some(&tmp), &[]);
+        assert!(r.is_none(), "missing baseline must fail soft, not panic");
+    }
+
+    #[test]
+    fn workspace_drift_returns_none_when_baseline_malformed() {
+        let tmp = tempdir();
+        let bogus = tmp.join("bogus.json");
+        std::fs::write(&bogus, "not json").unwrap();
+        let r = compute_workspace_drift(Some(&bogus), Some(&tmp), &[]);
+        assert!(r.is_none(), "unparseable baseline must fail soft");
+    }
+
+    #[test]
+    fn workspace_drift_detects_added_file_against_real_baseline() {
+        // End-to-end: take a real snapshot via the public API, write
+        // a new file, compute drift, assert the new file shows up.
+        let tmp = tempdir();
+        std::fs::write(tmp.join("a"), b"hello").unwrap();
+        let opts = sakimori_core::tamper::Options::default();
+        let baseline = sakimori_core::tamper::Snapshot::take(&tmp, &opts).unwrap();
+        let baseline_path = tmp.join("baseline.json");
+        std::fs::write(&baseline_path, baseline.to_json_pretty().unwrap()).unwrap();
+
+        // Add a file post-baseline.
+        std::fs::write(tmp.join("b"), b"new").unwrap();
+
+        let diff = compute_workspace_drift(Some(&baseline_path), Some(&tmp), &[])
+            .expect("drift should be Some when both args valid");
+        assert!(!diff.is_clean(), "must detect drift");
+        assert!(
+            diff.added.iter().any(|p| p.ends_with("b")),
+            "added: {:?}",
+            diff.added
+        );
     }
 }

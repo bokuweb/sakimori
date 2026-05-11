@@ -754,6 +754,30 @@ artifact` *inside the same job* can't see it — upload it from a
 downstream job, or use the `bokuweb/sakimori@v0` one-step form below
 if you need the artifact mid-job.
 
+**Tamper detection**: pass `snapshot-workspace: <DIR>` to also catch
+on-disk tampering. The daemon can't take the baseline itself (it
+starts before checkout), so add a tiny step right after checkout that
+records the baseline — the action exports the paths for you:
+
+```yaml
+- uses: bokuweb/sakimori/job@v0
+  with:
+    policy: .github/sakimori.yml
+    mode: block
+    snapshot-workspace: .
+
+- uses: actions/checkout@v4
+- run: sudo -E "$SAKIMORI_BIN" workspace snapshot
+       "$SAKIMORI_WORKSPACE_DIR" -o "$SAKIMORI_BASELINE_PATH"
+- run: pnpm install --frozen-lockfile
+- run: pnpm build
+```
+
+The daemon re-snapshots `$SAKIMORI_WORKSPACE_DIR` at post-time, diffs
+against the baseline, and surfaces drift in the JSON log + step
+summary. Forgetting the snapshot step is non-fatal (the daemon logs a
+warning and the drift section is omitted).
+
 ### eBPF-supervised test run — one-step form (Linux + Windows)
 
 The simplest form: pass the command you want supervised via the

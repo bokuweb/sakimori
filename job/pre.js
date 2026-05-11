@@ -169,6 +169,21 @@ function startDaemon() {
     : process.env.GITHUB_STEP_SUMMARY || "";
   const allowRoot = input("allow-root-cgroup") === "true";
 
+  // Tamper detection wiring. Baseline file is read at SIGTERM time so
+  // it's fine that it doesn't exist yet at start (the user takes it
+  // after checkout in a separate step). See action.yml for the
+  // recipe. snapshot-skip is newline-separated since YAML `with:`
+  // doesn't have a clean way to pass a list of strings.
+  const snapshotDirIn = input("snapshot-workspace");
+  const snapshotDir = snapshotDirIn ? resolveOutput(snapshotDirIn) : "";
+  const baselinePath = snapshotDir
+    ? path.join(runnerTemp, "sakimori-workspace-baseline.json")
+    : "";
+  const snapshotSkip = (input("snapshot-skip") || "")
+    .split(/[\n,]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+
   // process.ppid is the GitHub Actions runner worker that spawned `node
   // pre.js`. It's the common ancestor cgroup we need to attach to: every
   // subsequent step the worker spawns inherits its cgroup, so attaching
@@ -207,6 +222,17 @@ function startDaemon() {
   if (allowRoot) {
     daemonArgs.push("--allow-root-cgroup");
   }
+  if (snapshotDir) {
+    daemonArgs.push(
+      "--workspace-baseline",
+      baselinePath,
+      "--workspace-dir",
+      snapshotDir,
+    );
+    for (const skip of snapshotSkip) {
+      daemonArgs.push("--workspace-skip", skip);
+    }
+  }
 
   // Fresh log files each run — append would mix stale daemon output
   // from a previous job that ran on this same runner image (rare on
@@ -241,6 +267,17 @@ function startDaemon() {
       // daemon flagged denied events in block mode.
       setEnv("SAKIMORI_JOB_LOG", log);
       setEnv("SAKIMORI_JOB_MODE", mode || "audit");
+      // Tamper-detection wiring: expose the resolved paths so the
+      // user's post-checkout snapshot step can find them.
+      if (snapshotDir) {
+        setEnv("SAKIMORI_WORKSPACE_DIR", snapshotDir);
+        setEnv("SAKIMORI_BASELINE_PATH", baselinePath);
+        notice(
+          `tamper detection armed — take the baseline with: ` +
+            `sudo -E "$SAKIMORI_BIN" workspace snapshot ` +
+            `"$SAKIMORI_WORKSPACE_DIR" -o "$SAKIMORI_BASELINE_PATH"`,
+        );
+      }
       setOutput("bin", binPath);
       setOutput("log", log);
       setOutput("pidfile", pidFile);

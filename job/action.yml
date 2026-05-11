@@ -44,6 +44,34 @@ inputs:
       single-tenant runner where that's actually what you want.
     required: false
     default: "false"
+  snapshot-workspace:
+    description: |
+      Directory to diff for tamper detection. When set, the daemon is
+      started with `--workspace-dir <DIR> --workspace-baseline <BASELINE>`,
+      and the action exports two env vars for use in a post-checkout
+      step:
+        - SAKIMORI_WORKSPACE_DIR   — resolved absolute directory
+        - SAKIMORI_BASELINE_PATH   — where to write the baseline JSON
+      Add a step right after `actions/checkout` that takes the
+      baseline:
+        - run: sudo -E "$SAKIMORI_BIN" workspace snapshot
+                 "$SAKIMORI_WORKSPACE_DIR" -o "$SAKIMORI_BASELINE_PATH"
+      The daemon reads the file at SIGTERM time and surfaces drift in
+      the JSON log + step summary. Forgetting the snapshot step is
+      non-fatal — the daemon logs a warning and the report omits the
+      drift section.
+    required: false
+    default: ""
+  snapshot-skip:
+    description: |
+      Newline-separated extra directory basenames to skip during the
+      tamper snapshot, on top of the built-in build-artefact list
+      (`.git`, `node_modules`, `target`, `dist`, …). Must match
+      whatever the post-checkout `sakimori workspace snapshot` step
+      passes for `--skip`, otherwise added/removed entries fire
+      spuriously.
+    required: false
+    default: ""
 
 outputs:
   bin:
