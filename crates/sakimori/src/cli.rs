@@ -220,6 +220,15 @@ pub struct ActionsAuditArgs {
     /// pipeline is harder to compromise than a random vendor's.
     #[arg(long)]
     pub strict: bool,
+    /// Look up the current SHA each mutable `@<ref>` resolves to via
+    /// the GitHub REST API and surface it on the finding (text
+    /// output prints `→ <sha>`, JSON adds `resolved_sha`). Lets you
+    /// copy-paste the right pinned form straight from the report.
+    /// Off by default — keeps the audit offline. Reads `GITHUB_TOKEN`
+    /// from the environment when present (raises the rate limit
+    /// from 60/hour to 5000/hour).
+    #[arg(long)]
+    pub resolve: bool,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -897,6 +906,20 @@ fn run_actions_audit(args: ActionsAuditArgs) -> Result<()> {
         }
     }
 
+    // `--resolve` is opt-in because it goes online. The same
+    // GithubResolver instance is reused across all files so its
+    // internal `GITHUB_TOKEN` env read happens once and the cache
+    // sees the most repeated `actions/checkout@v4` situation.
+    if args.resolve {
+        let resolver = sakimori_core::actions::GithubResolver::new(format!(
+            "sakimori/{}",
+            env!("CARGO_PKG_VERSION")
+        ));
+        for (_, findings) in &mut all {
+            sakimori_core::actions::resolve_all(findings, &resolver);
+        }
+    }
+
     let mut blocking = 0usize;
     match args.format {
         ActionsFormat::Json => {
@@ -939,6 +962,15 @@ fn run_actions_audit(args: ActionsAuditArgs) -> Result<()> {
                         None => f.job.clone(),
                     };
                     println!("  {tag}  {where_}: {}", f.message);
+                    // Surface the resolved SHA (or the lookup error)
+                    // on a dedicated indented line — keeps the
+                    // primary message readable while still showing
+                    // the actionable suggestion.
+                    if let Some(sha) = &f.resolved_sha {
+                        println!("         → resolved: {sha}");
+                    } else if let Some(err) = &f.resolve_error {
+                        println!("         → resolve failed: {err}");
+                    }
                     if f.is_blocking() {
                         blocking += 1;
                     }
