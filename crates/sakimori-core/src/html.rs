@@ -6,11 +6,16 @@
 
 use std::fmt::Write;
 
-use crate::{events::Event, policy::Policy, stats::Stats};
+use crate::{events::Event, policy::Policy, stats::Stats, tamper::Diff};
 
 /// Render the full report. The result is a complete `<!DOCTYPE html>`
 /// document.
-pub fn render(policy: &Policy, stats: &Stats, meta: ReportMeta<'_>) -> String {
+pub fn render(
+    policy: &Policy,
+    stats: &Stats,
+    meta: ReportMeta<'_>,
+    drift: Option<&Diff>,
+) -> String {
     let mut html = String::with_capacity(16 * 1024);
 
     let by_kind = count_by_kind(&stats.samples);
@@ -96,7 +101,7 @@ pub fn render(policy: &Policy, stats: &Stats, meta: ReportMeta<'_>) -> String {
       <input id="q" type="search" placeholder="filter by path, host, comm…" autocomplete="off">
     </div>
     <table class="events-table">
-      <thead><tr><th>verdict</th><th>kind</th><th>pid</th><th>comm</th><th>host</th><th>detail</th></tr></thead>
+      <thead><tr><th>verdict</th><th>kind</th><th>pid</th><th>comm</th><th>source</th><th>host</th><th>detail</th></tr></thead>
       <tbody>
 "#,
     );
@@ -111,7 +116,17 @@ pub fn render(policy: &Policy, stats: &Stats, meta: ReportMeta<'_>) -> String {
     <p class="hint">Showing up to 64 samples per kind. Full event stream is in the JSON log.</p>
   </section>
 
-  <section class="policy">
+"#,
+    );
+
+    if let Some(d) = drift
+        && !d.is_clean()
+    {
+        render_drift_section(&mut html, d);
+    }
+
+    html.push_str(
+        r#"  <section class="policy">
     <h2>Effective policy</h2>
     <pre><code>"#,
     );
@@ -233,9 +248,19 @@ fn render_event_row(out: &mut String, ev: &Event) {
             )
         }
     };
-    // `searchable` now includes host so the filter box matches by
-    // hostname too, not just IP:port.
-    let searchable = format!("{kind} {pid} {comm} {host} {detail}").to_lowercase();
+    let source_cell = render_source_cell(ev.source());
+    // Searchable text used by the filter box. Includes both the
+    // package-manager label and the root argv so users can grep
+    // for "npm install foo" or just "npm".
+    let source_search = ev
+        .source()
+        .map(|a| {
+            let pm = a.package_manager.map(|p| p.label()).unwrap_or("");
+            let argv = a.root_argv.as_deref().unwrap_or("");
+            format!("{pm} {argv}")
+        })
+        .unwrap_or_default();
+    let searchable = format!("{kind} {pid} {comm} {source_search} {host} {detail}").to_lowercase();
     let _ = write!(
         out,
         r#"        <tr class="{row_class}" data-kind="{kind}" data-denied="{denied}" data-search="{search}">
@@ -243,6 +268,7 @@ fn render_event_row(out: &mut String, ev: &Event) {
           <td><span class="chip {kind_class}">{kind}</span></td>
           <td class="num">{pid}</td>
           <td><code>{comm}</code></td>
+          <td>{source_cell}</td>
           <td>{host}</td>
           <td>{detail}</td>
         </tr>
@@ -255,9 +281,128 @@ fn render_event_row(out: &mut String, ev: &Event) {
         kind_class = kind_class,
         pid = pid,
         comm = html_escape(&comm),
+        source_cell = source_cell,
         host = host,
         detail = detail,
     );
+}
+
+/// Render the `source` column for one event. When attribution is
+/// attached and a package manager was identified, show the label as
+/// a chip with the joined argv as a hover tooltip — keeps the cell
+/// compact while preserving the "what command actually ran this"
+/// detail one mouse-over away. Falls back to em-dash when no
+/// attribution is available (Linux-only feature; macOS/Windows
+/// supervisor leaves source: None).
+fn render_source_cell(attr: Option<&crate::attribution::Attribution>) -> String {
+    let Some(a) = attr else {
+        return r#"<span class="muted">—</span>"#.to_string();
+    };
+    let Some(pm) = a.package_manager else {
+        // Have a chain but no recognised package manager — surface
+        // the chain depth so the cell isn't blank.
+        return format!(
+            r#"<span class="muted" title="chain depth {}">—</span>"#,
+            a.chain.len()
+        );
+    };
+    let tooltip = a
+        .root_argv
+        .as_deref()
+        .unwrap_or_else(|| pm.label())
+        .chars()
+        .take(200)
+        .collect::<String>();
+    format!(
+        r#"<span class="chip chip-source" title="{tooltip}">{label}</span>"#,
+        tooltip = html_escape(&tooltip),
+        label = html_escape(pm.label()),
+    )
+}
+
+/// Maximum drift rows surfaced per category before truncation.
+/// Matches the step-summary cap so HTML and markdown views stay
+/// in sync; the JSON log carries the full diff regardless.
+const HTML_DRIFT_TOP_N: usize = 50;
+
+fn render_drift_section(out: &mut String, drift: &Diff) {
+    let total = drift.total();
+    let _ = write!(
+        out,
+        r#"  <section class="drift">
+    <h2>Workspace drift <span class="badge badge-warn">{total} change{plural}</span></h2>
+    <p class="hint">Files modified during the supervised step.
+       Compare against the baseline taken at <code>--snapshot-workspace</code>.</p>
+    <table class="events-table">
+      <thead><tr><th>change</th><th>path</th><th>note</th></tr></thead>
+      <tbody>
+"#,
+        total = total,
+        plural = if total == 1 { "" } else { "s" },
+    );
+    for p in drift.added.iter().take(HTML_DRIFT_TOP_N) {
+        let _ = writeln!(
+            out,
+            r#"        <tr><td><span class="chip chip-add">added</span></td><td><code>{}</code></td><td></td></tr>"#,
+            html_escape(&p.display().to_string())
+        );
+    }
+    for m in drift.modified.iter().take(HTML_DRIFT_TOP_N) {
+        let note = drift_modification_note(m);
+        let _ = writeln!(
+            out,
+            r#"        <tr><td><span class="chip chip-mod">modified</span></td><td><code>{}</code></td><td><span class="muted">{}</span></td></tr>"#,
+            html_escape(&m.path.display().to_string()),
+            html_escape(&note),
+        );
+    }
+    for p in drift.removed.iter().take(HTML_DRIFT_TOP_N) {
+        let _ = writeln!(
+            out,
+            r#"        <tr><td><span class="chip chip-del">removed</span></td><td><code>{}</code></td><td></td></tr>"#,
+            html_escape(&p.display().to_string())
+        );
+    }
+    let shown = drift.added.len().min(HTML_DRIFT_TOP_N)
+        + drift.modified.len().min(HTML_DRIFT_TOP_N)
+        + drift.removed.len().min(HTML_DRIFT_TOP_N);
+    out.push_str("      </tbody>\n    </table>\n");
+    if total > shown {
+        let _ = writeln!(
+            out,
+            r#"    <p class="hint">… {} more rows omitted; full diff is in <code>workspace_drift</code> of the JSON log.</p>"#,
+            total - shown,
+        );
+    }
+    out.push_str("  </section>\n\n");
+}
+
+fn drift_modification_note(m: &crate::tamper::ModifiedEntry) -> String {
+    use crate::tamper::Entry;
+    match (&m.before, &m.after) {
+        (
+            Entry::File {
+                size: a,
+                sha256: ha,
+            },
+            Entry::File {
+                size: b,
+                sha256: hb,
+            },
+        ) => {
+            if a != b {
+                format!("{a} → {b} bytes")
+            } else if ha != hb {
+                "contents changed".to_string()
+            } else {
+                "metadata changed".to_string()
+            }
+        }
+        (Entry::Symlink { target: a }, Entry::Symlink { target: b }) => {
+            format!("link target {a} → {b}")
+        }
+        _ => "type changed".to_string(),
+    }
 }
 
 fn html_escape(s: &str) -> String {
@@ -403,11 +548,18 @@ main { max-width: 1200px; margin: 0 auto; padding: 32px; }
 .chip-exec { background: #ddd6fe; color: #6d28d9; }
 .chip-open { background: #bfdbfe; color: #1d4ed8; }
 .chip-connect { background: #fbcfe8; color: #be185d; }
+.chip-source { background: var(--accent-soft); color: var(--accent); cursor: help; }
+.chip-add { background: var(--ok-soft); color: var(--ok); }
+.chip-mod { background: var(--warn-soft); color: var(--warn); }
+.chip-del { background: var(--danger-soft); color: var(--danger); }
 @media (prefers-color-scheme: dark) {
   .chip-exec { background: #4c1d95; color: #ddd6fe; }
   .chip-open { background: #1e3a8a; color: #bfdbfe; }
   .chip-connect { background: #831843; color: #fbcfe8; }
 }
+
+.drift { margin-bottom: 32px; }
+.drift h2 { display: flex; gap: 12px; align-items: center; }
 
 .events { margin-bottom: 32px; }
 .toolbar {
@@ -548,7 +700,7 @@ mod tests {
     fn html_includes_host_column_header() {
         let p = Policy::permissive_audit();
         let s = stats_with_one_connect("1.2.3.4", None);
-        let out = render(&p, &s, meta());
+        let out = render(&p, &s, meta(), None);
         assert!(out.contains("<th>host</th>"), "host column header missing");
     }
 
@@ -556,7 +708,7 @@ mod tests {
     fn connect_row_shows_hostname_when_present() {
         let p = Policy::permissive_audit();
         let s = stats_with_one_connect("1.2.3.4", Some("example.com"));
-        let out = render(&p, &s, meta());
+        let out = render(&p, &s, meta(), None);
         assert!(out.contains("example.com"), "hostname should render");
         // The IP still appears in the detail column.
         assert!(out.contains("1.2.3.4:443"));
@@ -566,7 +718,7 @@ mod tests {
     fn connect_row_shows_dash_when_hostname_missing() {
         let p = Policy::permissive_audit();
         let s = stats_with_one_connect("1.2.3.4", None);
-        let out = render(&p, &s, meta());
+        let out = render(&p, &s, meta(), None);
         // Em-dash placeholder in the host cell.
         assert!(out.contains("—"), "dash placeholder expected when no PTR");
     }
@@ -593,10 +745,106 @@ mod tests {
             denied: false,
             source: None,
         });
-        let out = render(&p, &s, meta());
+        let out = render(&p, &s, meta(), None);
         // Both rows should render; the host cell is simply empty for
         // non-connect events.
         assert!(out.contains("/bin/sh"));
         assert!(out.contains("/etc/passwd"));
+    }
+
+    #[test]
+    fn source_column_header_present() {
+        let p = Policy::permissive_audit();
+        let s = stats_with_one_connect("1.2.3.4", None);
+        let out = render(&p, &s, meta(), None);
+        assert!(out.contains("<th>source</th>"), "source column missing");
+    }
+
+    #[test]
+    fn source_cell_shows_package_manager_label_when_attributed() {
+        use crate::attribution::{Attribution, PackageManager, ProcInfo};
+        let p = Policy::permissive_audit();
+        let mut s = Stats::default();
+        s.ingest(Event::Connect {
+            pid: 1,
+            uid: 0,
+            comm: "curl".into(),
+            daddr: "1.1.1.1".into(),
+            dport: 443,
+            protocol: 6,
+            denied: false,
+            hostname: None,
+            source: Some(Attribution {
+                chain: vec![ProcInfo {
+                    pid: 1,
+                    argv0: "npm".into(),
+                    argv: "npm install left-pad@1.0.0".into(),
+                }],
+                package_manager: Some(PackageManager::Npm),
+                root_argv: Some("npm install left-pad@1.0.0".into()),
+            }),
+        });
+        let out = render(&p, &s, meta(), None);
+        // Chip with the pm label rendered.
+        assert!(
+            out.contains(">npm<"),
+            "expected pm chip with `npm` label, got:\n{out}"
+        );
+        // Tooltip carries the full argv for the cell hover.
+        assert!(
+            out.contains("npm install left-pad@1.0.0"),
+            "expected root_argv in tooltip / search index"
+        );
+    }
+
+    #[test]
+    fn source_cell_falls_back_to_dash_when_no_attribution() {
+        // Event without source → em-dash placeholder.
+        let p = Policy::permissive_audit();
+        let s = stats_with_one_connect("1.2.3.4", None);
+        let out = render(&p, &s, meta(), None);
+        // Both the host and source cells use the em-dash placeholder
+        // — count >=2 to confirm the source cell got one too.
+        assert!(
+            out.matches("—").count() >= 2,
+            "expected dash placeholders for missing data"
+        );
+    }
+
+    #[test]
+    fn drift_section_renders_only_when_drift_is_present() {
+        use crate::tamper::{Diff, Entry, ModifiedEntry};
+        use std::path::PathBuf;
+
+        let p = Policy::permissive_audit();
+        let s = Stats::default();
+
+        // Clean diff → no section.
+        let out = render(&p, &s, meta(), Some(&Diff::default()));
+        assert!(!out.contains("Workspace drift"));
+
+        // Real diff → section appears with chip rows.
+        let drift = Diff {
+            added: vec![PathBuf::from("src/new.rs")],
+            modified: vec![ModifiedEntry {
+                path: PathBuf::from("src/lib.rs"),
+                before: Entry::File {
+                    size: 100,
+                    sha256: Some("a".repeat(64)),
+                },
+                after: Entry::File {
+                    size: 200,
+                    sha256: Some("b".repeat(64)),
+                },
+            }],
+            removed: vec![PathBuf::from("src/old.rs")],
+        };
+        let out = render(&p, &s, meta(), Some(&drift));
+        assert!(out.contains("Workspace drift"));
+        assert!(out.contains("chip-add"));
+        assert!(out.contains("chip-mod"));
+        assert!(out.contains("chip-del"));
+        // Modification note exposes the size delta.
+        assert!(out.contains("100 → 200 bytes"));
     }
 }
