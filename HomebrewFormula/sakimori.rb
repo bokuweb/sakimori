@@ -2,7 +2,7 @@ class Sakimori < Formula
   desc "Cross-platform supply-chain guard for every package manager"
   homepage "https://github.com/bokuweb/sakimori"
   license "MIT"
-  version "0.26.0"
+  version "0.32.0"
 
   # This formula is a per-release binary installer — we consume the
   # prebuilt tarballs that `.github/workflows/release.yml` publishes
@@ -16,23 +16,23 @@ class Sakimori < Formula
 
   on_macos do
     on_arm do
-      url "https://github.com/bokuweb/sakimori/releases/download/v0.26.0/sakimori-aarch64-apple-darwin.tar.gz"
-      sha256 "80907949dc623686245be77c5833fba3d41a3b8d66406d2ea4c10fa0f1793251"
+      url "https://github.com/bokuweb/sakimori/releases/download/v0.32.0/sakimori-aarch64-apple-darwin.tar.gz"
+      sha256 "3a4d125ce4ecc9cbf3a583c2770ce071af1895958510940c1469317874829e2c"
     end
     on_intel do
-      url "https://github.com/bokuweb/sakimori/releases/download/v0.26.0/sakimori-x86_64-apple-darwin.tar.gz"
-      sha256 "f6d2c6e8770eb70a7b2173aa10043f28215e9a655db5fc0a80c9aef00fdf17c8"
+      url "https://github.com/bokuweb/sakimori/releases/download/v0.32.0/sakimori-x86_64-apple-darwin.tar.gz"
+      sha256 "fa38027b8058be415517b0ed4e32413fa8f7847fd7027812ae84a58c1f6784f6"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/bokuweb/sakimori/releases/download/v0.26.0/sakimori-aarch64-unknown-linux-musl.tar.gz"
-      sha256 "7ae6f9a1e7f9ad369b80571eebb00ca64692598d0bc1c1df11d84ad07c828b57"
+      url "https://github.com/bokuweb/sakimori/releases/download/v0.32.0/sakimori-aarch64-unknown-linux-musl.tar.gz"
+      sha256 "90302151f0043cac868e9588dd34acb168e75c3df94bd28a8b7c7e0e24f79b21"
     end
     on_intel do
-      url "https://github.com/bokuweb/sakimori/releases/download/v0.26.0/sakimori-x86_64-unknown-linux-musl.tar.gz"
-      sha256 "ba9bf9f8a7dbe8b21daf3e0ce72c29873dc56ea4eac6716f3a92ce19c234986e"
+      url "https://github.com/bokuweb/sakimori/releases/download/v0.32.0/sakimori-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "cfe872eca1cd0331ba9e45dfc1cae16dd526609e2ad8e827b8b5e0047eed134e"
     end
   end
 
