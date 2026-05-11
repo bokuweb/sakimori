@@ -769,11 +769,33 @@ Limitations: Linux runners only (Windows needs a different kernel
 hook), and **container jobs** (`jobs.<id>.container:`) are unsupported
 because the host-side cgroup attach can't reach steps that run inside
 the container. Matrix shards and reusable-workflow callers are each
-their own job and need their own `bokuweb/sakimori/job@v0`. Note also
-that the audit log is only written at post-time, so `actions/upload-
-artifact` *inside the same job* can't see it — upload it from a
-downstream job, or use the `bokuweb/sakimori@v0` one-step form below
-if you need the artifact mid-job.
+their own job and need their own `bokuweb/sakimori/job@v0`.
+
+**Uploading the audit log from the same job**: the daemon writes
+its JSON / HTML / step-summary at end-of-job (the post-hook), which
+is too late for an `actions/upload-artifact` step inside the same
+job. Drop in `bokuweb/sakimori/job/stop@v0` right before the
+upload to flush the daemon early:
+
+```yaml
+- uses: bokuweb/sakimori/job@v0
+  with: { policy: .github/sakimori.yml, mode: block }
+
+- uses: actions/checkout@v4
+- run: pnpm test
+
+- uses: bokuweb/sakimori/job/stop@v0       # flush + stop
+- uses: actions/upload-artifact@v4
+  with:
+    name: sakimori-report
+    path: |
+      sakimori.log.json
+      sakimori-report.html
+```
+
+It's idempotent — the daemon's own post-hook turns into a no-op on
+the missing pid-file. On non-Linux matrix entries the sub-action
+no-ops silently, so it's safe to drop into a cross-OS workflow.
 
 **Tamper detection**: pass `snapshot-workspace: <DIR>` to also catch
 on-disk tampering. The daemon can't take the baseline itself (it

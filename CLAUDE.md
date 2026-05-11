@@ -394,6 +394,15 @@ of value-per-implementation-cost.
       `job-scoped-smoke` CI job to test the action against a
       locally-built binary, also useful for air-gapped mirrors.
 
+      Sub-action `bokuweb/sakimori/job/stop@v0` (composite, one
+      step) is a 1-line shortcut for the "flush the daemon early
+      before `actions/upload-artifact` inside the same job"
+      pattern. Replaces the previous 4-line `sudo -n -E
+      $SAKIMORI_BIN daemon stop --pid-file $SAKIMORI_JOB_PIDFILE`
+      snippet so consumer workflows don't have to know about
+      pid-files or sudo. Idempotent + Linux-only-no-op so it can
+      be dropped into cross-OS matrices unchanged.
+
       **Out of scope for this iteration**: container jobs
       (`jobs.<id>.container:`) — the host-side cgroup attach can't
       reach steps that run inside the container. `pre.js` detects
