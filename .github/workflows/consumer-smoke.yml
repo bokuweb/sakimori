@@ -16,12 +16,6 @@ permissions:
 
 jobs:
   use-as-action:
-    # The `bokuweb/sakimori@v0` published action still ships the pre-rename
-    # `coronarium-*.tar.gz` assets and exports `CORONARIUM_BIN`; on a
-    # pull_request run from this branch the workflow references
-    # `$SAKIMORI_BIN` and fails. Re-enable on PR after the first release
-    # under the new name has been cut.
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -127,8 +121,6 @@ jobs:
     # Complement the audit-mode happy path with a block-mode run that
     # asserts the published action actually makes CI fail when a deny
     # happens. Runs alongside use-as-action (doesn't need its results).
-    # Skipped on PR for the same reason as use-as-action above.
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -164,9 +156,7 @@ jobs:
 
   use-as-action-windows:
     # Proves `bokuweb/sakimori@v0` also works on windows-latest, using
-    # the same inputs / env contract as the Linux job above. Skipped on
-    # PR for the same reason as use-as-action above.
-    if: github.event_name != 'pull_request'
+    # the same inputs / env contract as the Linux job above.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
