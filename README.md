@@ -453,6 +453,65 @@ Cache location: `$XDG_CACHE_HOME/sakimori/deps-cache.json`
 (`%LOCALAPPDATA%\sakimori\…` on Windows). Publish dates are
 immutable, so there's no TTL.
 
+### `deps verify-cache`
+
+Re-hash the package manager's local cache against the lockfile's
+`integrity:` fields and fail if any byte doesn't match what the
+lockfile pinned. This catches the *content* half of the **TanStack
+2025 npm supply-chain attack**: a tarball restored from `actions/
+cache` whose bytes have been swapped, while the lockfile entry
+itself looks untouched.
+
+Run it right after install, in the brief moment when the store is
+fully populated but nothing has built against it yet:
+
+```bash
+# npm cacache (uses ~/.npm/_cacache by default)
+sakimori deps verify-cache --lockfile package-lock.json
+
+# pnpm store v3 (auto-picks ~/.local/share/pnpm/store/v3 on Linux,
+# ~/Library/pnpm/store/v3 on macOS)
+sakimori deps verify-cache --lockfile pnpm-lock.yaml
+
+# cargo registry cache (walks $CARGO_HOME/registry/cache/*/)
+sakimori deps verify-cache --lockfile Cargo.lock
+
+# Override the store path (Windows, monorepos with isolated stores,
+# corporate runners with non-standard layouts):
+sakimori deps verify-cache --lockfile pnpm-lock.yaml --cache /opt/pnpm-store/v3
+
+# Machine-readable for CI gating
+sakimori deps verify-cache --lockfile package-lock.json --format json
+```
+
+Supported stores:
+
+| ecosystem | lockfile | store walked |
+|---|---|---|
+| npm | `package-lock.json` (v2/v3) | `~/.npm/_cacache/content-v2/<algo>/<aa>/<bb>/<rest>` |
+| pnpm | `pnpm-lock.yaml` (v6–v9) | `<store>/v3/files/<aa>/<rest>[-exec]` + per-tarball `-index.json` |
+| cargo | `Cargo.lock` | `$CARGO_HOME/registry/cache/<reg>/<name>-<version>.crate` |
+
+Exit codes:
+
+| code | meaning |
+|---|---|
+| 0 | every lockfile entry verifies cleanly against the store |
+| 1 | at least one mismatch or missing-from-store entry |
+| 2 | parse / I/O error |
+
+> ⚠️ **Honest limitations.** The pnpm verifier reads the on-disk
+> `<rest>-index.json` to find per-file hashes — pnpm discards the
+> tarball after extraction, so a fully coordinated rewrite of both
+> the index and every blob it references would verify clean. The
+> realistic single-file tampering pattern is caught. **pnpm v10**
+> replaced the per-package JSON index with a SQLite `index.db`;
+> v10 stores are not yet supported and `verify-cache` will surface
+> a clear `Unsupported` error rather than silently passing.
+
+The same check is wrapped as a one-line GitHub Actions step —
+see [CI usage](#ci-usage-github-actions) below.
+
 ### `deps watch`
 
 Long-running FS-event watcher for lockfile changes. Designed for
@@ -561,6 +620,35 @@ files are ignored — only workflow files (those with a top-level
 `jobs:` block) are walked. Resolution failures (rate-limit, removed
 action) appear as `→ resolve failed: …` per finding without
 aborting the audit.
+
+**Workflow-level lint** (in addition to per-`uses:` SHA pinning):
+the auditor also flags the `pull_request_target` + writable Actions
+cache pattern — the TanStack 2025 cache-poisoning vector. If a
+workflow runs on `pull_request_target` (or `workflow_run`) **and**
+any job step writes to the GitHub Actions cache, that's an Error.
+
+```bash
+sakimori actions audit .github/workflows/bundle-size.yml
+# .github/workflows/bundle-size.yml  (1 ok, 0 warn, 0 error)
+#   ERROR  [pull_request_target_with_cache_write] workflow runs on
+#          `pull_request_target` and writes to the Actions cache —
+#          an untrusted fork PR can poison the cache that a later
+#          trusted workflow restores (TanStack-style npm supply-chain
+#          compromise). …
+#          · size (actions/cache@v4): actions/cache writes via post-step on cache miss
+```
+
+Detected cache writers: `actions/cache@*`, `actions/cache/save@*`,
+`actions/setup-{node,python,java,dotnet,ruby}` with `with.cache:`,
+`actions/setup-go` (caches by default), `Swatinem/rust-cache`,
+`mozilla-actions/sccache-action`, `astral-sh/setup-uv` with
+`enable-cache: true`. Cache writes use a runner-internal token, not
+the workflow `GITHUB_TOKEN`, so `permissions: contents: read` does
+**not** block them. Split cache-writing steps into a separate
+workflow that doesn't run on fork PRs, or gate the offending job
+behind `if: github.event.pull_request.head.repo.full_name ==
+github.repository`. JSON output puts these under a top-level
+`workflow_findings` array alongside the per-`uses:` `findings`.
 
 ### `run`
 
@@ -736,6 +824,48 @@ of silently falling back.
 - run: $SAKIMORI_BIN deps check --min-age 7d Cargo.lock package-lock.json
 - run: cargo test   # only reached if the check passed
 ```
+
+### Cache-poisoning guard: `bokuweb/sakimori/verify-cache@v0`
+
+The proxy filters at **fetch** time — it can't see bytes restored
+from `actions/cache`. If your workflow uses `actions/cache` (or
+`actions/setup-node` with `cache:`, `Swatinem/rust-cache`, etc.) a
+poisoned restore happens between cache-restore and install, behind
+the proxy's back.
+
+Drop this step in **right after install** to re-hash every blob in
+the local store against the lockfile's `integrity:` fields:
+
+```yaml
+- uses: bokuweb/sakimori/proxy@v0
+  with: { min-age: 7d }
+
+- uses: actions/cache@v4
+  with: { path: ~/.local/share/pnpm/store, key: ... }
+- run: pnpm install        # populates / hits the cache
+
+# ↓ catches TanStack-style cache poisoning: cache restored a
+# tarball whose bytes don't match what the lockfile pinned.
+- uses: bokuweb/sakimori/verify-cache@v0
+  with:
+    lockfile: pnpm-lock.yaml
+```
+
+Supports `package-lock.json`, `pnpm-lock.yaml`, and `Cargo.lock`;
+auto-picks the cache root for the runner OS. Inputs:
+
+| input | default | description |
+|---|---|---|
+| `lockfile` | (required) | Path to `package-lock.json`, `pnpm-lock.yaml`, or `Cargo.lock`. |
+| `cache` | (auto) | Override the store root. Required on Windows; auto-detects `~/.npm/_cacache`, `~/.local/share/pnpm/store/v3` (Linux), `~/Library/pnpm/store/v3` (macOS), `$CARGO_HOME/.cargo/registry/cache` on other platforms. |
+| `format` | `text` | `text` or `json`. |
+| `version` | `v0` | sakimori release tag. |
+| `token` | `${{ github.token }}` | Used by `gh release download`. |
+
+Exit codes match the CLI: `0` clean, `1` on any mismatch / missing
+entry. **pnpm v10 SQLite stores are not yet supported** — the
+action exits with a clear `Unsupported` error rather than passing
+silently.
 
 ### eBPF-supervised test run — job-scoped form (Linux only)
 

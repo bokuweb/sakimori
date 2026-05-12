@@ -665,6 +665,27 @@ pub enum DepsCommand {
     /// every lockfile change, and surface violations via a desktop
     /// notification. Designed for `launchd` / `systemd --user`.
     Watch(DepsWatchArgs),
+    /// Re-hash the package manager's local cache against the
+    /// `integrity:` fields in a lockfile. Catches the *content* half
+    /// of TanStack-style GHA cache poisoning: cache restored bytes
+    /// that don't match what the lockfile pinned. MVP: npm cacache
+    /// only (default root `~/.npm/_cacache`).
+    #[command(name = "verify-cache")]
+    VerifyCache(DepsVerifyCacheArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct DepsVerifyCacheArgs {
+    /// Lockfile to read integrity hashes from. MVP supports
+    /// `package-lock.json` (npm v2/v3).
+    #[arg(long, short = 'l')]
+    pub lockfile: PathBuf,
+    /// Path to the package manager's cache root. Defaults to
+    /// `~/.npm/_cacache` (npm cacache layout).
+    #[arg(long)]
+    pub cache: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: DepsFormat,
 }
 
 #[derive(Debug, Parser)]
@@ -956,6 +977,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             })?;
             Ok(())
         }
+        Command::Deps {
+            cmd: DepsCommand::VerifyCache(args),
+        } => run_deps_verify_cache(args),
         Command::InstallGate {
             cmd: InstallGateCommand::Shellenv(args),
         } => {
@@ -1147,29 +1171,170 @@ fn run_workspace_diff(args: WorkspaceDiffArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_deps_verify_cache(args: DepsVerifyCacheArgs) -> Result<()> {
+    use sakimori_core::deps::verify_cache::{
+        Outcome, cargo_integrity_entries, npm_integrity_entries, pnpm_integrity_entries,
+        verify_cargo_registry, verify_npm_cacache, verify_pnpm_store,
+    };
+
+    // Pick lockfile flavour by basename. Each flavour has its own
+    // default cache root convention; everything else funnels into
+    // the shared VerifyReport.
+    let fname = args
+        .lockfile
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let report = match fname {
+        "package-lock.json" => {
+            let cache_root = match args.cache {
+                Some(p) => p,
+                None => default_npm_cacache_root()?,
+            };
+            let entries = npm_integrity_entries(&args.lockfile)
+                .with_context(|| format!("reading integrity from {}", args.lockfile.display()))?;
+            verify_npm_cacache(&entries, &cache_root)
+        }
+        "pnpm-lock.yaml" => {
+            let store_root = match args.cache {
+                Some(p) => p,
+                None => default_pnpm_store_root()?,
+            };
+            let entries = pnpm_integrity_entries(&args.lockfile)
+                .with_context(|| format!("reading integrity from {}", args.lockfile.display()))?;
+            verify_pnpm_store(&entries, &store_root)
+        }
+        "Cargo.lock" => {
+            let cargo_home = match args.cache {
+                Some(p) => p,
+                None => default_cargo_home()?,
+            };
+            let entries = cargo_integrity_entries(&args.lockfile)
+                .with_context(|| format!("reading integrity from {}", args.lockfile.display()))?;
+            verify_cargo_registry(&entries, &cargo_home)
+        }
+        other => anyhow::bail!(
+            "unsupported lockfile `{other}` (supported: package-lock.json, pnpm-lock.yaml, Cargo.lock)"
+        ),
+    };
+
+    match args.format {
+        DepsFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        DepsFormat::Text => {
+            println!(
+                "{}  ({} checked, {} ok, {} missing, {} mismatch, {} unsupported)",
+                args.lockfile.display(),
+                report.checked,
+                report.ok,
+                report.missing,
+                report.mismatched,
+                report.unsupported
+            );
+            for v in &report.packages {
+                let tag = match v.outcome {
+                    Outcome::Ok => continue, // hide OK rows in text mode
+                    Outcome::Missing => "MISSING ",
+                    Outcome::Mismatch => "MISMATCH",
+                    Outcome::Unsupported => "skipped ",
+                };
+                println!("  {tag}  {}@{}", v.name, v.version);
+                if let Some(p) = &v.cache_path {
+                    println!("           path: {}", p.display());
+                }
+                if let (Some(exp), Some(act)) = (&v.expected_sha_hex, &v.actual_sha_hex) {
+                    println!("           expected: {exp}");
+                    println!("           actual:   {act}");
+                }
+                if let Some(m) = &v.message {
+                    println!("           {m}");
+                }
+            }
+        }
+    }
+
+    if !report.is_clean() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn default_cargo_home() -> Result<PathBuf> {
+    // `CARGO_HOME` is the canonical override; cargo respects it
+    // everywhere. Default is `~/.cargo` on Unix and `%USERPROFILE%
+    // \.cargo` on Windows. The verifier walks `<cargo_home>/
+    // registry/cache/*/` for the .crate tarballs.
+    if let Some(p) = std::env::var_os("CARGO_HOME") {
+        return Ok(PathBuf::from(p));
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            anyhow::anyhow!("neither $CARGO_HOME nor $HOME set — pass --cache explicitly")
+        })?;
+    Ok(home.join(".cargo"))
+}
+
+fn default_pnpm_store_root() -> Result<PathBuf> {
+    // pnpm settings docs: storeDir defaults are
+    //   Linux:   ~/.local/share/pnpm/store
+    //   macOS:   ~/Library/pnpm/store
+    //   Windows: ~/AppData/Local/pnpm/store
+    // pnpm appends `v3` itself, so the path the verifier walks is
+    // <storeDir>/v3 — that's what we return. Windows isn't auto-
+    // detected here; users on Windows pass `--cache` explicitly.
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("$HOME not set — pass --cache explicitly"))?;
+    let base = if cfg!(target_os = "macos") {
+        home.join("Library").join("pnpm").join("store")
+    } else {
+        home.join(".local").join("share").join("pnpm").join("store")
+    };
+    Ok(base.join("v3"))
+}
+
+fn default_npm_cacache_root() -> Result<PathBuf> {
+    // npm puts cacache at `~/.npm/_cacache` on Linux/macOS. On
+    // Windows it's `%LOCALAPPDATA%\npm-cache\_cacache`, but the
+    // first-call MVP only targets the Unix layout — point users
+    // explicitly via `--cache` on Windows.
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("$HOME not set — pass --cache explicitly"))?;
+    Ok(home.join(".npm").join("_cacache"))
+}
+
 fn run_actions_audit(args: ActionsAuditArgs) -> Result<()> {
-    use sakimori_core::actions::{Finding, Severity, Summary, audit_yaml};
+    use sakimori_core::actions::{
+        Finding, Severity, Summary, WorkflowFinding, audit_workflow_yaml, audit_yaml,
+    };
     use serde::Serialize;
 
     #[derive(Serialize)]
     struct PerFile<'a> {
         file: &'a std::path::Path,
         findings: &'a [Finding],
+        workflow_findings: &'a [WorkflowFinding],
         summary: Summary,
     }
 
-    let mut all: Vec<(PathBuf, Vec<Finding>)> = Vec::new();
+    let mut all: Vec<(PathBuf, Vec<Finding>, Vec<WorkflowFinding>)> = Vec::new();
     for path in &args.files {
         let yaml =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let findings = audit_yaml(&yaml).with_context(|| format!("auditing {}", path.display()))?;
-        all.push((path.clone(), findings));
+        let workflow_findings = audit_workflow_yaml(&yaml)
+            .with_context(|| format!("auditing workflow rules in {}", path.display()))?;
+        all.push((path.clone(), findings, workflow_findings));
     }
 
     // `--strict` rewrites Warn → Error in-place so both the printed
     // output and the exit code reflect the user's choice.
     if args.strict {
-        for (_, findings) in &mut all {
+        for (_, findings, _) in &mut all {
             for f in findings {
                 if f.severity == Severity::Warn {
                     f.severity = Severity::Error;
@@ -1187,7 +1352,7 @@ fn run_actions_audit(args: ActionsAuditArgs) -> Result<()> {
             "sakimori/{}",
             env!("CARGO_PKG_VERSION")
         ));
-        for (_, findings) in &mut all {
+        for (_, findings, _) in &mut all {
             sakimori_core::actions::resolve_all(findings, &resolver);
         }
     }
@@ -1197,21 +1362,27 @@ fn run_actions_audit(args: ActionsAuditArgs) -> Result<()> {
         ActionsFormat::Json => {
             let payload: Vec<PerFile<'_>> = all
                 .iter()
-                .map(|(p, f)| PerFile {
+                .map(|(p, f, wf)| PerFile {
                     file: p.as_path(),
                     findings: f,
+                    workflow_findings: wf,
                     summary: Summary::from_findings(f),
                 })
                 .collect();
             println!("{}", serde_json::to_string_pretty(&payload)?);
             blocking = all
                 .iter()
-                .flat_map(|(_, f)| f.iter())
+                .flat_map(|(_, f, _)| f.iter())
                 .filter(|f| f.is_blocking())
-                .count();
+                .count()
+                + all
+                    .iter()
+                    .flat_map(|(_, _, wf)| wf.iter())
+                    .filter(|w| matches!(w.severity, Severity::Error))
+                    .count();
         }
         ActionsFormat::Text => {
-            for (path, findings) in &all {
+            for (path, findings, workflow_findings) in &all {
                 let summary = Summary::from_findings(findings);
                 println!(
                     "{}  ({} ok, {} warn, {} error)",
@@ -1244,6 +1415,28 @@ fn run_actions_audit(args: ActionsAuditArgs) -> Result<()> {
                         println!("         → resolve failed: {err}");
                     }
                     if f.is_blocking() {
+                        blocking += 1;
+                    }
+                }
+                for wf in workflow_findings {
+                    let tag = match wf.severity {
+                        Severity::Error => "ERROR",
+                        Severity::Warn => "warn ",
+                        Severity::Ok => "ok   ",
+                    };
+                    println!("  {tag}  [{rule}] {msg}", rule = wf.rule, msg = wf.message);
+                    for w in &wf.cache_writers {
+                        let where_ = match &w.step {
+                            Some(name) => format!("{}/{name}", w.job),
+                            None => w.job.clone(),
+                        };
+                        println!(
+                            "         · {where_} ({uses}): {r}",
+                            uses = w.uses,
+                            r = w.reason
+                        );
+                    }
+                    if matches!(wf.severity, Severity::Error) {
                         blocking += 1;
                     }
                 }

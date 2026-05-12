@@ -434,6 +434,79 @@ of value-per-implementation-cost.
       out of scope: matrix / reusable-workflow shards (each is its
       own Runner.Worker = its own job = needs its own
       `bokuweb/sakimori/job@v0`).
+13. **GHA cache-poisoning lint** (TanStack-style PR-cache attack) —
+    extend `coronarium actions audit` with a workflow-level rule:
+    if `on:` contains `pull_request_target` (or `workflow_run` with
+    a writable cache) **and** any job step writes to the GitHub
+    Actions cache, emit an Error. Cache writers to detect:
+    `actions/cache@*`, `actions/cache/save@*`, any `actions/setup-*`
+    invocation with a `with.cache:` input, and a small allow-list
+    of well-known cache-providing actions (`Swatinem/rust-cache`,
+    `astral-sh/setup-uv`, `pnpm/action-setup` when paired with
+    `setup-node cache:`). Reason: cache writes use a runner-internal
+    token, not the workflow `GITHUB_TOKEN`, so `permissions:
+    contents: read` does not block them — an untrusted fork PR
+    running under `pull_request_target` can poison the
+    pnpm/npm/cargo store cache that a later trusted workflow
+    restores. This is the **TanStack npm supply-chain compromise
+    (2025)** vector and the static check would have caught it.
+    Output: workflow-level finding (file-scoped, not `uses:`-scoped)
+    naming the trigger + the offending step(s). JSON shape: new
+    `workflow_findings` array alongside the existing per-`uses:`
+    `findings`. Out of scope for the first slice: detecting cache
+    writes inside `run:` scripts (e.g. raw `gh actions-cache`
+    calls), and pruning false positives when the cache key is
+    proven untouchable from the PR side — both can be follow-ups.
+14. **`sakimori deps verify-cache`** — hash the package manager's
+    local cache against the lockfile's `integrity:` fields before
+    install. Detects the *content* half of the TanStack vector:
+    `actions/cache` restored a tarball into the local store, but
+    the bytes don't match what the lockfile pinned. Lockfiles ship
+    SRI-style integrity hashes (`sha512-<base64>`) per resolved
+    `(name, version)`; package managers populate content-addressed
+    stores. The verifier walks each store, re-hashes every file
+    referenced by the lockfile, and reports `ok` / `missing` /
+    `mismatch`. Exits non-zero on any mismatch. **Implemented:**
+    - **npm cacache** (`package-lock.json`) — `content-v2/<algo>/
+      <aa>/<bb>/<rest>`; filename *is* the hex digest, so the check
+      is "re-hash file, compare to lockfile integrity".
+    - **pnpm store v3** (`pnpm-lock.yaml`) — lockfile integrity is
+      the *tarball* SRI; it keys an on-disk `<store>/v3/files/<aa>/
+      <rest>-index.json` listing per-file `(integrity, mode, size)`
+      tuples. Verifier reads that index and re-hashes every blob
+      (`<rest>` for regular, `<rest>-exec` when `mode & 0o111`).
+      Handles both v6-v8 (`/name/ver`) and v9 (`name@ver`) spec
+      forms, plus the `_peer@ver` / `(peer@ver)` annotations.
+      Honest limitation documented in the module: a fully
+      coordinated rewrite of both the index.json and every blob
+      verifies clean — we can't re-derive the tarball hash without
+      the .tgz, which pnpm discards. Catches the realistic single-
+      file tampering pattern. **pnpm v10** replaces per-package
+      index.json with a SQLite `<store>/index.db` (msgpack values
+      keyed by `${integrity}\t${pkgId}`); the verifier detects this
+      layout and short-circuits every entry to `Unsupported` with
+      an actionable message rather than silently passing — full
+      SQLite/msgpack support is the remaining sub-task.
+    - **cargo registry** (`Cargo.lock`) — each `[[package]]` from a
+      registry source carries `checksum = "<hex>"` (SHA-256 of the
+      .crate tarball, the same value as the sparse-index `cksum`).
+      Verifier walks every `$CARGO_HOME/registry/cache/<reg>/`
+      (basename opaque — sparse + legacy git + alt registries can
+      coexist) looking for `<name>-<version>.crate`, hashes it, and
+      compares. Cargo re-verifies per-file hashes via
+      `.cargo-checksum.json` at build time, so the .crate tarball
+      check is the bit that adds defence against cache-layer
+      tampering specifically.
+
+    **Action surface**: `bokuweb/sakimori/verify-cache@v0` (node20
+    sub-action) wraps the CLI as a one-line GitHub Actions step.
+    Auto-detects ecosystem from the lockfile basename, picks the
+    default cache root for the runner OS, propagates the CLI exit
+    code. Designed to drop in right after the install step.
+
+    Doesn't replace `deps check` (release-age) — pairs with it:
+    age check at fetch time, cache verify between cache-restore
+    and install. Remaining follow-up: pnpm v10 SQLite reader.
 
 Explicitly **out of scope** (different product philosophy, not
 a missing feature):

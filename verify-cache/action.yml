@@ -1,0 +1,54 @@
+name: "sakimori-verify-cache"
+description: |
+  Re-hash the package manager's local cache against the lockfile's
+  `integrity:` fields and fail the job if any byte doesn't match what
+  the lockfile pinned. Catches the *content* half of TanStack-style
+  GitHub Actions cache poisoning: a tarball restored from cache that
+  no longer hashes to its claimed integrity.
+
+  Run this immediately after the install step (`npm ci`, `pnpm
+  install`) — that's the moment when the cache is fully populated
+  but the build hasn't yet consumed it.
+
+  Supports `package-lock.json` (npm cacache) and `pnpm-lock.yaml`
+  (pnpm store v3). Auto-detects ecosystem from the lockfile name and
+  picks the default cache root for the runner OS.
+author: "bokuweb"
+branding:
+  icon: "check-circle"
+  color: "red"
+
+inputs:
+  lockfile:
+    description: |
+      Path to the lockfile to verify. Either `package-lock.json` or
+      `pnpm-lock.yaml`.
+    required: true
+  cache:
+    description: |
+      Optional override for the package manager's cache root.
+      Defaults to `~/.npm/_cacache` (npm) or `~/.local/share/pnpm/
+      store/v3` (pnpm, Linux) / `~/Library/pnpm/store/v3` (pnpm,
+      macOS). Pass explicitly on Windows.
+    required: false
+    default: ""
+  format:
+    description: |
+      Output format. `text` (default) prints a one-line summary plus
+      mismatched / missing entries; `json` prints the full report.
+    required: false
+    default: "text"
+  version:
+    description: |
+      sakimori release tag to download. Defaults to the floating
+      `v0` tag.
+    required: false
+    default: "v0"
+  token:
+    description: "GitHub token for `gh release download`."
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: node20
+  main: "main.js"

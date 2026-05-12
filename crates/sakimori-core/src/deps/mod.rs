@@ -19,6 +19,7 @@ pub mod cache;
 pub mod cli;
 pub mod lockfile;
 pub mod registry;
+pub mod verify_cache;
 pub mod watch;
 
 use std::path::Path;
