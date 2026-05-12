@@ -40,6 +40,16 @@ impl Enforcer {
                 .context("attaching sys_enter_openat")?;
         }
 
+        // Roadmap #4: opportunistic pre-syscall block via
+        // bpf_override_return on a do_sys_openat2 kprobe. Strictly
+        // additive — the SIGKILL tripwire on the tracepoint stays
+        // armed regardless, so any attach failure here degrades
+        // silently to the existing behaviour. Gated behind an
+        // opt-in env var while we collect cross-kernel field data.
+        if should_attempt_kprobe_override() {
+            try_attach_openat2_kprobe(bpf);
+        }
+
         if let Some(cgroup) = cgroup {
             let fd = cgroup.as_file()?;
             for name in ["sakimori_connect4", "sakimori_connect6"] {
@@ -55,6 +65,86 @@ impl Enforcer {
         populate_network_maps(bpf, policy, resolver).await?;
         populate_file_maps(bpf, policy)?;
         Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn should_attempt_kprobe_override() -> bool {
+    // The env-var gate is the user's opt-in switch; the detection
+    // probe filters out kernels that don't have
+    // CONFIG_BPF_KPROBE_OVERRIDE. We require both: an opted-in
+    // user on a kernel without the support would silently fall
+    // back, but on the (more common) opted-out user we don't even
+    // probe.
+    if !env_opt_in("SAKIMORI_ENABLE_KPROBE_OVERRIDE") {
+        return false;
+    }
+    let status = crate::kprobe_override::detect();
+    match status {
+        crate::kprobe_override::KprobeOverrideStatus::Available { .. } => true,
+        crate::kprobe_override::KprobeOverrideStatus::Unsupported { .. } => {
+            log::info!(
+                "SAKIMORI_ENABLE_KPROBE_OVERRIDE set but kernel lacks CONFIG_BPF_KPROBE_OVERRIDE; \
+                 staying on SIGKILL-tripwire fallback"
+            );
+            false
+        }
+        crate::kprobe_override::KprobeOverrideStatus::Unknown { reason } => {
+            log::info!(
+                "SAKIMORI_ENABLE_KPROBE_OVERRIDE set but kernel-config readability is unknown \
+                 ({reason}); attempting attach anyway"
+            );
+            true
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn env_opt_in(name: &str) -> bool {
+    // Common truthy values; everything else (unset, "0", "false",
+    // empty) is treated as opt-out so users can paste a `=0` into
+    // CI to disable without removing the assignment.
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn try_attach_openat2_kprobe(bpf: &mut aya::Ebpf) {
+    let Some(prog) = bpf.program_mut("sakimori_openat2_kprobe") else {
+        log::debug!("sakimori_openat2_kprobe program not in object; skipping");
+        return;
+    };
+    let kp: &mut aya::programs::KProbe = match prog.try_into() {
+        Ok(k) => k,
+        Err(e) => {
+            log::warn!("sakimori_openat2_kprobe: not a KProbe program: {e:#}");
+            return;
+        }
+    };
+    if let Err(e) = kp.load() {
+        log::warn!(
+            "sakimori_openat2_kprobe: verifier rejected load ({e:#}); \
+             staying on SIGKILL-tripwire fallback"
+        );
+        return;
+    }
+    match kp.attach("do_sys_openat2", 0) {
+        Ok(_) => {
+            log::info!(
+                "sakimori_openat2_kprobe attached: file.deny is now a pre-syscall block \
+                 (bpf_override_return → -EPERM)"
+            );
+        }
+        Err(e) => {
+            log::warn!(
+                "sakimori_openat2_kprobe: attach to do_sys_openat2 failed ({e:#}); \
+                 staying on SIGKILL-tripwire fallback. Common causes: \
+                 do_sys_openat2 not in this kernel's error-injection allowlist, \
+                 or missing CAP_SYS_ADMIN."
+            );
+        }
     }
 }
 

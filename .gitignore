@@ -8,3 +8,8 @@ __pycache__/
 # are not part of the main workspace and shouldn't be tracked.
 crates/sakimori-win/target/
 crates/sakimori-win/Cargo.lock
+
+# Same story for sakimori-ebpf — built separately via nightly +
+# `bpfel-unknown-none` target.
+crates/sakimori-ebpf/target/
+crates/sakimori-ebpf/Cargo.lock
