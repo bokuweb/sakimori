@@ -86,6 +86,17 @@ pub struct ProxyConfig {
     /// the local-first audit log is the foundation of
     /// `sakimori advisories scan`.
     pub install_log_enabled: bool,
+    /// Optional OTLP/HTTP logs endpoint. When `Some`, every allowed
+    /// install dispatches a fire-and-forget `LogRecord` (with
+    /// `package.*` attributes) to this URL in addition to the local
+    /// install log. The URL must include the OTLP path (typically
+    /// `…/v1/logs`); we don't auto-suffix because collectors may
+    /// mount OTLP on a custom path.
+    pub otlp_endpoint: Option<String>,
+    /// Extra headers attached to every OTLP request — typically
+    /// `Authorization: Bearer …` for vendor backends. Ignored when
+    /// `otlp_endpoint` is `None`.
+    pub otlp_headers: Vec<(String, String)>,
 }
 
 impl ProxyConfig {
@@ -107,6 +118,8 @@ impl ProxyConfig {
             network_allow: None,
             install_log_path: None,
             install_log_enabled: true,
+            otlp_endpoint: None,
+            otlp_headers: Vec::new(),
         })
     }
 }
@@ -253,6 +266,14 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
     } else {
         None
     };
+    let otlp_exporter = cfg.otlp_endpoint.as_ref().map(|endpoint| {
+        log::info!("OTLP log export → {endpoint}");
+        Arc::new(crate::otlp::OtlpExporter::new(
+            endpoint.clone(),
+            cfg.otlp_headers.clone(),
+            cfg.user_agent.clone(),
+        ))
+    });
     let handler = SakimoriHandler {
         parsers: Arc::new(default_parsers()),
         decider,
@@ -263,6 +284,7 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
         pypi_simple: PypiSimpleClient::new(cfg.user_agent.clone()),
         network_allow: cfg.network_allow.map(Arc::new),
         install_logger,
+        otlp_exporter,
     };
 
     // `.build()` in hudsucker 0.22 returns Proxy<…> directly; no Result.
@@ -358,6 +380,12 @@ struct SakimoriHandler {
     pypi_simple: PypiSimpleClient,
     /// Append-only install log. `None` disables logging.
     install_logger: Option<Arc<InstallLogger>>,
+    /// Optional OTLP/HTTP log exporter. `None` disables OTLP fan-out.
+    /// Coexists with `install_logger`: per CLAUDE.md roadmap #6 the
+    /// two transports complement each other (`/ingest` is for
+    /// sakimori-hub push notifications, OTLP is for generic
+    /// observability backends).
+    otlp_exporter: Option<Arc<crate::otlp::OtlpExporter>>,
     /// Hostname allow-list. `None` (or empty) → unrestricted egress.
     /// `Some(non-empty)` → default-deny: any CONNECT or plain-HTTP
     /// request whose target host doesn't match returns 403 before
@@ -430,17 +458,22 @@ impl HttpHandler for SakimoriHandler {
                 let now = Utc::now();
                 match self.decider.decide(ecosystem, &name, &version, now) {
                     Decision::Allow => {
-                        if let Some(logger) = self.install_logger.as_ref() {
+                        if self.install_logger.is_some() || self.otlp_exporter.is_some() {
                             let mode = classify_execution_mode(&user_agent);
                             let mut ev =
                                 InstallEvent::new(ecosystem, &name, &version).with_mode(mode);
                             if !user_agent.is_empty() {
                                 ev = ev.with_user_agent(&user_agent);
                             }
-                            if let Err(e) = logger.record(&ev) {
+                            if let Some(logger) = self.install_logger.as_ref()
+                                && let Err(e) = logger.record(&ev)
+                            {
                                 // Non-fatal: an unwritable install log
                                 // must not break package installs.
                                 log::warn!("install log write failed: {e:#}");
+                            }
+                            if let Some(exporter) = self.otlp_exporter.as_ref() {
+                                exporter.dispatch(&ev);
                             }
                         }
                         RequestOrResponse::Request(req)

@@ -633,6 +633,28 @@ pub struct ProxyStartArgs {
     /// `~/.sakimori/installs.jsonl`.
     #[arg(long)]
     pub install_log: Option<PathBuf>,
+    /// Opt-in OTLP/HTTP logs endpoint. When set, every allowed
+    /// install is also exported as an OTLP `LogRecord` with
+    /// `package.*` attributes — for fan-out to Datadog / Honeycomb /
+    /// Loki / a self-run otel-collector without standing up
+    /// sakimori-hub. Pass the full URL (typically ending in
+    /// `/v1/logs`); we don't auto-suffix. Coexists with the local
+    /// install log.
+    #[arg(long, value_name = "URL")]
+    pub otlp_endpoint: Option<String>,
+    /// Additional header sent on every OTLP request, in `KEY=VALUE`
+    /// form. Repeatable. Typical use: `--otlp-header
+    /// Authorization="Bearer …"` for vendor backends. Ignored when
+    /// `--otlp-endpoint` is not set.
+    #[arg(long = "otlp-header", value_name = "K=V", value_parser = parse_kv)]
+    pub otlp_headers: Vec<(String, String)>,
+}
+
+fn parse_kv(s: &str) -> std::result::Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
+        _ => Err(format!("expected KEY=VALUE, got `{s}`")),
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -897,6 +919,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 network_allow,
                 install_log_path: args.install_log,
                 install_log_enabled: !args.no_install_log,
+                otlp_endpoint: args.otlp_endpoint,
+                otlp_headers: args.otlp_headers,
             };
             sakimori_proxy::run(cfg).await?;
             Ok(())

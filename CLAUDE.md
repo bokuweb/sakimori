@@ -205,15 +205,21 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
    can run yourself if you want push notifications across a team."
 
    On top of (not instead of) the native `/ingest`, the proxy
-   also offers an **opt-in OTLP exporter** (`sakimori proxy start
-   --otlp-endpoint <url>`) that emits each install as an OTLP
-   LogRecord with `package.*` attributes (`package.ecosystem`,
+   also offers an **opt-in OTLP exporter** — ✅ implemented in
+   v0.36 — via `sakimori proxy start --otlp-endpoint <url>` plus
+   repeatable `--otlp-header K=V` for vendor auth. Every allowed
+   install is dispatched as an OTLP/HTTP **JSON** `LogRecord`
+   carrying `package.*` attributes (`package.ecosystem`,
    `package.name`, `package.version`, `package.resolved_at`,
-   `package.project_path`). This lets users fan installs out to
-   any existing observability backend — Datadog / Honeycomb / Loki
-   / a self-run otel-collector — without standing up sakimori-hub.
-   The two transports coexist: pick `/ingest` for advisory push
-   notifications, OTLP for general observability, both for either.
+   `package.execution_mode`, plus `package.project_path` /
+   `package.user_agent` when present). Dispatch is fire-and-forget
+   on a `spawn_blocking` worker so a slow / unreachable collector
+   never blocks an install; failures are `log::warn!`-only. The
+   user passes the full URL (typically `…/v1/logs`) — sakimori
+   does not auto-suffix because collectors may mount OTLP on a
+   custom path. The two transports coexist: pick `/ingest` for
+   advisory push notifications, OTLP for general observability,
+   both for either.
 
    **npx** works for free here (same `registry.npmjs.org` path
    the npm rewriter already handles); **Homebrew** does *not* fit

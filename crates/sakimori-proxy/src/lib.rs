@@ -9,6 +9,7 @@ pub mod install;
 pub mod nuget_flatcontainer_client;
 pub mod osv;
 pub mod osv_mirror;
+pub mod otlp;
 pub mod parser;
 pub mod proxy;
 pub mod pypi_simple_client;
