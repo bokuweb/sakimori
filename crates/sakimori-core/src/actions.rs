@@ -448,6 +448,252 @@ fn url_encode_ref(s: &str) -> String {
     out
 }
 
+// --- workflow-level lints -------------------------------------------------
+
+/// A workflow-level finding — independent of any single `uses:` row.
+/// Used for whole-file patterns like "this `pull_request_target`
+/// workflow can also write to the Actions cache, which an untrusted
+/// fork PR can abuse to poison a later trusted run" (the
+/// TanStack 2025 npm supply-chain vector).
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowFinding {
+    /// Stable rule id so users can grep / suppress / link to docs.
+    pub rule: &'static str,
+    pub severity: Severity,
+    pub message: String,
+    /// Trigger names that put this workflow in scope (e.g.
+    /// `pull_request_target`, `workflow_run`).
+    pub triggers: Vec<String>,
+    /// Steps that write to the Actions cache. Empty when the rule
+    /// fires for a non-cache reason (none today; keep the door open).
+    pub cache_writers: Vec<CacheWriter>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheWriter {
+    pub job: String,
+    pub step: Option<String>,
+    pub uses: String,
+    /// Human-readable reason this step is treated as a cache writer
+    /// — e.g. "actions/cache writes on post-step", "setup-node with
+    /// cache: pnpm".
+    pub reason: String,
+}
+
+/// Triggers that grant the workflow base-repo cache write scope
+/// reachable from an attacker-controlled fork PR. `pull_request`
+/// from a fork is scoped to the PR's own ref and can't poison the
+/// trusted scope, so it's deliberately not on this list.
+const DANGEROUS_TRIGGERS: &[&str] = &["pull_request_target", "workflow_run"];
+
+/// Audit a workflow YAML for whole-file lint rules. Today: the
+/// `pull_request_target` + writable Actions cache pattern. Returns
+/// an empty vec when nothing fires.
+pub fn audit_workflow_yaml(yaml: &str) -> Result<Vec<WorkflowFinding>> {
+    let doc: serde_yaml::Value = serde_yaml::from_str(yaml).context("parsing workflow YAML")?;
+    // serde_yaml maps `on:` to the boolean `true` in YAML 1.1 mode
+    // (the famous "Norway problem" cousin). Try both keys.
+    let on = doc
+        .get("on")
+        .or_else(|| doc.get(serde_yaml::Value::Bool(true)));
+    let Some(on) = on else {
+        return Ok(Vec::new());
+    };
+    let triggers = collect_triggers(on);
+    let dangerous: Vec<String> = triggers
+        .iter()
+        .filter(|t| DANGEROUS_TRIGGERS.contains(&t.as_str()))
+        .cloned()
+        .collect();
+    if dangerous.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let writers = collect_cache_writers(&doc);
+    if writers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let trigger_list = dangerous.join(", ");
+    let msg = format!(
+        "workflow runs on `{trigger_list}` and writes to the Actions cache — an untrusted fork \
+         PR can poison the cache that a later trusted workflow restores (TanStack-style npm \
+         supply-chain compromise). Cache writes use a runner-internal token, so `permissions: \
+         contents: read` does not block them. Split cache-writing steps into a separate \
+         workflow that does not run on fork PRs, or gate this job behind \
+         `if: github.event.pull_request.head.repo.full_name == github.repository`."
+    );
+    Ok(vec![WorkflowFinding {
+        rule: "pull_request_target_with_cache_write",
+        severity: Severity::Error,
+        message: msg,
+        triggers: dangerous,
+        cache_writers: writers,
+    }])
+}
+
+fn collect_triggers(on: &serde_yaml::Value) -> Vec<String> {
+    match on {
+        serde_yaml::Value::String(s) => vec![s.clone()],
+        serde_yaml::Value::Sequence(seq) => seq
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        serde_yaml::Value::Mapping(map) => map
+            .iter()
+            .filter_map(|(k, _)| k.as_str().map(String::from))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn collect_cache_writers(doc: &serde_yaml::Value) -> Vec<CacheWriter> {
+    let mut out = Vec::new();
+    let Some(jobs) = doc.get("jobs").and_then(|v| v.as_mapping()) else {
+        return out;
+    };
+    for (job_id, job_val) in jobs {
+        let job_id = job_id.as_str().unwrap_or("<non-string>").to_string();
+        let Some(job_map) = job_val.as_mapping() else {
+            continue;
+        };
+        let Some(steps) = job_map
+            .get(serde_yaml::Value::String("steps".into()))
+            .and_then(|v| v.as_sequence())
+        else {
+            continue;
+        };
+        for step in steps {
+            let Some(step_map) = step.as_mapping() else {
+                continue;
+            };
+            let Some(uses) = step_map
+                .get(serde_yaml::Value::String("uses".into()))
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            let with = step_map
+                .get(serde_yaml::Value::String("with".into()))
+                .and_then(|v| v.as_mapping());
+            let Some(reason) = classify_cache_writer(uses, with) else {
+                continue;
+            };
+            let step_name = step_map
+                .get(serde_yaml::Value::String("name".into()))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            out.push(CacheWriter {
+                job: job_id.clone(),
+                step: step_name,
+                uses: uses.to_string(),
+                reason,
+            });
+        }
+    }
+    out
+}
+
+/// Decide whether a single step is a cache writer. Returns a short
+/// human-readable reason on a hit, `None` otherwise.
+///
+/// The matcher strips `@<ref>` so versioning is irrelevant, and
+/// lowercases owner/path comparison because GitHub treats them
+/// case-insensitively. Sub-path actions (`actions/cache/save`) are
+/// recognised by exact path prefix.
+fn classify_cache_writer(uses: &str, with: Option<&serde_yaml::Mapping>) -> Option<String> {
+    let path = uses.split_once('@').map(|(p, _)| p).unwrap_or(uses);
+    let path_lc = path.to_ascii_lowercase();
+
+    // Explicit cache actions. `actions/cache/restore` is read-only,
+    // so deliberately not on this list.
+    if path_lc == "actions/cache" {
+        return Some("actions/cache writes via post-step on cache miss".into());
+    }
+    if path_lc == "actions/cache/save" {
+        return Some("actions/cache/save writes the cache".into());
+    }
+
+    // setup-* actions that wire up caching when the user sets a
+    // `with.cache:` input. setup-go enables caching by default
+    // (input defaults to "true"), so the rule fires even without an
+    // explicit `with.cache:` unless it's explicitly disabled.
+    let setup_with_cache_input = matches!(
+        path_lc.as_str(),
+        "actions/setup-node"
+            | "actions/setup-python"
+            | "actions/setup-java"
+            | "actions/setup-dotnet"
+            | "actions/setup-ruby"
+            | "ruby/setup-ruby"
+    );
+    if setup_with_cache_input {
+        if let Some(cache_val) = with.and_then(|w| w.get(serde_yaml::Value::String("cache".into())))
+            && !is_falsy(cache_val)
+        {
+            return Some(format!(
+                "{path} with cache: {} enables Actions cache write",
+                yaml_scalar_display(cache_val)
+            ));
+        }
+        return None;
+    }
+    if path_lc == "actions/setup-go" {
+        // Default-on; only NOT a writer if `with.cache: false`.
+        let disabled = with
+            .and_then(|w| w.get(serde_yaml::Value::String("cache".into())))
+            .map(is_falsy)
+            .unwrap_or(false);
+        if !disabled {
+            return Some("actions/setup-go caches by default (writes Actions cache)".into());
+        }
+        return None;
+    }
+
+    // Well-known third-party cache-providing actions.
+    if path_lc == "swatinem/rust-cache" {
+        return Some("Swatinem/rust-cache writes the cargo registry/target cache".into());
+    }
+    if path_lc == "mozilla-actions/sccache-action" {
+        return Some("mozilla-actions/sccache-action backs sccache with the Actions cache".into());
+    }
+    if path_lc == "astral-sh/setup-uv" {
+        // uv's setup action only writes cache when `enable-cache:
+        // true` is set; default is off in current versions.
+        let enabled = with
+            .and_then(|w| w.get(serde_yaml::Value::String("enable-cache".into())))
+            .map(|v| !is_falsy(v))
+            .unwrap_or(false);
+        if enabled {
+            return Some("astral-sh/setup-uv with enable-cache: true writes the uv cache".into());
+        }
+        return None;
+    }
+
+    None
+}
+
+fn is_falsy(v: &serde_yaml::Value) -> bool {
+    match v {
+        serde_yaml::Value::Bool(false) => true,
+        serde_yaml::Value::String(s) => {
+            let l = s.to_ascii_lowercase();
+            l == "false" || l == "no" || l == "off" || l.is_empty()
+        }
+        serde_yaml::Value::Null => true,
+        _ => false,
+    }
+}
+
+fn yaml_scalar_display(v: &serde_yaml::Value) -> String {
+    match v {
+        serde_yaml::Value::String(s) => s.clone(),
+        serde_yaml::Value::Bool(b) => b.to_string(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        _ => "<non-scalar>".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,6 +1010,249 @@ jobs:
         assert_eq!(f.owner_repo(), None);
         let f = fake_finding("docker://alpine:3");
         assert_eq!(f.owner_repo(), None);
+    }
+
+    // --- workflow-level lint tests ---------------------------------------
+
+    #[test]
+    fn workflow_lint_fires_on_pull_request_target_plus_actions_cache() {
+        // The TanStack 2025 vector reduced to its essentials: a PR
+        // workflow that uses pull_request_target and runs
+        // actions/cache. Cache is restored & written under the base
+        // repo scope from untrusted fork code → trusted release
+        // workflow later restores the poisoned blob.
+        let yaml = r#"
+name: bundle-size
+on:
+  pull_request_target:
+    branches: [main]
+jobs:
+  size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: Linux-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+      - run: pnpm install
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert_eq!(f.len(), 1, "expected one workflow finding: {f:#?}");
+        assert_eq!(f[0].rule, "pull_request_target_with_cache_write");
+        assert_eq!(f[0].severity, Severity::Error);
+        assert_eq!(f[0].triggers, vec!["pull_request_target".to_string()]);
+        assert_eq!(f[0].cache_writers.len(), 1);
+        assert_eq!(f[0].cache_writers[0].uses, "actions/cache@v4");
+        assert!(f[0].message.contains("TanStack"), "{}", f[0].message);
+    }
+
+    #[test]
+    fn workflow_lint_fires_for_setup_node_with_cache_input() {
+        let yaml = r#"
+on: [pull_request_target]
+jobs:
+  build:
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].cache_writers.len(), 1);
+        assert!(
+            f[0].cache_writers[0].reason.contains("cache: pnpm"),
+            "{}",
+            f[0].cache_writers[0].reason
+        );
+    }
+
+    #[test]
+    fn workflow_lint_fires_for_setup_go_default_on_cache() {
+        // setup-go enables caching by default — no `with.cache:`
+        // required to be dangerous.
+        let yaml = r#"
+on:
+  pull_request_target: {}
+jobs:
+  build:
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert_eq!(f.len(), 1, "expected setup-go default-on cache to fire");
+        assert_eq!(f[0].cache_writers[0].uses, "actions/setup-go@v5");
+    }
+
+    #[test]
+    fn workflow_lint_quiet_when_setup_go_disables_cache() {
+        let yaml = r#"
+on: [pull_request_target]
+jobs:
+  build:
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          cache: false
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert!(f.is_empty(), "expected no finding: {f:#?}");
+    }
+
+    #[test]
+    fn workflow_lint_fires_for_swatinem_rust_cache() {
+        let yaml = r#"
+on: [pull_request_target]
+jobs:
+  build:
+    steps:
+      - uses: Swatinem/rust-cache@v2
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].cache_writers[0].uses, "Swatinem/rust-cache@v2");
+    }
+
+    #[test]
+    fn workflow_lint_owner_case_insensitive() {
+        // Action paths are case-insensitive on GitHub — `SWATINEM`
+        // should match the same as `Swatinem`.
+        let yaml = r#"
+on: [pull_request_target]
+jobs:
+  build:
+    steps:
+      - uses: SWATINEM/Rust-Cache@v2
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert_eq!(f.len(), 1);
+    }
+
+    #[test]
+    fn workflow_lint_fires_on_workflow_run_trigger() {
+        let yaml = r#"
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+jobs:
+  publish:
+    steps:
+      - uses: actions/cache@v4
+        with:
+          path: ./target
+          key: cache-key
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].triggers, vec!["workflow_run".to_string()]);
+    }
+
+    #[test]
+    fn workflow_lint_quiet_when_only_pull_request_trigger() {
+        // `pull_request` from a fork runs scoped to the PR ref —
+        // doesn't reach the trusted cache scope. Don't fire.
+        let yaml = r#"
+on: [pull_request]
+jobs:
+  build:
+    steps:
+      - uses: actions/cache@v4
+        with: { path: ., key: k }
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert!(f.is_empty(), "expected no finding: {f:#?}");
+    }
+
+    #[test]
+    fn workflow_lint_quiet_when_no_cache_writer_present() {
+        let yaml = r#"
+on: [pull_request_target]
+jobs:
+  build:
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4  # read-only, fine
+        with: { path: ., key: k }
+      - run: echo hello
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert!(f.is_empty(), "restore-only must not trip the rule: {f:#?}");
+    }
+
+    #[test]
+    fn workflow_lint_quiet_when_setup_node_has_no_cache_input() {
+        let yaml = r#"
+on: [pull_request_target]
+jobs:
+  build:
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn workflow_lint_fires_for_actions_cache_save_subpath() {
+        let yaml = r#"
+on: [pull_request_target]
+jobs:
+  build:
+    steps:
+      - uses: actions/cache/save@v4
+        with: { path: ., key: k }
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert_eq!(f.len(), 1);
+    }
+
+    #[test]
+    fn workflow_lint_handles_on_as_yaml_true_key() {
+        // YAML 1.1 parsers (incl. serde_yaml) interpret bare `on:`
+        // as the boolean `true`. The lint must still find it.
+        let yaml = r#"
+on:
+  pull_request_target:
+    branches: [main]
+jobs:
+  build:
+    steps:
+      - uses: actions/cache@v4
+        with: { path: ., key: k }
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert_eq!(
+            f.len(),
+            1,
+            "expected finding even when `on` parsed as bool key"
+        );
+    }
+
+    #[test]
+    fn workflow_lint_collects_multiple_writers_in_one_finding() {
+        let yaml = r#"
+on: [pull_request_target]
+jobs:
+  a:
+    steps:
+      - uses: actions/cache@v4
+        with: { path: ., key: k1 }
+  b:
+    steps:
+      - uses: Swatinem/rust-cache@v2
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert_eq!(f.len(), 1, "one finding aggregating all writers");
+        assert_eq!(f[0].cache_writers.len(), 2);
+        let jobs: Vec<&str> = f[0].cache_writers.iter().map(|w| w.job.as_str()).collect();
+        assert!(jobs.contains(&"a") && jobs.contains(&"b"));
     }
 
     #[test]
