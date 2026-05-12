@@ -27,9 +27,16 @@ inputs:
   cache:
     description: |
       Optional override for the package manager's cache root.
-      Defaults to `~/.npm/_cacache` (npm) or `~/.local/share/pnpm/
-      store/v3` (pnpm, Linux) / `~/Library/pnpm/store/v3` (pnpm,
-      macOS). Pass explicitly on Windows.
+      Auto-detected from the runner OS:
+        npm   — `~/.npm/_cacache` (Linux/macOS) /
+                `%LOCALAPPDATA%\npm-cache\_cacache` (Windows)
+        pnpm  — `~/.local/share/pnpm/store/v3` (Linux) /
+                `~/Library/pnpm/store/v3` (macOS) /
+                `%LOCALAPPDATA%\pnpm\store\v3` (Windows)
+        cargo — `$CARGO_HOME` if set, else `~/.cargo` /
+                `%USERPROFILE%\.cargo`
+      Pass explicitly only when the runner uses a non-default layout
+      (corporate runners, monorepos with isolated stores, etc.).
     required: false
     default: ""
   format:

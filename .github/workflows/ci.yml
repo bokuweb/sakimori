@@ -303,6 +303,130 @@ jobs:
             kill "$(cat "$RUNNER_TEMP/proxy.pid")" 2>/dev/null || true
           fi
 
+  verify-cache-smoke:
+    # End-to-end check that `deps verify-cache` actually catches a
+    # poisoned cache for every supported ecosystem. The "clean" pass
+    # also exercises the `./verify-cache` sub-action (action.yml +
+    # main.js) once per ecosystem; the "poisoned" assertion goes
+    # through the CLI directly so we can capture the non-zero exit.
+    runs-on: ubuntu-latest
+    needs: userspace
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p sakimori
+      - run: echo "SAKIMORI_BIN=$PWD/target/release/sakimori" >>"$GITHUB_ENV"
+
+      # --- npm ----------------------------------------------------------
+      - name: npm — populate cacache via a real install
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/npm-smoke"
+          cd "$RUNNER_TEMP/npm-smoke"
+          npm init -y >/dev/null
+          # is-odd is tiny (one dep on `is-number`) and stable.
+          npm install --no-audit --no-fund --silent is-odd@3.0.1
+          test -f package-lock.json
+          # Confirm cacache actually got populated.
+          test -d "$HOME/.npm/_cacache/content-v2"
+      - name: npm — verify-cache (action wrapper, clean)
+        uses: ./verify-cache
+        with:
+          lockfile: ${{ runner.temp }}/npm-smoke/package-lock.json
+      - name: npm — poison + assert verify-cache fails
+        run: |
+          set -euo pipefail
+          blob=$(find "$HOME/.npm/_cacache/content-v2" -type f | head -1)
+          test -n "$blob" || { echo "::error::no cacache blob found to poison"; exit 1; }
+          echo "poisoning $blob"
+          printf 'X' >>"$blob"
+          set +e
+          "$SAKIMORI_BIN" deps verify-cache --lockfile "$RUNNER_TEMP/npm-smoke/package-lock.json"
+          rc=$?
+          set -e
+          if [ "$rc" = "0" ]; then
+            echo "::error::npm verify-cache failed to detect tampering"
+            exit 1
+          fi
+          echo "✓ npm verify-cache detected tampering (rc=$rc)"
+
+      # --- pnpm ---------------------------------------------------------
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: pnpm — populate store v3 via a real install
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pnpm-smoke"
+          cd "$RUNNER_TEMP/pnpm-smoke"
+          # pnpm refuses to install without a package.json that has at
+          # least name+version. `pnpm init` writes a minimal one.
+          pnpm init >/dev/null
+          pnpm add --silent is-odd@3.0.1
+          test -f pnpm-lock.yaml
+          # `pnpm store path` prints the directory containing the `v3` segment.
+          store_root=$(pnpm store path | tr -d '\r')
+          echo "PNPM_STORE_ROOT=$store_root" >>"$GITHUB_ENV"
+          test -d "$store_root/files"
+      - name: pnpm — verify-cache (action wrapper, clean)
+        uses: ./verify-cache
+        with:
+          lockfile: ${{ runner.temp }}/pnpm-smoke/pnpm-lock.yaml
+          # pnpm/action-setup can put the store in non-default
+          # locations (depends on PNPM_HOME). Pass it through
+          # explicitly so the verifier doesn't guess wrong.
+          cache: ${{ env.PNPM_STORE_ROOT }}
+      - name: pnpm — poison + assert verify-cache fails
+        run: |
+          set -euo pipefail
+          # Pick a regular content blob (skip the *-index.json files —
+          # tampering one of those would be detected too but it's a
+          # different code path; we want the per-file integrity check).
+          blob=$(find "$PNPM_STORE_ROOT/files" -type f ! -name '*-index.json' | head -1)
+          test -n "$blob" || { echo "::error::no pnpm blob found to poison"; exit 1; }
+          echo "poisoning $blob"
+          printf 'X' >>"$blob"
+          set +e
+          "$SAKIMORI_BIN" deps verify-cache \
+            --lockfile "$RUNNER_TEMP/pnpm-smoke/pnpm-lock.yaml" \
+            --cache "$PNPM_STORE_ROOT"
+          rc=$?
+          set -e
+          if [ "$rc" = "0" ]; then
+            echo "::error::pnpm verify-cache failed to detect tampering"
+            exit 1
+          fi
+          echo "✓ pnpm verify-cache detected tampering (rc=$rc)"
+
+      # --- cargo --------------------------------------------------------
+      - name: cargo — populate registry cache via fetch
+        run: |
+          # The earlier `cargo build` already populated $CARGO_HOME/registry/cache.
+          # Confirm at least one .crate is present before we proceed.
+          n=$(find "$HOME/.cargo/registry/cache" -name '*.crate' -type f | wc -l)
+          echo "cargo cache has $n .crate files"
+          test "$n" -gt 0
+      - name: cargo — verify-cache (action wrapper, clean)
+        uses: ./verify-cache
+        with:
+          lockfile: Cargo.lock
+      - name: cargo — poison + assert verify-cache fails
+        run: |
+          set -euo pipefail
+          crate=$(find "$HOME/.cargo/registry/cache" -name '*.crate' -type f | head -1)
+          test -n "$crate" || { echo "::error::no .crate to poison"; exit 1; }
+          echo "poisoning $crate"
+          printf 'X' >>"$crate"
+          set +e
+          "$SAKIMORI_BIN" deps verify-cache --lockfile Cargo.lock
+          rc=$?
+          set -e
+          if [ "$rc" = "0" ]; then
+            echo "::error::cargo verify-cache failed to detect tampering"
+            exit 1
+          fi
+          echo "✓ cargo verify-cache detected tampering (rc=$rc)"
+
   ebpf:
     runs-on: ubuntu-latest
     steps:

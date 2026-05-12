@@ -476,8 +476,9 @@ sakimori deps verify-cache --lockfile pnpm-lock.yaml
 # cargo registry cache (walks $CARGO_HOME/registry/cache/*/)
 sakimori deps verify-cache --lockfile Cargo.lock
 
-# Override the store path (Windows, monorepos with isolated stores,
-# corporate runners with non-standard layouts):
+# Override the store path (monorepos with isolated stores, corporate
+# runners with non-standard layouts). Windows defaults are auto-
+# detected (`%LOCALAPPDATA%\npm-cache\_cacache`, `%LOCALAPPDATA%\pnpm\store\v3`).
 sakimori deps verify-cache --lockfile pnpm-lock.yaml --cache /opt/pnpm-store/v3
 
 # Machine-readable for CI gating
@@ -857,7 +858,7 @@ auto-picks the cache root for the runner OS. Inputs:
 | input | default | description |
 |---|---|---|
 | `lockfile` | (required) | Path to `package-lock.json`, `pnpm-lock.yaml`, or `Cargo.lock`. |
-| `cache` | (auto) | Override the store root. Required on Windows; auto-detects `~/.npm/_cacache`, `~/.local/share/pnpm/store/v3` (Linux), `~/Library/pnpm/store/v3` (macOS), `$CARGO_HOME/.cargo/registry/cache` on other platforms. |
+| `cache` | (auto) | Override the store root. Auto-detected from the runner OS — `~/.npm/_cacache` (Linux/macOS) or `%LOCALAPPDATA%\npm-cache\_cacache` (Windows) for npm; `~/.local/share/pnpm/store/v3` / `~/Library/pnpm/store/v3` / `%LOCALAPPDATA%\pnpm\store\v3` for pnpm; `$CARGO_HOME` (default `~/.cargo` or `%USERPROFILE%\.cargo`) for cargo. |
 | `format` | `text` | `text` or `json`. |
 | `version` | `v0` | sakimori release tag. |
 | `token` | `${{ github.token }}` | Used by `gh release download`. |
