@@ -267,6 +267,7 @@ jobs:
         # on any hit. The wiring assertion is what matters here.
         run: |
           set -uxo pipefail
+          set +e
           ./target/release/sakimori advisories scan \
               --install-log "$RUNNER_TEMP/installs.jsonl" \
               --json > "$RUNNER_TEMP/proxy-scan.json"
