@@ -7,6 +7,7 @@ mod doctor;
 mod enforcer;
 mod events;
 mod install_gate;
+mod kprobe_override;
 mod loader;
 mod policy;
 mod resolve;

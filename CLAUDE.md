@@ -174,6 +174,15 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
 4. **Linux file/exec block via `bpf_override_return`** — clean
    pre-syscall block, requires runtime detection of
    CONFIG_BPF_KPROBE_OVERRIDE and a well-timed kprobe.
+   Partial progress (v0.37): `crate::kprobe_override::detect()`
+   reads `/boot/config-$(uname -r)` and reports
+   `Available` / `Unsupported` / `Unknown` so the rest of the
+   loader can light up the kprobe path opportunistically, and
+   `sakimori doctor` surfaces a "Kernel pre-syscall block" row
+   with strength-aware messaging (the warn path explicitly
+   reassures users that the existing SIGKILL tripwire is still
+   in effect). The kprobe BPF program + attach path is the
+   next slice.
 5. **macOS live block** — either a Network Extension (heavy, needs
    signing) or an HTTPS proxy (see #2).
 6. **Retroactive CVE notification for past installs** — local-first

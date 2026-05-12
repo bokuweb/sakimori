@@ -11,6 +11,8 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::kprobe_override::KprobeOverrideStatus;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckStatus {
     Ok,
@@ -128,6 +130,11 @@ pub struct DoctorInputs {
     /// and nothing told me" situations on long-running runners.
     /// `None` means "skip this check".
     pub daemon_pidfile: Option<PathBuf>,
+    /// Optional pre-detected kprobe-override status. When `Some`,
+    /// the doctor adds a "Kernel pre-syscall block" row reflecting
+    /// it. Detection itself is in [`crate::kprobe_override`] — the
+    /// doctor takes it as input so the renderer stays pure.
+    pub kprobe_override: Option<KprobeOverrideStatus>,
 }
 
 /// Run every check with the given inputs. Pure-ish — does read the
@@ -150,7 +157,41 @@ pub fn run_checks(inp: &DoctorInputs) -> Vec<CheckResult> {
     if let Some(p) = &inp.daemon_pidfile {
         out.push(check_daemon_pidfile(p));
     }
+    if let Some(k) = &inp.kprobe_override {
+        out.push(check_kprobe_override(k));
+    }
     out
+}
+
+fn check_kprobe_override(status: &KprobeOverrideStatus) -> CheckResult {
+    // Block-strength reporting: per CLAUDE.md roadmap #4 the
+    // file/exec deny path is a SIGKILL tripwire today; with
+    // CONFIG_BPF_KPROBE_OVERRIDE=y we can upgrade it to a real
+    // pre-syscall block. Until the kprobe userspace landing-pad
+    // exists, this check is purely informational — it does not
+    // (and must not) fail the doctor.
+    match status {
+        KprobeOverrideStatus::Available { config_path } => CheckResult::ok(
+            "Kernel pre-syscall block",
+            format!(
+                "CONFIG_BPF_KPROBE_OVERRIDE=y (from {})",
+                config_path.display()
+            ),
+        ),
+        KprobeOverrideStatus::Unsupported { config_path } => CheckResult::warn(
+            "Kernel pre-syscall block",
+            format!(
+                "kernel built without CONFIG_BPF_KPROBE_OVERRIDE (per {})",
+                config_path.display()
+            ),
+            "file.deny/exec.deny still work as SIGKILL tripwires; rebuild the kernel with CONFIG_BPF_KPROBE_OVERRIDE=y for true pre-syscall block",
+        ),
+        KprobeOverrideStatus::Unknown { reason } => CheckResult::warn(
+            "Kernel pre-syscall block",
+            format!("status unknown ({reason})"),
+            "install the matching linux-headers / kernel-devel package, or ignore — file.deny/exec.deny remain effective as SIGKILL tripwires",
+        ),
+    }
 }
 
 fn check_daemon_pidfile(path: &Path) -> CheckResult {
@@ -485,6 +526,36 @@ mod tests {
         let r = check_daemon_pidfile(&d);
         assert_eq!(r.status, CheckStatus::Ok);
         std::fs::remove_file(&d).ok();
+    }
+
+    #[test]
+    fn kprobe_override_available_is_ok() {
+        let r = check_kprobe_override(&KprobeOverrideStatus::Available {
+            config_path: PathBuf::from("/boot/config-6.6.0"),
+        });
+        assert_eq!(r.status, CheckStatus::Ok);
+        assert!(r.detail.contains("CONFIG_BPF_KPROBE_OVERRIDE"));
+    }
+
+    #[test]
+    fn kprobe_override_unsupported_is_warn_with_fallback_hint() {
+        let r = check_kprobe_override(&KprobeOverrideStatus::Unsupported {
+            config_path: PathBuf::from("/boot/config-5.10.0"),
+        });
+        assert_eq!(r.status, CheckStatus::Warn);
+        // Must reassure the user that file.deny/exec.deny still work.
+        let hint = r.hint.unwrap();
+        assert!(hint.contains("tripwire") || hint.contains("SIGKILL"));
+    }
+
+    #[test]
+    fn kprobe_override_unknown_is_warn_not_fail() {
+        // No readable kernel config — block strength is genuinely
+        // unknowable; we must not exit non-zero for this.
+        let r = check_kprobe_override(&KprobeOverrideStatus::Unknown {
+            reason: "missing /boot/config-x".into(),
+        });
+        assert_eq!(r.status, CheckStatus::Warn);
     }
 
     #[cfg(target_os = "linux")]

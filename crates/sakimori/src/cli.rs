@@ -1566,6 +1566,7 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
         rc_path,
         daemon_unit_path,
         daemon_pidfile: args.daemon_pidfile,
+        kprobe_override: Some(crate::kprobe_override::detect()),
     };
     let results = crate::doctor::run_checks(&inputs);
     print!("{}", crate::doctor::render_report(&results));
