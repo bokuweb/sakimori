@@ -28,9 +28,9 @@ use aya_ebpf::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
         bpf_probe_read_user, bpf_probe_read_user_str_bytes, bpf_send_signal,
     },
-    macros::{cgroup_sock_addr, map, tracepoint},
+    macros::{cgroup_sock_addr, kprobe, map, tracepoint},
     maps::{Array, HashMap, RingBuf},
-    programs::{SockAddrContext, TracePointContext},
+    programs::{ProbeContext, SockAddrContext, TracePointContext},
 };
 use sakimori_common::{
     COMM_LEN, Connect4Event, Connect6Event, EVENT_KIND_CONNECT4, EVENT_KIND_CONNECT6,
@@ -61,8 +61,7 @@ static NET6: HashMap<Ipv6Key, u8> = HashMap::with_max_entries(1024, BPF_F_NO_PRE
 /// `policy.file.deny`; anything beyond falls through to userspace-only
 /// tagging.
 #[map]
-static FILE_DENY_PREFIX: Array<FileDenyPrefix> =
-    Array::with_max_entries(FILE_DENY_MAX_ENTRIES, 0);
+static FILE_DENY_PREFIX: Array<FileDenyPrefix> = Array::with_max_entries(FILE_DENY_MAX_ENTRIES, 0);
 
 #[inline(always)]
 fn settings() -> Settings {
@@ -81,7 +80,11 @@ fn make_header(kind: u32, verdict: u32) -> EventHeader {
     let mut comm = [0u8; COMM_LEN];
     if let Ok(c) = bpf_get_current_comm() {
         // bpf_get_current_comm returns exactly 16 bytes.
-        let n = if c.len() < COMM_LEN { c.len() } else { COMM_LEN };
+        let n = if c.len() < COMM_LEN {
+            c.len()
+        } else {
+            COMM_LEN
+        };
         let mut i = 0;
         while i < n {
             comm[i] = c[i];
@@ -200,6 +203,80 @@ pub fn sakimori_openat(ctx: TracePointContext) -> u32 {
     0
 }
 
+// ---------------------------------------------------------------------------
+// do_sys_openat2 kprobe — clean pre-syscall block via bpf_override_return
+// ---------------------------------------------------------------------------
+//
+// Roadmap #4 second slice. The tracepoint above is a "tripwire": the
+// open syscall has already started executing by the time we observe
+// it, so the strongest action we can take is `bpf_send_signal(SIGKILL)`
+// — the process dies before it can consume the resulting fd, but
+// the kernel did briefly enter the open path. A kprobe attached to
+// `do_sys_openat2` (which sits behind every open / openat / openat2
+// entry on modern kernels) can call `bpf_override_return(-EPERM)` to
+// short-circuit the kernel function entirely — the calling task sees
+// the syscall return `-EPERM` and can choose how to react. This is
+// the "true pre-syscall block" the README's Limitations section
+// promises as a roadmap item.
+//
+// Constraints:
+// - Requires `CONFIG_BPF_KPROBE_OVERRIDE=y` (detected by userspace
+//   via `crate::kprobe_override` in the loader crate).
+// - `do_sys_openat2` is annotated with `ALLOW_ERROR_INJECTION` in
+//   fs/open.c on modern kernels; older ones without that annotation
+//   reject the attach.
+// - Userspace gates loading behind an opt-in env var until field
+//   validation across kernel versions; the tracepoint's SIGKILL
+//   path is unchanged, so a kernel that rejects the attach degrades
+//   silently to the existing tripwire.
+
+/// Linux `-EPERM` as a kernel return value. `bpf_override_return`
+/// installs this as the value the kprobed function will return,
+/// so the calling task gets `openat2(...) = -EPERM` directly
+/// rather than the file descriptor it would otherwise have received.
+const NEG_EPERM: u64 = (-1i64) as u64;
+
+#[kprobe]
+pub fn sakimori_openat2_kprobe(ctx: ProbeContext) -> u32 {
+    // do_sys_openat2(int dfd, const char __user *filename, struct open_how *how)
+    // arg 1 is the user-space filename pointer.
+    let filename_ptr: *const u8 = match ctx.arg::<*const u8>(1) {
+        Some(p) if !p.is_null() => p,
+        _ => return 0,
+    };
+
+    let mut scratch = [0u8; FILE_DENY_PREFIX_LEN];
+    let scratch_len = unsafe {
+        match bpf_probe_read_user_str_bytes(filename_ptr, &mut scratch) {
+            Ok(read) => read.len(),
+            Err(_) => return 0,
+        }
+    };
+    if scratch_len == 0 {
+        return 0;
+    }
+
+    if !file_deny_matches(&scratch, scratch_len) {
+        return 0;
+    }
+    if settings().mode != 1 {
+        // audit mode — observation belongs to the tracepoint, which
+        // is what populates the ringbuf. The kprobe stays silent.
+        return 0;
+    }
+
+    // SAFETY: `ctx.regs` is the verifier-checked pt_regs pointer
+    // aya hands us; `bpf_override_return` is a kernel-supplied
+    // helper whose only precondition we control is that the
+    // attached function is in the error-injection allowlist —
+    // userspace verifies that at attach time via the kprobe-
+    // override probe in `crate::kprobe_override`.
+    unsafe {
+        let _ = aya_ebpf::helpers::r#gen::bpf_override_return(ctx.regs as *mut _, NEG_EPERM);
+    }
+    0
+}
+
 /// Linear scan of the FILE_DENY_PREFIX map. `FILE_DENY_MAX_ENTRIES = 8`
 /// keeps the unrolled program well within the verifier's instruction
 /// count budget even after in-lining the per-byte compare loop.
@@ -208,9 +285,7 @@ fn file_deny_matches(path: &[u8; FILE_DENY_PREFIX_LEN], path_len: usize) -> bool
     let mut i: u32 = 0;
     let mut hit = false;
     while i < FILE_DENY_MAX_ENTRIES {
-        if !hit
-            && let Some(slot) = unsafe { FILE_DENY_PREFIX.get(i) }
-        {
+        if !hit && let Some(slot) = unsafe { FILE_DENY_PREFIX.get(i) } {
             let needle = slot.len as usize;
             if needle > 0 && needle <= FILE_DENY_PREFIX_LEN && needle <= path_len {
                 let mut mismatch = false;

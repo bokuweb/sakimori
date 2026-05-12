@@ -174,15 +174,25 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
 4. **Linux file/exec block via `bpf_override_return`** — clean
    pre-syscall block, requires runtime detection of
    CONFIG_BPF_KPROBE_OVERRIDE and a well-timed kprobe.
-   Partial progress (v0.37): `crate::kprobe_override::detect()`
+   Partial progress (v0.37–v0.38): `crate::kprobe_override::detect()`
    reads `/boot/config-$(uname -r)` and reports
-   `Available` / `Unsupported` / `Unknown` so the rest of the
-   loader can light up the kprobe path opportunistically, and
-   `sakimori doctor` surfaces a "Kernel pre-syscall block" row
-   with strength-aware messaging (the warn path explicitly
-   reassures users that the existing SIGKILL tripwire is still
-   in effect). The kprobe BPF program + attach path is the
-   next slice.
+   `Available` / `Unsupported` / `Unknown`, surfaced through
+   `sakimori doctor` as a strength-aware "Kernel pre-syscall
+   block" row (warn path reassures users the SIGKILL tripwire is
+   still in effect). v0.38 lands the kernel-side half: a kprobe
+   on `do_sys_openat2` (which sits behind every `open` / `openat`
+   / `openat2` entry) that runs the same `FILE_DENY_PREFIX` match
+   as the tracepoint and calls `bpf_override_return(-EPERM)` on a
+   hit — so `file.deny` becomes a real pre-syscall block, not
+   just a SIGKILL tripwire. Behaviour-preserving by default:
+   the attach is opt-in via `SAKIMORI_ENABLE_KPROBE_OVERRIDE=1`
+   while we gather cross-kernel field data; without that flag the
+   existing tracepoint + SIGKILL path is unchanged. The kprobe
+   path is strictly additive — verifier reject, missing
+   error-injection allowlist on `do_sys_openat2`, or missing
+   capability all degrade silently to the tripwire fallback
+   with a single `log::warn!`. The exec-side counterpart (a
+   kprobe on `__x64_sys_execve` etc.) is the next slice.
 5. **macOS live block** — either a Network Extension (heavy, needs
    signing) or an HTTPS proxy (see #2).
 6. **Retroactive CVE notification for past installs** — local-first
