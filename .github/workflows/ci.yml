@@ -259,21 +259,31 @@ jobs:
           print(f"✓ proxy recorded {len(hits)} install event(s) for lodash@4.17.21")
           PY
 
-      - name: advisories scan against proxy-recorded log finds nothing
-        # End-to-end happy-path: the log the proxy just wrote is
-        # readable by `advisories scan`, and lodash@4.17.21 has no
-        # advisories so the exit code is clean.
+      - name: advisories scan consumes the proxy-recorded log
+        # End-to-end: the log the proxy just wrote must be readable by
+        # `advisories scan` and produce a valid JSON report. We don't
+        # assert hit count — OSV may or may not list advisories that
+        # transitively cover lodash@4.17.21, and `scan` exits non-zero
+        # on any hit. The wiring assertion is what matters here.
         run: |
-          set -euxo pipefail
+          set -uxo pipefail
           ./target/release/sakimori advisories scan \
               --install-log "$RUNNER_TEMP/installs.jsonl" \
               --json > "$RUNNER_TEMP/proxy-scan.json"
+          rc=$?
+          set -e
+          # Accept 0 (no hits) or 1 (hits found); fail anything else.
+          if [ "$rc" != "0" ] && [ "$rc" != "1" ]; then
+            echo "::error::advisories scan exited unexpectedly (rc=$rc)"
+            cat "$RUNNER_TEMP/proxy-scan.json" || true
+            exit 1
+          fi
           python3 - <<'PY'
           import json, os
           r = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "proxy-scan.json")))
           assert r["installs_scanned"] >= 1, r
-          assert r["hits"] == [], r
-          print("ok no advisories for lodash@4.17.21")
+          assert "hits" in r and isinstance(r["hits"], list), r
+          print(f"ok: scanned={r['installs_scanned']} hits={len(r['hits'])}")
           PY
 
       - name: Show proxy log on success
