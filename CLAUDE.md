@@ -213,6 +213,36 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
    remains out of scope; sakimori-hub is "here's the server you
    can run yourself if you want push notifications across a team."
 
+   **Install inventory (`/ingest` + query API)** — beyond the
+   advisory-JOIN path above, sakimori-hub is also the natural home
+   for a **team-wide installed-package inventory**: every
+   `InstallEvent` that hits `/ingest` is durably stored
+   (`(ecosystem, name, version, resolved_at, execution_mode,
+   user_agent, project_path, source)` with `source` ∈
+   `{actions, desktop}` derived from a hub-side classifier on
+   `user_agent` / `project_path`), and a small read API
+   (`GET /installs?ecosystem=&name=&since=&source=`) plus a
+   minimal HTML inventory view answer "**who installed `<pkg>@
+   <ver>` and when, across CI and developer laptops**". Both
+   surfaces (Actions runners via `bokuweb/sakimori@v0` and desktop
+   via `sakimori install-gate install`) already route installs
+   through the same proxy, so the same `InstallEvent` schema
+   covers both with no extra wiring on the client. The inventory
+   is the foundation the advisory-JOIN dispatcher reads from —
+   landing the storage half first means "what's in our supply
+   chain?" becomes answerable even before the dispatcher ships.
+   Retention default is 18 months (long enough to catch the
+   advisory disclosure tail without unbounded growth); operators
+   can override.
+
+   This is also the layer that makes the **ephemeral-execution
+   history searchable**: `npx`/`uvx`/`pipx run`/`cargo install`
+   leave no lockfile trace, so without hub storage there is no
+   way to answer "did anyone on the team run `<malicious-pkg>`
+   in the last 90 days?". Dependabot/Snyk/Socket are
+   lockfile-scoped and structurally cannot. With hub +
+   `execution_mode: ephemeral`, they can.
+
    On top of (not instead of) the native `/ingest`, the proxy
    also offers an **opt-in OTLP exporter** — ✅ implemented in
    v0.36 — via `sakimori proxy start --otlp-endpoint <url>` plus
