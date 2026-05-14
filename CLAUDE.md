@@ -213,6 +213,36 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
    remains out of scope; sakimori-hub is "here's the server you
    can run yourself if you want push notifications across a team."
 
+   **Install inventory (`/ingest` + query API)** — beyond the
+   advisory-JOIN path above, sakimori-hub is also the natural home
+   for a **team-wide installed-package inventory**: every
+   `InstallEvent` that hits `/ingest` is durably stored
+   (`(ecosystem, name, version, resolved_at, execution_mode,
+   user_agent, project_path, source)` with `source` ∈
+   `{actions, desktop}` derived from a hub-side classifier on
+   `user_agent` / `project_path`), and a small read API
+   (`GET /installs?ecosystem=&name=&since=&source=`) plus a
+   minimal HTML inventory view answer "**who installed `<pkg>@
+   <ver>` and when, across CI and developer laptops**". Both
+   surfaces (Actions runners via `bokuweb/sakimori@v0` and desktop
+   via `sakimori install-gate install`) already route installs
+   through the same proxy, so the same `InstallEvent` schema
+   covers both with no extra wiring on the client. The inventory
+   is the foundation the advisory-JOIN dispatcher reads from —
+   landing the storage half first means "what's in our supply
+   chain?" becomes answerable even before the dispatcher ships.
+   Retention default is 18 months (long enough to catch the
+   advisory disclosure tail without unbounded growth); operators
+   can override.
+
+   This is also the layer that makes the **ephemeral-execution
+   history searchable**: `npx`/`uvx`/`pipx run`/`cargo install`
+   leave no lockfile trace, so without hub storage there is no
+   way to answer "did anyone on the team run `<malicious-pkg>`
+   in the last 90 days?". Dependabot/Snyk/Socket are
+   lockfile-scoped and structurally cannot. With hub +
+   `execution_mode: ephemeral`, they can.
+
    On top of (not instead of) the native `/ingest`, the proxy
    also offers an **opt-in OTLP exporter** — ✅ implemented in
    v0.36 — via `sakimori proxy start --otlp-endpoint <url>` plus
@@ -507,6 +537,83 @@ of value-per-implementation-cost.
     Doesn't replace `deps check` (release-age) — pairs with it:
     age check at fetch time, cache verify between cache-restore
     and install. Remaining follow-up: pnpm v10 SQLite reader.
+15. **Lifecycle-script gate in the proxy** (Shai-Hulud-class
+    defence) — npm `preinstall` / `install` / `postinstall`,
+    pip build-backend hooks, and similar are the primary RCE
+    vector for worm-style supply-chain attacks (Shai-Hulud
+    1st/2nd wave, May 2026). `min-release-age` only narrows
+    the window; once a malicious version has aged past the
+    threshold, `npm install` still runs its postinstall. Add an
+    opt-in proxy flag `--lifecycle-policy <audit|block|strip>`
+    that inspects every fetched npm tarball's `package.json`
+    `scripts.{preinstall,install,postinstall,prepare}` and either
+    logs the script body (audit), refuses the fetch with 403
+    (block), or rewrites the tarball to remove those keys
+    (strip — equivalent to a per-package `--ignore-scripts`
+    without needing user buy-in across every install command).
+    Strip-mode is the interesting one: it lets a developer keep
+    using `npm install` without remembering the flag, and CI
+    builds that legitimately need a postinstall (e.g. native
+    addon compile) opt back in via a per-package allowlist
+    `--lifecycle-allow <name>[@<spec>]`. PyPI parallel: parse
+    `pyproject.toml` `build-system.build-backend` and flag
+    non-stdlib backends; full strip there is harder because
+    `setup.py` legacy projects can't be neutered without
+    breaking install, so PyPI starts audit-only. Pairs naturally
+    with `deps watch` — the proxy is the only layer that can
+    catch the script *before* it runs.
+16. **Persistence-write rule pack** (Shai-Hulud-class defence) —
+    a curated `file.deny` rule set covering the locations
+    worm-style malware writes for OS-level persistence:
+    `~/Library/LaunchAgents/**`, `~/Library/LaunchDaemons/**`,
+    `/Library/Launch{Agents,Daemons}/**`, `~/.config/systemd/user/**`,
+    `/etc/systemd/system/**`, crontab spool dirs, `~/.ssh/**`
+    (especially `authorized_keys` / `config`), shell rc files
+    (`~/.bashrc`, `~/.zshrc`, `~/.profile`), and Claude/VS Code
+    workspace hooks (`.claude/**.mjs`, `.vscode/tasks.json`).
+    Ships as `coronarium policy preset persistence` that prints
+    a ready-to-merge YAML block. Combined with the v0.23
+    attribution layer, a write to any of these paths from a
+    package-manager-attributed subtree is the highest-confidence
+    "this install is malicious" signal sakimori can produce —
+    much stronger than a network event, because there is no
+    legitimate reason for `npm install` to touch
+    `~/Library/LaunchAgents/`. Block-mode SIGKILLs the writer.
+17. **Cloud-credential exfiltration tripwire** (Shai-Hulud-class
+    defence) — a curated `network.deny` rule pack covering the
+    egress patterns observed in the May 2026 wave: AWS IMDS
+    (`169.254.169.254`), `sts.amazonaws.com`,
+    `secretsmanager.*.amazonaws.com`, `ssm.*.amazonaws.com`,
+    GCP metadata (`metadata.google.internal`,
+    `169.254.169.254` with `Metadata-Flavor: Google`), Azure IMDS,
+    Vault default ports, and the well-known crypto-wallet
+    exfiltration endpoints. Pairs with v0.33's SNI-based proxy
+    egress filter so the rule fires on the *hostname the client
+    asked for*, not a CDN-rotated IP. Attribution surface: when
+    the offending PID's ancestor chain contains a package
+    manager (already classified by `attribution::Attribution`),
+    the event is upgraded to a distinct `cloud_secret_egress`
+    category in the JSON log + step summary, with a different
+    UI affordance — "your install just touched your cloud
+    credentials" is qualitatively different from "your build
+    talked to S3". Ships as
+    `coronarium policy preset cloud-secret-egress`.
+18. **Known-IOC workspace scanner** — extend `coronarium
+    workspace diff` (and `sakimori run --snapshot-workspace`)
+    with a known-bad-path index of file paths and content
+    fingerprints observed in current supply-chain worm campaigns:
+    `.claude/setup.mjs`, `.github/workflows/codeql_analysis.yml`
+    (when the repo doesn't legitimately use CodeQL),
+    `{dune_word}-{dune_word}-{3-digit}` repo names created via
+    the GitHub API during install, and authored-by
+    `claude <claude@users.noreply.github.com>` commits where the
+    user did not invoke Claude. Distinct from the generic
+    workspace-drift check because it elevates specific drift
+    patterns from "something changed" to "this is the Shai-Hulud
+    fingerprint". The index ships as a versioned YAML
+    (`coronarium-iocs.yml`) bundled with the binary, refreshable
+    by `coronarium iocs update`. Conservatively scoped: hits
+    surface as ❌ in the step summary; no auto-quarantine.
 
 Explicitly **out of scope** (different product philosophy, not
 a missing feature):
