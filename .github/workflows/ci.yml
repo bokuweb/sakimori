@@ -336,9 +336,27 @@ jobs:
       - name: npm — poison + assert verify-cache fails
         run: |
           set -euo pipefail
-          blob=$(find "$HOME/.npm/_cacache/content-v2" -type f | head -1)
-          test -n "$blob" || { echo "::error::no cacache blob found to poison"; exit 1; }
-          echo "poisoning $blob"
+          # cacache's `content-v2/` holds both tarball blobs *and*
+          # registry packument blobs — a blind `find | head -1` often
+          # picks a packument that isn't referenced by the lockfile,
+          # so the verifier walks past it and reports clean. Derive
+          # the blob path from the lockfile's own `integrity:` so we
+          # poison a file we know the verifier will hash.
+          integrity=$(python3 -c "
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          for k, v in d.get('packages', {}).items():
+              if k.startswith('node_modules/') and 'integrity' in v:
+                  print(v['integrity']); sys.exit(0)
+          sys.exit('no integrity entry found')
+          " "$RUNNER_TEMP/npm-smoke/package-lock.json")
+          algo=${integrity%%-*}
+          b64=${integrity#*-}
+          hex=$(printf '%s' "$b64" | base64 -d | xxd -p -c 9999)
+          aa=${hex:0:2}; bb=${hex:2:2}; rest=${hex:4}
+          blob="$HOME/.npm/_cacache/content-v2/$algo/$aa/$bb/$rest"
+          test -f "$blob" || { echo "::error::expected cacache blob $blob not found"; ls -la "$(dirname "$blob")" || true; exit 1; }
+          echo "poisoning $blob (lockfile-referenced)"
           printf 'X' >>"$blob"
           set +e
           "$SAKIMORI_BIN" deps verify-cache --lockfile "$RUNNER_TEMP/npm-smoke/package-lock.json"
