@@ -198,11 +198,19 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp_path() -> PathBuf {
+        // Nanos alone collide under cargo's parallel test runner —
+        // two tests scheduled on the same tick share a path and
+        // each sees the other's appended events. Mix in a process-
+        // local atomic counter so paths are unique regardless of
+        // clock resolution.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("sakimori-advisories-{id}/installs.jsonl"))
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("sakimori-advisories-{id}-{seq}/installs.jsonl"))
     }
 
     struct FakeBatch {
