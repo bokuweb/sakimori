@@ -400,7 +400,9 @@ jobs:
           # Pick a regular content blob (skip the *-index.json files —
           # tampering one of those would be detected too but it's a
           # different code path; we want the per-file integrity check).
-          blob=$(find "$PNPM_STORE_ROOT/files" -type f ! -name '*-index.json' | head -1)
+          # `-print -quit` instead of `| head -1` avoids a SIGPIPE
+          # race under `set -o pipefail`.
+          blob=$(find "$PNPM_STORE_ROOT/files" -type f ! -name '*-index.json' -print -quit)
           test -n "$blob" || { echo "::error::no pnpm blob found to poison"; exit 1; }
           echo "poisoning $blob"
           printf 'X' >>"$blob"
@@ -431,7 +433,9 @@ jobs:
       - name: cargo — poison + assert verify-cache fails
         run: |
           set -euo pipefail
-          crate=$(find "$HOME/.cargo/registry/cache" -name '*.crate' -type f | head -1)
+          # `find ... | head -1` would race SIGPIPE under `pipefail`.
+          # `-print -quit` stops at the first match inside `find`.
+          crate=$(find "$HOME/.cargo/registry/cache" -name '*.crate' -type f -print -quit)
           test -n "$crate" || { echo "::error::no .crate to poison"; exit 1; }
           echo "poisoning $crate"
           printf 'X' >>"$crate"
