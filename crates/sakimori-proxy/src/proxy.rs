@@ -97,6 +97,20 @@ pub struct ProxyConfig {
     /// `Authorization: Bearer …` for vendor backends. Ignored when
     /// `otlp_endpoint` is `None`.
     pub otlp_headers: Vec<(String, String)>,
+    /// Lifecycle-script policy for npm tarballs. `None` disables the
+    /// gate (current default). `Some(Audit)` logs script bodies for
+    /// every fetched tarball that ships an `install` / `preinstall` /
+    /// `postinstall` / `prepare` hook; `Some(Block)` 403s the tarball
+    /// fetch when any of those keys is present, stopping the install
+    /// before npm gets to run them. `strip` is on the roadmap but not
+    /// yet implemented — the CLI rejects it at parse time.
+    pub lifecycle_policy: Option<crate::lifecycle::LifecyclePolicy>,
+    /// Per-package allow-list — installs of names on this list bypass
+    /// the lifecycle gate entirely. Necessary for legitimate native
+    /// addons whose `install` script compiles bindings (e.g.
+    /// `sharp`, `bcrypt`, `node-sass`). Patterns are exact npm names,
+    /// case-sensitive; no globbing.
+    pub lifecycle_allow: Vec<String>,
 }
 
 impl ProxyConfig {
@@ -120,6 +134,8 @@ impl ProxyConfig {
             install_log_enabled: true,
             otlp_endpoint: None,
             otlp_headers: Vec::new(),
+            lifecycle_policy: None,
+            lifecycle_allow: Vec::new(),
         })
     }
 }
@@ -279,12 +295,15 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
         decider,
         last_host: None,
         last_path: None,
+        last_npm_tarball: None,
         require_provenance: cfg.require_provenance,
         nuget_flat: NugetFlatContainerClient::new(cfg.user_agent.clone()),
         pypi_simple: PypiSimpleClient::new(cfg.user_agent.clone()),
         network_allow: cfg.network_allow.map(Arc::new),
         install_logger,
         otlp_exporter,
+        lifecycle_policy: cfg.lifecycle_policy,
+        lifecycle_allow: Arc::new(cfg.lifecycle_allow.into_iter().collect()),
     };
 
     // `.build()` in hudsucker 0.22 returns Proxy<…> directly; no Result.
@@ -391,6 +410,106 @@ struct SakimoriHandler {
     /// request whose target host doesn't match returns 403 before
     /// hudsucker tunnels or MITMs anything.
     network_allow: Option<Arc<crate::host_allow::HostMatcher>>,
+    /// `Some((name, version))` when the in-flight request was a
+    /// pinned npm tarball. `handle_response` consults this to decide
+    /// whether to run the lifecycle gate. Reset to `None` on every
+    /// request so an earlier tarball's identity can't bleed across.
+    last_npm_tarball: Option<(String, String)>,
+    /// Forwarded from [`ProxyConfig::lifecycle_policy`]. `None`
+    /// disables the gate entirely (no tarball buffering, no inspect).
+    lifecycle_policy: Option<crate::lifecycle::LifecyclePolicy>,
+    /// Pre-built set of package names that bypass the gate. Wrapped
+    /// in `Arc` so cloning the handler is O(1) — hudsucker may clone
+    /// the handler per connection.
+    lifecycle_allow: Arc<std::collections::HashSet<String>>,
+}
+
+impl SakimoriHandler {
+    /// Buffer the tarball body, inspect `package.json` for
+    /// install-time lifecycle scripts, then either audit-log + pass
+    /// through (Audit) or return 403 (Block).
+    ///
+    /// On any failure to parse the body as a gzipped tarball, we
+    /// fail open: pass the body through unchanged. The proxy's job
+    /// is to defend, not to invent rejections that would break
+    /// installs of legitimately-non-npm-shaped artefacts the parser
+    /// nonetheless tagged as Pinned. The log line records the
+    /// fail-open so it's still auditable.
+    async fn lifecycle_inspect_npm_tarball(
+        &self,
+        res: Response<Body>,
+        policy: crate::lifecycle::LifecyclePolicy,
+        name: &str,
+        version: &str,
+    ) -> Response<Body> {
+        use http_body_util::BodyExt;
+        let (mut parts, body) = res.into_parts();
+        let collected = match body.collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(e) => {
+                log::warn!("lifecycle: failed to buffer tarball body for {name}@{version}: {e}");
+                return Response::from_parts(parts, Body::empty());
+            }
+        };
+        let pass_through = || -> Response<Body> {
+            // Re-emit unchanged. Strip Content-Length so hyper
+            // recomputes it (the bytes are the same length, but
+            // hudsucker's re-framing path is happier when we do).
+            let mut parts2 = parts.clone();
+            parts2.headers.remove(http::header::CONTENT_LENGTH);
+            Response::from_parts(
+                parts2,
+                Body::from(http_body_util::Full::new(collected.clone())),
+            )
+        };
+        let inspection = match crate::lifecycle::inspect_npm_tarball(&collected) {
+            Ok(i) => i,
+            Err(e) => {
+                log::warn!(
+                    "lifecycle: fail-open on {name}@{version} — could not inspect tarball: {e}"
+                );
+                return pass_through();
+            }
+        };
+        if !inspection.has_scripts() {
+            log::debug!("lifecycle: {name}@{version} — no install-time scripts");
+            return pass_through();
+        }
+        let stages: Vec<&str> = inspection.scripts.iter().map(|s| s.stage).collect();
+        match policy {
+            crate::lifecycle::LifecyclePolicy::Audit => {
+                log::warn!(
+                    "lifecycle(audit): {name}@{version} ships {} install-time script(s): {}",
+                    stages.len(),
+                    stages.join(", ")
+                );
+                for s in &inspection.scripts {
+                    log::info!(
+                        "lifecycle(audit): {name}@{version} [{stage}]: {body}",
+                        stage = s.stage,
+                        body = s.body
+                    );
+                }
+                pass_through()
+            }
+            crate::lifecycle::LifecyclePolicy::Block => {
+                let reason = format!(
+                    "lifecycle: blocking {name}@{version} — ships install-time script(s): {}. \
+                     Add `{name}` to the lifecycle allow-list if this install is expected, \
+                     or relax to `--lifecycle-policy audit` to log without blocking.",
+                    stages.join(", ")
+                );
+                log::warn!("{reason}");
+                parts.headers.remove(http::header::CONTENT_LENGTH);
+                Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("content-type", "text/plain; charset=utf-8")
+                    .header("x-sakimori-deny", "lifecycle-script")
+                    .body(Body::from(format!("{reason}\n")))
+                    .expect("static lifecycle deny response")
+            }
+        }
+    }
 }
 
 impl HttpHandler for SakimoriHandler {
@@ -423,9 +542,12 @@ impl HttpHandler for SakimoriHandler {
         if !should_intercept(&host, &self.parsers) {
             self.last_host = None;
             self.last_path = None;
+            self.last_npm_tarball = None;
             return RequestOrResponse::Request(req);
         }
         self.last_host = Some(host.clone());
+        // Reset per-request; the `Pinned` branch below may set it back.
+        self.last_npm_tarball = None;
         let path: String = req
             .uri()
             .path_and_query()
@@ -455,6 +577,15 @@ impl HttpHandler for SakimoriHandler {
                 name,
                 version,
             } => {
+                // Remember npm-pinned identity so the lifecycle gate
+                // in `handle_response` can attribute findings without
+                // re-parsing the path.
+                if self.lifecycle_policy.is_some()
+                    && matches!(ecosystem, sakimori_core::deps::Ecosystem::Npm)
+                    && !self.lifecycle_allow.contains(&name)
+                {
+                    self.last_npm_tarball = Some((name.clone(), version.clone()));
+                }
                 let now = Utc::now();
                 match self.decider.decide(ecosystem, &name, &version, now) {
                     Decision::Allow => {
@@ -489,6 +620,21 @@ impl HttpHandler for SakimoriHandler {
     }
 
     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
+        // Lifecycle gate runs first because tarballs don't show up in
+        // `classify_response` (which only knows about metadata
+        // endpoints). Only buffer + inspect when the gate is active
+        // AND this response is for a pinned npm tarball we tagged in
+        // `handle_request`. Take()-style — a clone-then-clear semantic
+        // would also work but Option::take is what we want.
+        if let Some(policy) = self.lifecycle_policy
+            && let Some((name, version)) = self.last_npm_tarball.take()
+            && res.status().is_success()
+        {
+            return self
+                .lifecycle_inspect_npm_tarball(res, policy, &name, &version)
+                .await;
+        }
+
         // Decide whether and how to rewrite based on host + path. Only
         // endpoints we specifically understand get touched; everything
         // else flows through byte-for-byte.

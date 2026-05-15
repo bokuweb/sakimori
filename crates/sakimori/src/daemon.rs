@@ -152,6 +152,7 @@ pub async fn start(args: DaemonStartArgs) -> Result<()> {
         args.workspace_dir.as_deref(),
         &args.workspace_skip,
     );
+    let ioc_report = drift.as_ref().map(scan_drift_for_iocs);
 
     let report = ReportArgs {
         log: &args.log,
@@ -161,10 +162,12 @@ pub async fn start(args: DaemonStartArgs) -> Result<()> {
         mode,
         policy: &policy,
         workspace_drift: drift.as_ref().filter(|d| !d.is_clean()),
+        workspace_iocs: ioc_report.as_ref().filter(|r| !r.is_clean()),
     };
     sakimori_core::report::write(&report, &stats)?;
 
     let drift_violation = drift.as_ref().map(|d| !d.is_clean()).unwrap_or(false);
+    let ioc_high = ioc_report.as_ref().map(|r| r.has_high()).unwrap_or(false);
 
     // Block-mode parity with `sakimori run`: any denied event flips the
     // exit code so the surrounding job fails.
@@ -182,7 +185,31 @@ pub async fn start(args: DaemonStartArgs) -> Result<()> {
         );
         std::process::exit(1);
     }
+    // High-severity IOC fails the job in *any* mode — the fingerprint
+    // is "this is a known supply-chain worm artefact", not a policy
+    // call the user might want to override.
+    if ioc_high {
+        let n = ioc_report.as_ref().map(|r| r.findings.len()).unwrap_or(0);
+        eprintln!(
+            "::error title=sakimori::known-IOC hit: {n} workspace path(s) match a known supply-chain campaign fingerprint"
+        );
+        std::process::exit(1);
+    }
     Ok(())
+}
+
+/// Run the IOC catalog against `drift.added` + `drift.modified`. Files
+/// that were already in the baseline get no re-check (the baseline-
+/// snapshot opportunity is the snapshot itself; pre-existing infections
+/// are caught by `workspace scan-iocs` before the run).
+fn scan_drift_for_iocs(drift: &sakimori_core::tamper::Diff) -> sakimori_core::iocs::Report {
+    let paths: Vec<&std::path::Path> = drift
+        .added
+        .iter()
+        .map(|p| p.as_path())
+        .chain(drift.modified.iter().map(|m| m.path.as_path()))
+        .collect();
+    sakimori_core::iocs::Report::new(sakimori_core::iocs::scan_paths(paths.iter().copied()))
 }
 
 /// Take a fresh snapshot of `dir`, diff against the baseline file. Returns
