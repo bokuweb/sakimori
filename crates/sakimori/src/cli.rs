@@ -153,40 +153,6 @@ pub enum Command {
         #[command(subcommand)]
         cmd: AdvisoriesCommand,
     },
-    /// Manage the on-disk IOC catalog override used by
-    /// `workspace scan-iocs`. The bundled catalog ships in the
-    /// binary; `iocs update <url>` fetches a refreshed feed and
-    /// writes it to `~/.sakimori/iocs.yml`, where the scanner
-    /// picks it up automatically. A malformed feed never clobbers a
-    /// working override (validation runs before the atomic write).
-    Iocs {
-        #[command(subcommand)]
-        cmd: IocsCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum IocsCommand {
-    /// Fetch a YAML IOC catalog from `url`, validate it, and write
-    /// it to the local override path (defaults to
-    /// `~/.sakimori/iocs.yml`). Subsequent `workspace scan-iocs`
-    /// runs use the refreshed catalog automatically.
-    Update(IocsUpdateArgs),
-    /// Print which catalog the scanner will use right now (override
-    /// path, bundled, or override-failed-falling-back-to-bundled)
-    /// and the pattern count. Useful for confirming an `iocs update`
-    /// actually took effect.
-    Where,
-}
-
-#[derive(Debug, Parser)]
-pub struct IocsUpdateArgs {
-    /// URL to fetch. Anything `ureq` can GET — typically https.
-    pub url: String,
-    /// Destination file. Defaults to the same path
-    /// `workspace scan-iocs` reads (`~/.sakimori/iocs.yml`).
-    #[arg(long, short = 'o', value_name = "FILE")]
-    pub output: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -328,28 +294,12 @@ pub enum WorkspaceCommand {
     /// files. Exits non-zero when there's any drift (suppress with
     /// `--allow-drift`).
     Diff(WorkspaceDiffArgs),
-    /// Scan a directory against the bundled known-IOC index and
-    /// report any matching files (Shai-Hulud-class fingerprints).
-    /// Exits non-zero on any Error-severity hit; Warn-severity hits
-    /// surface but don't gate. Use `--allow-id` to suppress a
-    /// pattern the operator has already triaged as benign.
+    /// Walk `<dir>` and check every path against the known-IOC
+    /// catalog (Shai-Hulud-class fingerprints). Standalone — does
+    /// not need a baseline snapshot. Useful for a fresh-checkout
+    /// quick scan or for post-mortem on a runner you don't have a
+    /// baseline for.
     ScanIocs(WorkspaceScanIocsArgs),
-}
-
-#[derive(Debug, Parser)]
-pub struct WorkspaceScanIocsArgs {
-    /// Directory to scan.
-    pub dir: PathBuf,
-    /// Override the bundled IOC catalog with a custom YAML file
-    /// (same schema as `crates/sakimori-core/iocs/coronarium-iocs.yml`).
-    #[arg(long, value_name = "FILE")]
-    pub index: Option<PathBuf>,
-    /// Suppress a specific pattern by id. Repeatable.
-    #[arg(long = "allow-id", value_name = "ID")]
-    pub allow_id: Vec<String>,
-    /// Emit machine-readable JSON instead of the default text report.
-    #[arg(long)]
-    pub json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -391,12 +341,34 @@ pub struct WorkspaceDiffArgs {
     /// audit-only step where you just want the report.
     #[arg(long)]
     pub allow_drift: bool,
+    /// Disable the known-IOC scan that runs against added /
+    /// modified paths. The scan is on by default — turning it off
+    /// is rarely useful but exists so the diff output stays
+    /// stable for golden-file regression tests.
+    #[arg(long)]
+    pub no_check_iocs: bool,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum WorkspaceDiffFormat {
     Text,
     Json,
+}
+
+#[derive(Debug, Parser)]
+pub struct WorkspaceScanIocsArgs {
+    /// Directory to scan.
+    pub dir: PathBuf,
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: WorkspaceDiffFormat,
+    /// Extra directory basenames to skip on top of the built-in
+    /// `tamper::DEFAULT_SKIP_DIRS` list.
+    #[arg(long = "skip")]
+    pub skip: Vec<String>,
+    /// Treat Medium-severity hits as exit-1 too. Default is to
+    /// exit non-zero only on High.
+    #[arg(long)]
+    pub strict: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -449,30 +421,10 @@ pub enum PolicyCommand {
     /// block so you can pick which to deny — the suggester never
     /// auto-populates `process.deny_exec`.
     Suggest(PolicySuggestArgs),
-    /// Emit a curated rule pack for a known supply-chain attack
-    /// pattern (persistence-write, cloud-secret egress, ...) as a
-    /// ready-to-merge YAML block. See `--help` for the available
-    /// preset names.
+    /// Emit a curated policy preset for a Shai-Hulud-class threat.
+    /// Output is YAML on stdout (or `--output`); merge into an
+    /// existing policy file or use as-is.
     Preset(PolicyPresetArgs),
-}
-
-#[derive(Debug, Parser)]
-pub struct PolicyPresetArgs {
-    /// Preset name. Known values:
-    ///   `persistence` — file.deny tripwire for launchd / systemd /
-    ///   cron / shell-rc / ~/.ssh.
-    ///   `cloud-secret-egress` — network.deny tripwire for cloud
-    ///   metadata services (AWS / GCP / Azure IMDS + STS).
-    pub name: String,
-    /// Where to write the rendered policy. Defaults to stdout.
-    #[arg(long, short = 'o')]
-    pub output: Option<PathBuf>,
-    /// Home directory used to expand `~/.ssh` etc. into absolute
-    /// paths. Defaults to `$HOME`. Only consulted by the
-    /// `persistence` preset; omitted entries cause the corresponding
-    /// per-user paths to be skipped.
-    #[arg(long, value_name = "PATH")]
-    pub home: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -480,6 +432,23 @@ pub struct PolicySuggestArgs {
     /// Audit log to read. Use `-` for stdin.
     pub log: PathBuf,
     /// Where to write the suggested policy. Defaults to stdout.
+    #[arg(long, short = 'o')]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+pub struct PolicyPresetArgs {
+    /// Which preset to emit. `persistence` is a file-write deny list
+    /// for launchd / systemd / ssh / shell-rc paths.
+    /// `cloud-secret-egress` is a network deny list for cloud-IMDS
+    /// and secret-store endpoints.
+    pub name: String,
+    /// Override the home directory used to expand `~` in the
+    /// `persistence` preset. Defaults to `$HOME`. No effect on other
+    /// presets.
+    #[arg(long)]
+    pub home: Option<String>,
+    /// Where to write the preset. Defaults to stdout.
     #[arg(long, short = 'o')]
     pub output: Option<PathBuf>,
 }
@@ -560,7 +529,7 @@ impl From<InstallGateShell> for crate::install_gate::Shell {
 pub enum ProxyCommand {
     /// Start the proxy. Prints the root CA's install instructions on
     /// first run.
-    Start(ProxyStartArgs),
+    Start(Box<ProxyStartArgs>),
     /// Add the proxy's root CA to the OS trust store (sudo required on
     /// macOS/Linux; admin PowerShell on Windows). Prints the exact
     /// command when we can't run it ourselves.
@@ -728,6 +697,22 @@ pub struct ProxyStartArgs {
     /// `--otlp-endpoint` is not set.
     #[arg(long = "otlp-header", value_name = "K=V", value_parser = parse_kv)]
     pub otlp_headers: Vec<(String, String)>,
+    /// Lifecycle-script gate for npm tarballs (Shai-Hulud-class
+    /// defence). `audit` logs every fetched tarball that ships
+    /// `install` / `preinstall` / `postinstall` / `prepare` scripts
+    /// without blocking; `block` returns 403 for those tarballs so
+    /// npm never runs the scripts. `strip` is on the roadmap but not
+    /// yet implemented — pass `audit` or `block` for now. Unset
+    /// disables the gate entirely (current default).
+    #[arg(long = "lifecycle-policy", value_name = "MODE")]
+    pub lifecycle_policy: Option<String>,
+    /// Per-package allow-list for the lifecycle gate. Repeatable.
+    /// Names listed here keep their install scripts even under
+    /// `--lifecycle-policy block`. Use for legitimate native-addon
+    /// packages (e.g. `sharp`, `bcrypt`) whose `install` script
+    /// compiles bindings.
+    #[arg(long = "lifecycle-allow", value_name = "PKG")]
+    pub lifecycle_allow: Vec<String>,
 }
 
 fn parse_kv(s: &str) -> std::result::Result<(String, String), String> {
@@ -1012,6 +997,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             let min_age = parse_simple_duration(&args.min_age)?;
             let ca_files = ca_files_for(args.config_dir)?;
             let network_allow = build_network_allow(&args.network_allow, &args.network_allow_file)?;
+            let lifecycle_policy = args
+                .lifecycle_policy
+                .as_deref()
+                .map(sakimori_proxy::lifecycle::LifecyclePolicy::parse)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             let cfg = sakimori_proxy::ProxyConfig {
                 listen: args.listen,
                 min_age,
@@ -1031,6 +1022,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 install_log_enabled: !args.no_install_log,
                 otlp_endpoint: args.otlp_endpoint,
                 otlp_headers: args.otlp_headers,
+                lifecycle_policy,
+                lifecycle_allow: args.lifecycle_allow,
             };
             sakimori_proxy::run(cfg).await?;
             Ok(())
@@ -1115,12 +1108,6 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Advisories {
             cmd: AdvisoriesCommand::Scan(args),
         } => run_advisories_scan(args),
-        Command::Iocs {
-            cmd: IocsCommand::Update(args),
-        } => run_iocs_update(args),
-        Command::Iocs {
-            cmd: IocsCommand::Where,
-        } => run_iocs_where(),
     }
 }
 
@@ -1238,9 +1225,37 @@ fn run_workspace_diff(args: WorkspaceDiffArgs) -> Result<()> {
         .with_context(|| format!("snapshotting {}", args.dir.display()))?;
     let dif = sakimori_core::tamper::diff(&baseline, &current);
 
+    // Only scan paths the diff implicates — a clean file that was
+    // already in the baseline gets no IOC re-check, because the
+    // baseline-scan opportunity is the snapshot step itself (todo:
+    // wire `workspace snapshot --check-iocs` as a follow-up).
+    let ioc_targets: Vec<&std::path::Path> = if args.no_check_iocs {
+        Vec::new()
+    } else {
+        dif.added
+            .iter()
+            .map(std::path::PathBuf::as_path)
+            .chain(dif.modified.iter().map(|m| m.path.as_path()))
+            .collect()
+    };
+    let ioc_findings = sakimori_core::iocs::scan_paths(ioc_targets.iter().copied());
+    let ioc_report = sakimori_core::iocs::Report::new(ioc_findings);
+
     match args.format {
         WorkspaceDiffFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&dif)?);
+            #[derive(serde::Serialize)]
+            struct Combined<'a> {
+                #[serde(flatten)]
+                diff: &'a sakimori_core::tamper::Diff,
+                iocs: &'a sakimori_core::iocs::Report,
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&Combined {
+                    diff: &dif,
+                    iocs: &ioc_report,
+                })?
+            );
         }
         WorkspaceDiffFormat::Text => {
             if dif.is_clean() {
@@ -1263,126 +1278,79 @@ fn run_workspace_diff(args: WorkspaceDiffArgs) -> Result<()> {
                     println!("-  {}", p.display());
                 }
             }
+            if !ioc_report.is_clean() {
+                eprintln!(
+                    "\nsakimori: ❌ {} known-IOC hit(s) (catalog {})",
+                    ioc_report.findings.len(),
+                    ioc_report.catalog_version,
+                );
+                for f in &ioc_report.findings {
+                    let tag = match f.severity {
+                        sakimori_core::iocs::Severity::High => "HIGH",
+                        sakimori_core::iocs::Severity::Medium => "MED ",
+                    };
+                    println!("!! {tag}  {}  [{}]", f.path.display(), f.rule_id);
+                    println!("       {}", f.description);
+                }
+            }
         }
     }
 
-    if !dif.is_clean() && !args.allow_drift {
+    // A High-severity IOC is exit-1 even with `--allow-drift`: that
+    // flag is meant for "I expect drift", not for "I expect a
+    // known-malicious-file fingerprint".
+    let drift_blocks = !dif.is_clean() && !args.allow_drift;
+    if drift_blocks || ioc_report.has_high() {
         std::process::exit(1);
     }
     Ok(())
 }
 
 fn run_workspace_scan_iocs(args: WorkspaceScanIocsArgs) -> Result<()> {
-    use sakimori_core::iocs::{Catalog, LoadedFrom, default_override_path};
-    use std::collections::BTreeSet;
-    let (catalog, loaded_from) = match &args.index {
-        // Explicit --index bypasses the override-fallback chain
-        // entirely: when the operator says "use this file," surfacing
-        // a silent bundled fallback would be wrong.
-        Some(p) => (Catalog::from_file(p)?, LoadedFrom::Override(p.clone())),
-        None => Catalog::load_with_fallback(default_override_path().as_deref()),
-    };
-    // Loud one-line warning when an override exists but failed to
-    // parse — the operator must know they're getting bundled defaults
-    // instead of their fresh feed.
-    if let LoadedFrom::BundledAfterOverrideError { path, error } = &loaded_from {
-        eprintln!(
-            "sakimori: warning: IOC override at {} failed to parse ({}); using bundled catalog",
-            path.display(),
-            error,
-        );
-    }
-    let allow: BTreeSet<String> = args.allow_id.into_iter().collect();
-    let report = sakimori_core::iocs::scan(&args.dir, &catalog, &allow)?;
+    let opts = tamper_options(args.skip, sakimori_core::tamper::DEFAULT_MAX_FILE_BYTES);
+    let snap = sakimori_core::tamper::Snapshot::take(&args.dir, &opts)
+        .with_context(|| format!("scanning {}", args.dir.display()))?;
+    let findings = sakimori_core::iocs::scan_paths(snap.files.keys());
+    let report = sakimori_core::iocs::Report::new(findings);
 
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else if report.is_clean() {
-        eprintln!(
-            "sakimori: scanned {} — no known IOCs matched (catalog v{}, {} pattern(s))",
-            report.root.display(),
-            catalog.version,
-            catalog.patterns.len(),
-        );
-    } else {
-        eprintln!(
-            "sakimori: {} IOC hit(s) in {} (catalog v{})\n",
-            report.hits.len(),
-            report.root.display(),
-            catalog.version,
-        );
-        for h in &report.hits {
-            let tag = match h.severity {
-                sakimori_core::iocs::Severity::Error => "ERROR",
-                sakimori_core::iocs::Severity::Warn => "WARN ",
-            };
-            println!("[{}] {}  {}", tag, h.pattern_id, h.path);
-            println!("        {}", h.description.replace('\n', " "));
+    match args.format {
+        WorkspaceDiffFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        WorkspaceDiffFormat::Text => {
+            if report.is_clean() {
+                eprintln!(
+                    "sakimori: no known-IOC hits ({} file(s) scanned, catalog {})",
+                    snap.files.len(),
+                    report.catalog_version,
+                );
+            } else {
+                eprintln!(
+                    "sakimori: ❌ {} known-IOC hit(s) in {} (catalog {})",
+                    report.findings.len(),
+                    args.dir.display(),
+                    report.catalog_version,
+                );
+                for f in &report.findings {
+                    let tag = match f.severity {
+                        sakimori_core::iocs::Severity::High => "HIGH",
+                        sakimori_core::iocs::Severity::Medium => "MED ",
+                    };
+                    println!("!! {tag}  {}  [{}]", f.path.display(), f.rule_id);
+                    println!("       {}", f.description);
+                }
+            }
         }
     }
 
-    if report.has_error() {
+    let block = report.has_high()
+        || (args.strict
+            && report
+                .findings
+                .iter()
+                .any(|f| matches!(f.severity, sakimori_core::iocs::Severity::Medium)));
+    if block {
         std::process::exit(1);
-    }
-    Ok(())
-}
-
-fn run_iocs_update(args: IocsUpdateArgs) -> Result<()> {
-    use sakimori_core::iocs::{HttpFetcher, default_override_path, update_from};
-    let dest = match args.output {
-        Some(p) => p,
-        None => default_override_path().ok_or_else(|| {
-            anyhow::anyhow!(
-                "cannot resolve default IOC override path: neither $XDG_DATA_HOME nor $HOME is set. \
-                 Pass --output explicitly."
-            )
-        })?,
-    };
-    let fetcher = HttpFetcher {
-        user_agent: format!("sakimori/{}", env!("CARGO_PKG_VERSION")),
-    };
-    let cat = update_from(&fetcher, &args.url, &dest)?;
-    eprintln!(
-        "sakimori: wrote IOC catalog v{} ({} pattern(s)) to {}",
-        cat.version,
-        cat.patterns.len(),
-        dest.display(),
-    );
-    Ok(())
-}
-
-fn run_iocs_where() -> Result<()> {
-    use sakimori_core::iocs::{Catalog, LoadedFrom, default_override_path};
-    let override_path = default_override_path();
-    let (cat, src) = Catalog::load_with_fallback(override_path.as_deref());
-    match src {
-        LoadedFrom::Override(p) => {
-            println!(
-                "override (v{}, {} pattern(s)) — {}",
-                cat.version,
-                cat.patterns.len(),
-                p.display()
-            );
-        }
-        LoadedFrom::Bundled => {
-            println!(
-                "bundled (v{}, {} pattern(s)){}",
-                cat.version,
-                cat.patterns.len(),
-                override_path
-                    .map(|p| format!(" — no override at {}", p.display()))
-                    .unwrap_or_default(),
-            );
-        }
-        LoadedFrom::BundledAfterOverrideError { path, error } => {
-            println!(
-                "bundled (v{}, {} pattern(s)) — override at {} failed to parse: {}",
-                cat.version,
-                cat.patterns.len(),
-                path.display(),
-                error,
-            );
-        }
     }
     Ok(())
 }
@@ -1733,20 +1701,19 @@ fn run_policy_suggest(args: PolicySuggestArgs) -> Result<()> {
 }
 
 fn run_policy_preset(args: PolicyPresetArgs) -> Result<()> {
-    use std::str::FromStr;
-    let preset = sakimori_core::presets::Preset::from_str(&args.name)?;
-    let home = args
-        .home
-        .map(|p| p.to_string_lossy().into_owned())
-        .or_else(|| std::env::var("HOME").ok());
-    let ctx = sakimori_core::presets::PresetCtx { home };
-    let yaml = sakimori_core::presets::format_yaml(preset, &ctx)?;
+    let preset = sakimori_core::presets::Preset::parse(&args.name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown preset {:?}; known presets: persistence, cloud-secret-egress",
+            args.name
+        )
+    })?;
+    let yaml = sakimori_core::presets::render(preset, args.home.as_deref());
     match args.output {
         Some(path) => {
-            std::fs::write(&path, yaml)
-                .with_context(|| format!("writing preset policy to {}", path.display()))?;
+            std::fs::write(&path, &yaml)
+                .with_context(|| format!("writing preset to {}", path.display()))?;
             eprintln!(
-                "sakimori: wrote preset `{}` to {}",
+                "sakimori: wrote {} preset to {}",
                 preset.name(),
                 path.display()
             );
@@ -1902,6 +1869,16 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
     // CI step on flaky DNS.
     crate::resolve_hostnames::resolve(&mut stats).await;
 
+    let ioc_report = drift.as_ref().map(|d| {
+        let paths: Vec<&std::path::Path> = d
+            .added
+            .iter()
+            .map(|p| p.as_path())
+            .chain(d.modified.iter().map(|m| m.path.as_path()))
+            .collect();
+        sakimori_core::iocs::Report::new(sakimori_core::iocs::scan_paths(paths.iter().copied()))
+    });
+
     let command_str = args.command.join(" ");
     let report_args = ReportArgs {
         log: &args.log,
@@ -1911,10 +1888,12 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
         mode,
         policy: &policy,
         workspace_drift: drift.as_ref().filter(|d| !d.is_clean()),
+        workspace_iocs: ioc_report.as_ref().filter(|r| !r.is_clean()),
     };
     sakimori_core::report::write(&report_args, &stats)?;
 
     let drift_violation = drift.as_ref().map(|d| !d.is_clean()).unwrap_or(false);
+    let ioc_high = ioc_report.as_ref().map(|r| r.has_high()).unwrap_or(false);
 
     if stats.denied > 0 && matches!(mode, policy::Mode::Block) {
         // GitHub Actions error annotation — renders as a red banner on the
@@ -1929,6 +1908,15 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
         let n = drift.as_ref().map(|d| d.total()).unwrap_or(0);
         eprintln!(
             "::error title=sakimori::workspace tamper detected: {n} files added/modified/removed during the supervised step"
+        );
+        std::process::exit(1);
+    }
+    // High-severity IOC fails the supervised step regardless of mode —
+    // see daemon.rs for the matching policy and rationale.
+    if ioc_high {
+        let n = ioc_report.as_ref().map(|r| r.findings.len()).unwrap_or(0);
+        eprintln!(
+            "::error title=sakimori::known-IOC hit: {n} workspace path(s) match a known supply-chain campaign fingerprint"
         );
         std::process::exit(1);
     }

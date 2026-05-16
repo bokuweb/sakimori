@@ -39,3 +39,5 @@ semver = "1"
 # deps. We keep this list intentionally small for now.
 base64 = "0.22"
 sha2 = "0.10"
+tar = "0.4"
+flate2 = "1"

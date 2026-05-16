@@ -1,417 +1,299 @@
-//! Curated policy rule packs for known supply-chain attack patterns.
+//! Curated policy presets for Shai-Hulud-class supply-chain attacks.
 //!
-//! Each preset returns a [`Policy`] populated with only the relevant
-//! deny rules. The CLI subcommand `sakimori policy preset <name>`
-//! renders one as a YAML block annotated with explanatory comments so
-//! the operator can drop it into an existing policy file or use it
-//! standalone.
+//! Each preset emits a `Policy` shape that the caller can either drop in
+//! verbatim or merge into an existing policy file. Presets are
+//! deliberately conservative — they only populate the dimension they're
+//! named for (file deny for `persistence`, network deny for
+//! `cloud-secret-egress`) so they compose cleanly with each other and
+//! with hand-written policies.
 //!
-//! Presets are intentionally conservative: every rule is something
-//! that should never legitimately fire during a `npm install` /
-//! `cargo build` / `pip install`. False positives here are a strong
-//! signal of compromise, not noise.
+//! Output is a YAML string, not a [`Policy`] value, because we want to
+//! interleave human-readable comments explaining *why* each rule is on
+//! the list. A user staring at `~/Library/LaunchAgents/` in a deny list
+//! months from now should be able to read the comment and know it's the
+//! macOS user-persistence path, not delete the rule.
 //!
-//! Kernel cap reminder: `file.deny` is limited to 8 entries under
-//! `mode: block` on Linux (see [`sakimori_common::FILE_DENY_MAX_ENTRIES`]).
-//! The persistence preset exceeds that on purpose — the user picks the
-//! 8 highest-value entries for their threat model and leaves the rest
-//! for audit mode (which is uncapped).
-//!
-//! Out of scope here: workspace-relative paths (`.claude/setup.mjs`,
-//! `.vscode/tasks.json`). The file matcher is absolute-prefix only, so
-//! those belong to the IOC workspace scanner (roadmap item 18), not
-//! `file.deny`.
+//! File deny lists honour the kernel-side block cap
+//! ([`sakimori_common::FILE_DENY_MAX_ENTRIES`] = 8). The `persistence`
+//! preset is tuned to fit inside that cap so it can ship under
+//! `mode: block` without the policy validator refusing to start.
 
-use std::str::FromStr;
+use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
-
-use crate::policy::{
-    DefaultDecision, EnvPolicy, FilePolicy, Mode, NetRule, NetworkPolicy, Policy, ProcessPolicy,
-};
-
-/// One of the curated rule packs. See module docs for the design
-/// philosophy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preset {
-    /// File-write tripwire for OS-level persistence locations
-    /// (launchd / systemd / cron / shell-rc / ~/.ssh).
+    /// File-write deny list covering common OS-level persistence paths
+    /// (launchd, systemd, ssh, shell rc). Pairs with the v0.23
+    /// attribution layer: a write to any of these from a
+    /// package-manager-attributed subtree is the strongest possible
+    /// "this install is malicious" signal.
     Persistence,
-    /// Network-egress tripwire for cloud metadata services and
-    /// secret-bearing endpoints (AWS / GCP / Azure IMDS + STS).
+    /// Network deny list covering cloud-metadata endpoints and the
+    /// well-known secret-store APIs. Built to ride on top of the
+    /// proxy's SNI-based egress filter so rules match by the hostname
+    /// the client asked for, not a CDN-rotated IP.
     CloudSecretEgress,
 }
 
 impl Preset {
-    /// Canonical CLI name (kebab-case).
-    pub fn name(&self) -> &'static str {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "persistence" => Some(Self::Persistence),
+            "cloud-secret-egress" => Some(Self::CloudSecretEgress),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
         match self {
-            Preset::Persistence => "persistence",
-            Preset::CloudSecretEgress => "cloud-secret-egress",
-        }
-    }
-
-    /// All preset names, for `--help` discovery.
-    pub fn all() -> &'static [Preset] {
-        &[Preset::Persistence, Preset::CloudSecretEgress]
-    }
-
-    /// One-line description shown above the YAML block.
-    pub fn description(&self) -> &'static str {
-        match self {
-            Preset::Persistence => {
-                "Tripwire for OS-level persistence writes — launchd / systemd / cron / \
-                 shell-rc / ~/.ssh. Any package-manager subtree touching these is a strong \
-                 signal of a worm-style supply-chain compromise (Shai-Hulud class)."
-            }
-            Preset::CloudSecretEgress => {
-                "Tripwire for cloud-credential exfiltration — AWS / GCP / Azure metadata \
-                 services and STS-style secret endpoints. Pairs with the proxy's SNI \
-                 filter (v0.33+) so a CDN-rotated IP can't slip past the IP-only rules."
-            }
+            Self::Persistence => "persistence",
+            Self::CloudSecretEgress => "cloud-secret-egress",
         }
     }
 }
 
-impl FromStr for Preset {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "persistence" => Ok(Preset::Persistence),
-            "cloud-secret-egress" => Ok(Preset::CloudSecretEgress),
-            other => Err(anyhow!(
-                "unknown preset `{other}` (known: persistence, cloud-secret-egress)"
-            )),
-        }
-    }
-}
-
-/// Inputs for rendering a preset. `home` is consulted by
-/// [`Preset::Persistence`] to expand `~/.ssh` etc. into absolute paths
-/// the file matcher understands.
-#[derive(Debug, Clone, Default)]
-pub struct PresetCtx {
-    /// Home directory to expand into. When `None`, the per-user entries
-    /// are omitted from the rendered policy and a comment notes that
-    /// the operator should add them by hand.
-    pub home: Option<String>,
-}
-
-/// Build the [`Policy`] for the requested preset.
+/// Resolve the home directory for the `persistence` preset.
 ///
-/// The persistence preset is rendered in `mode: audit` because its
-/// `file.deny` list deliberately exceeds the kernel-side 8-entry cap
-/// — emitting `mode: block` would produce a policy that fails the
-/// project's own [`Policy::validate`]. The header in
-/// [`format_yaml`] tells the operator to flip to `mode: block` only
-/// after pruning to the cap. The cloud-secret-egress preset stays in
-/// `mode: block` (no equivalent cap on `network.deny`).
-pub fn build(preset: Preset, ctx: &PresetCtx) -> Policy {
-    let mode = match preset {
-        Preset::Persistence => Mode::Audit,
-        Preset::CloudSecretEgress => Mode::Block,
-    };
-    let mut policy = Policy {
-        mode,
-        network: NetworkPolicy {
-            default: DefaultDecision::Allow,
-            allow: Vec::new(),
-            deny: Vec::new(),
-        },
-        file: FilePolicy {
-            default: DefaultDecision::Allow,
-            allow: Vec::new(),
-            deny: Vec::new(),
-        },
-        process: ProcessPolicy::default(),
-        env: EnvPolicy::default(),
-    };
+/// The preset emits absolute paths because the policy YAML parser does
+/// not expand `$HOME` / `~`. Callers that need a different home
+/// (e.g. generating a policy for a CI runner from a developer laptop)
+/// can pass it through `home_override`. When `None`, we read
+/// `std::env::var("HOME")` and fall back to `/root` so the preset is
+/// still emit-able in environments without HOME set (rare, but cron
+/// jobs and minimal containers do this).
+pub fn render(preset: Preset, home_override: Option<&str>) -> String {
     match preset {
-        Preset::Persistence => {
-            policy.file.deny = persistence_paths(ctx.home.as_deref());
-        }
-        Preset::CloudSecretEgress => {
-            policy.network.deny = cloud_secret_egress_rules();
-        }
+        Preset::Persistence => render_persistence(home_override),
+        Preset::CloudSecretEgress => render_cloud_secret_egress(),
     }
-    policy
 }
 
-/// Concrete file-prefix list for [`Preset::Persistence`]. Visible for
-/// tests; the CLI goes through [`build`].
-pub fn persistence_paths(home: Option<&str>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-
-    // System-wide persistence (no $HOME needed).
-    out.extend(
-        [
-            // macOS launchd
-            "/Library/LaunchAgents/",
-            "/Library/LaunchDaemons/",
-            // Linux systemd (system scope)
-            "/etc/systemd/system/",
-            "/etc/init.d/",
-            // Linux cron
-            "/var/spool/cron/",
-            "/etc/cron.d/",
-            "/etc/cron.hourly/",
-            "/etc/cron.daily/",
-            "/etc/cron.weekly/",
-            "/etc/cron.monthly/",
-        ]
-        .iter()
-        .map(|s| (*s).to_string()),
-    );
-
-    if let Some(home) = home {
-        let h = home.trim_end_matches('/');
-        out.extend([
-            // macOS per-user launchd
-            format!("{h}/Library/LaunchAgents/"),
-            format!("{h}/Library/LaunchDaemons/"),
-            // Linux per-user systemd + autostart
-            format!("{h}/.config/systemd/user/"),
-            format!("{h}/.config/autostart/"),
-            // SSH
-            format!("{h}/.ssh/"),
-            // Shell rc / profile — common worm injection targets.
-            // Listed as exact files (no trailing slash) so the
-            // matcher doesn't accidentally allow a directory.
-            format!("{h}/.bashrc"),
-            format!("{h}/.bash_profile"),
-            format!("{h}/.bash_logout"),
-            format!("{h}/.profile"),
-            format!("{h}/.zshrc"),
-            format!("{h}/.zprofile"),
-            format!("{h}/.zshenv"),
-        ]);
+fn resolve_home(home_override: Option<&str>) -> String {
+    if let Some(h) = home_override {
+        return strip_trailing_slash(h);
     }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    strip_trailing_slash(&home)
+}
 
+fn strip_trailing_slash(s: &str) -> String {
+    let mut buf = PathBuf::from(s)
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .to_string();
+    if buf.is_empty() {
+        buf.push('/');
+    }
+    buf
+}
+
+fn render_persistence(home_override: Option<&str>) -> String {
+    let home = resolve_home(home_override);
+    // Keep this list at <= FILE_DENY_MAX_ENTRIES (8) so it fits in the
+    // kernel-side block map. Each entry is prefix-matched against
+    // open() paths with directory-boundary awareness, so `{home}/.ssh/`
+    // matches `{home}/.ssh/authorized_keys` but not `{home}/.sshcfg`.
+    let mut out = String::new();
+    out.push_str(
+        "# Generated by `sakimori policy preset persistence`.\n\
+         # Curated file-write deny list for OS-level persistence paths.\n\
+         # Pair with `sakimori run --policy persistence.yml` to SIGKILL\n\
+         # any process — package-manager-attributed or not — that opens\n\
+         # one of these for write. Audit-mode first to confirm nothing\n\
+         # in your build legitimately touches them.\n\
+         mode: audit\n\
+         file:\n  default: allow\n  deny:\n",
+    );
+    let entries: [(&str, String); 8] = [
+        ("SSH keys and authorized_keys", format!("{home}/.ssh/")),
+        (
+            "macOS user-scope launchd persistence",
+            format!("{home}/Library/LaunchAgents/"),
+        ),
+        (
+            "macOS system-scope launchd persistence (LaunchAgents)",
+            "/Library/LaunchAgents/".to_string(),
+        ),
+        (
+            "macOS root daemon persistence (LaunchDaemons)",
+            "/Library/LaunchDaemons/".to_string(),
+        ),
+        (
+            "Linux user-scope systemd unit dir",
+            format!("{home}/.config/systemd/user/"),
+        ),
+        (
+            "Linux system-scope systemd unit dir",
+            "/etc/systemd/system/".to_string(),
+        ),
+        ("Shell rc — bash", format!("{home}/.bashrc")),
+        ("Shell rc — zsh", format!("{home}/.zshrc")),
+    ];
+    for (why, path) in entries {
+        out.push_str("    # ");
+        out.push_str(why);
+        out.push('\n');
+        out.push_str("    - ");
+        out.push_str(&path);
+        out.push('\n');
+    }
+    out.push_str(
+        "\n# Not on the list — covered well by other layers, or too\n\
+         # noisy without a per-project allowlist:\n\
+         #   - /etc/cron.d/, /var/spool/cron/  (rarely written by build steps,\n\
+         #     but legitimate Linux packaging does — extend if your threat\n\
+         #     model warrants it)\n\
+         #   - ~/.bash_profile, ~/.zprofile, ~/.profile  (same surface as\n\
+         #     ~/.bashrc / ~/.zshrc; drop them in if you can spare slots)\n\
+         #   - .vscode/tasks.json, .claude/*.mjs  (workspace-local; the\n\
+         #     workspace-drift snapshot is the better surface for these)\n",
+    );
     out
 }
 
-/// Concrete `network.deny` rules for [`Preset::CloudSecretEgress`].
-/// Visible for tests; the CLI goes through [`build`].
-pub fn cloud_secret_egress_rules() -> Vec<NetRule> {
-    // No ports = match every port for the target. Belt-and-braces:
-    // include the IMDS IP literal alongside the hostnames, since
-    // cgroup-side enforcement sees an IP and the hostname-keyed rules
-    // only fire after DNS resolution catches up.
-    let target = |s: &str| NetRule {
-        target: s.to_string(),
-        ports: Vec::new(),
-    };
-    vec![
-        // AWS / GCP / Azure share the link-local IMDS IP.
-        target("169.254.169.254"),
-        // GCP metadata (always resolves to 169.254.169.254 but the
-        // hostname appears in user code).
-        target("metadata.google.internal"),
-        // Azure IMDS (same IP, different naming).
-        target("metadata.azure.com"),
-        // AWS STS — the "assume this role" endpoint.
-        target("sts.amazonaws.com"),
-    ]
-}
-
-/// Render a preset as a YAML block, prefixed with a comment header
-/// explaining what it is and how to merge it.
-pub fn format_yaml(preset: Preset, ctx: &PresetCtx) -> Result<String> {
-    let policy = build(preset, ctx);
+fn render_cloud_secret_egress() -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "# Generated by `sakimori policy preset {}`.\n# {}\n",
-        preset.name(),
-        preset.description(),
-    ));
-    match preset {
-        Preset::Persistence => {
-            if ctx.home.is_none() {
-                out.push_str(
-                    "# NOTE: --home was not supplied, so per-user paths \
-                     (~/.ssh, shell rc) were omitted.\n#       Re-run with --home \
-                     /path/to/home to include them.\n",
-                );
-            }
-            out.push_str(
-                "# Emitted as `mode: audit` because the Linux kernel caps file.deny at 8 \
-                 entries under\n# `mode: block` and this list deliberately exceeds that. \
-                 To enforce: prune to the 8 most\n# critical paths for your threat model, \
-                 then flip `mode:` to `block`.\n",
-            );
-        }
-        Preset::CloudSecretEgress => {
-            out.push_str(
-                "# Pair with `sakimori proxy start --network-allow ...` for SNI-level \
-                 enforcement;\n# the rules below are eBPF-cgroup enforced (Linux) and \
-                 fire on IP/hostname resolution.\n",
-            );
-        }
+    out.push_str(
+        "# Generated by `sakimori policy preset cloud-secret-egress`.\n\
+         # Network deny list for cloud-metadata + secret-store APIs.\n\
+         #\n\
+         # Designed to be enforced at the proxy layer (`sakimori proxy\n\
+         # start --network-allow ...` plus the deny rules below) so the\n\
+         # match runs against the hostname the client asked for, not a\n\
+         # CDN-rotated IP. The eBPF connect path also picks these up\n\
+         # for processes that bypass the proxy.\n\
+         network:\n  default: allow\n  deny:\n",
+    );
+    let entries: &[(&str, &str)] = &[
+        (
+            "AWS / GCP / Azure IMDS magic IP (link-local, all three use it)",
+            "169.254.169.254",
+        ),
+        ("GCP metadata service hostname", "metadata.google.internal"),
+        (
+            "AWS STS (AssumeRole, session credential mint)",
+            "sts.amazonaws.com",
+        ),
+        (
+            "AWS Secrets Manager (us-east-1; add other regions if used)",
+            "secretsmanager.us-east-1.amazonaws.com",
+        ),
+        (
+            "AWS Systems Manager Parameter Store (us-east-1)",
+            "ssm.us-east-1.amazonaws.com",
+        ),
+        (
+            "HashiCorp Vault default API hostname",
+            "vault.service.consul",
+        ),
+        (
+            "GitHub Actions OIDC token endpoint (commonly abused for token theft)",
+            "vstoken.actions.githubusercontent.com",
+        ),
+    ];
+    for (why, target) in entries {
+        out.push_str("    # ");
+        out.push_str(why);
+        out.push('\n');
+        out.push_str("    - target: ");
+        out.push_str(target);
+        out.push('\n');
     }
-    out.push_str(&serde_yaml::to_string(&policy)?);
-    Ok(out)
+    out.push_str(
+        "\n# Notes:\n\
+         #   - Add the AWS regional endpoints you actually use (eu-west-1,\n\
+         #     ap-northeast-1, ...). Wildcards in the middle of a target\n\
+         #     are not supported; list each region explicitly.\n\
+         #   - Azure IMDS is the same 169.254.169.254 entry above — the\n\
+         #     `Metadata: true` header is checked, but at the network\n\
+         #     layer the IP is what matters.\n\
+         #   - For the SNI-based proxy path, the matcher also accepts\n\
+         #     `*.example.com` subdomain wildcards; consider adding\n\
+         #     `*.amazonaws.com` if you don't need any AWS egress at all.\n",
+    );
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::{DefaultDecision, Mode, Policy};
 
-    #[test]
-    fn preset_name_round_trip() {
-        for p in Preset::all() {
-            assert_eq!(Preset::from_str(p.name()).unwrap(), *p);
-        }
+    fn parse(yaml: &str) -> Policy {
+        serde_yaml::from_str::<Policy>(yaml).expect("preset YAML must parse as Policy")
     }
 
     #[test]
-    fn unknown_preset_errors() {
-        assert!(Preset::from_str("nope").is_err());
+    fn persistence_parses_and_is_audit_default() {
+        let yaml = render(Preset::Persistence, Some("/home/x"));
+        let policy = parse(&yaml);
+        assert!(matches!(policy.mode, Mode::Audit));
+        assert!(matches!(policy.file.default, DefaultDecision::Allow));
+        assert_eq!(policy.file.deny.len(), 8);
     }
 
     #[test]
-    fn persistence_without_home_keeps_only_system_paths() {
-        let paths = persistence_paths(None);
-        assert!(paths.iter().any(|p| p == "/Library/LaunchAgents/"));
-        assert!(paths.iter().any(|p| p == "/etc/systemd/system/"));
-        assert!(paths.iter().any(|p| p == "/etc/cron.d/"));
-        assert!(
-            !paths.iter().any(|p| p.contains(".ssh")),
-            "no $HOME → no per-user entries"
+    fn persistence_expands_home() {
+        let yaml = render(Preset::Persistence, Some("/home/alice"));
+        assert!(yaml.contains("/home/alice/.ssh/"));
+        assert!(yaml.contains("/home/alice/Library/LaunchAgents/"));
+        assert!(!yaml.contains("$HOME"));
+    }
+
+    #[test]
+    fn persistence_trims_trailing_slash_in_home() {
+        let yaml = render(Preset::Persistence, Some("/home/bob/"));
+        assert!(yaml.contains("/home/bob/.ssh/"));
+        assert!(!yaml.contains("/home/bob//"));
+    }
+
+    #[test]
+    fn persistence_fits_kernel_deny_cap() {
+        use sakimori_common::FILE_DENY_MAX_ENTRIES;
+        let yaml = render(Preset::Persistence, Some("/home/x"));
+        let policy = parse(&yaml);
+        assert!(policy.file.deny.len() <= FILE_DENY_MAX_ENTRIES as usize);
+        // And the policy validates under mode: block (the kernel-side
+        // cap is the only validator that touches preset output).
+        policy
+            .validate(Mode::Block)
+            .expect("persistence preset must fit kernel cap under mode: block");
+    }
+
+    #[test]
+    fn cloud_secret_egress_parses_and_has_deny_entries() {
+        let yaml = render(Preset::CloudSecretEgress, None);
+        let policy = parse(&yaml);
+        assert!(matches!(policy.network.default, DefaultDecision::Allow));
+        assert!(!policy.network.deny.is_empty());
+        let targets: Vec<_> = policy
+            .network
+            .deny
+            .iter()
+            .map(|r| r.target.as_str())
+            .collect();
+        assert!(targets.contains(&"169.254.169.254"));
+        assert!(targets.contains(&"sts.amazonaws.com"));
+    }
+
+    #[test]
+    fn cloud_secret_egress_does_not_touch_file_or_process() {
+        let yaml = render(Preset::CloudSecretEgress, None);
+        let policy = parse(&yaml);
+        assert!(policy.file.deny.is_empty());
+        assert!(policy.file.allow.is_empty());
+        assert!(policy.process.deny_exec.is_empty());
+    }
+
+    #[test]
+    fn parse_name_round_trip() {
+        assert_eq!(Preset::parse("persistence"), Some(Preset::Persistence));
+        assert_eq!(
+            Preset::parse("cloud-secret-egress"),
+            Some(Preset::CloudSecretEgress)
         );
-    }
-
-    #[test]
-    fn persistence_with_home_expands_user_paths() {
-        let paths = persistence_paths(Some("/Users/alice"));
-        assert!(paths.iter().any(|p| p == "/Users/alice/.ssh/"));
-        assert!(paths.iter().any(|p| p == "/Users/alice/.zshrc"));
-        assert!(
-            paths
-                .iter()
-                .any(|p| p == "/Users/alice/Library/LaunchAgents/")
-        );
-        assert!(
-            paths
-                .iter()
-                .any(|p| p == "/Users/alice/.config/systemd/user/")
-        );
-    }
-
-    #[test]
-    fn persistence_strips_trailing_slash_on_home() {
-        let with = persistence_paths(Some("/home/bob/"));
-        let without = persistence_paths(Some("/home/bob"));
-        assert_eq!(with, without, "trailing slash on --home must not matter");
-    }
-
-    #[test]
-    fn cloud_egress_includes_imds_ip_literal() {
-        let rules = cloud_secret_egress_rules();
-        assert!(rules.iter().any(|r| r.target == "169.254.169.254"));
-        assert!(rules.iter().any(|r| r.target == "sts.amazonaws.com"));
-        for r in &rules {
-            assert!(
-                r.ports.is_empty(),
-                "every-port match for {} (was {:?})",
-                r.target,
-                r.ports
-            );
-        }
-    }
-
-    #[test]
-    fn build_persistence_sets_file_deny_not_network() {
-        let p = build(
-            Preset::Persistence,
-            &PresetCtx {
-                home: Some("/h".into()),
-            },
-        );
-        assert!(!p.file.deny.is_empty());
-        assert!(p.network.deny.is_empty());
-        assert_eq!(p.file.default, DefaultDecision::Allow);
-        // Audit, not block — the deny list exceeds the kernel 8-entry
-        // cap on purpose, so block mode would fail `Policy::validate`.
-        assert_eq!(p.mode, Mode::Audit);
-    }
-
-    #[test]
-    fn build_cloud_egress_sets_network_deny_not_file() {
-        let p = build(Preset::CloudSecretEgress, &PresetCtx::default());
-        assert!(!p.network.deny.is_empty());
-        assert!(p.file.deny.is_empty());
-        assert_eq!(p.network.default, DefaultDecision::Allow);
-        assert_eq!(p.mode, Mode::Block);
-    }
-
-    #[test]
-    fn rendered_presets_pass_their_own_effective_mode_validation() {
-        // Regression for the codex review finding: a rendered preset
-        // written straight to a policy file must load + validate
-        // under the mode it ships in. Persistence ships audit
-        // (uncapped); cloud-secret-egress ships block (no cap).
-        for preset in Preset::all() {
-            let yaml = format_yaml(
-                *preset,
-                &PresetCtx {
-                    home: Some("/h".into()),
-                },
-            )
-            .unwrap();
-            let parsed: Policy = serde_yaml::from_str(&yaml).unwrap();
-            parsed
-                .validate(parsed.mode)
-                .unwrap_or_else(|e| panic!("{} fails validation: {e}", preset.name()));
-        }
-    }
-
-    #[test]
-    fn format_yaml_persistence_announces_missing_home() {
-        let s = format_yaml(Preset::Persistence, &PresetCtx::default()).unwrap();
-        assert!(s.contains("--home was not supplied"));
-        assert!(s.contains("file:"));
-        assert!(s.contains("/Library/LaunchAgents/"));
-    }
-
-    #[test]
-    fn format_yaml_persistence_with_home_omits_warning() {
-        let s = format_yaml(
-            Preset::Persistence,
-            &PresetCtx {
-                home: Some("/Users/alice".into()),
-            },
-        )
-        .unwrap();
-        assert!(!s.contains("--home was not supplied"));
-        assert!(s.contains("/Users/alice/.ssh/"));
-    }
-
-    #[test]
-    fn format_yaml_cloud_egress_mentions_proxy_pairing() {
-        let s = format_yaml(Preset::CloudSecretEgress, &PresetCtx::default()).unwrap();
-        assert!(s.contains("--network-allow"));
-        assert!(s.contains("169.254.169.254"));
-    }
-
-    #[test]
-    fn format_yaml_round_trips_as_loadable_policy() {
-        // What the CLI emits must parse back into a Policy via the
-        // same loader real users hit (`Policy::from_file` indirectly).
-        for preset in Preset::all() {
-            let yaml = format_yaml(
-                *preset,
-                &PresetCtx {
-                    home: Some("/h".into()),
-                },
-            )
-            .unwrap();
-            let parsed: Policy = serde_yaml::from_str(&yaml).expect("yaml parses as Policy");
-            // Validate against a permissive mode so the file-deny cap
-            // doesn't trip on the persistence preset (deliberately
-            // exceeds 8 — see module docs).
-            parsed
-                .validate(Mode::Audit)
-                .expect("rendered policy passes audit-mode validation");
-        }
+        assert_eq!(Preset::parse("nope"), None);
+        assert_eq!(Preset::Persistence.name(), "persistence");
+        assert_eq!(Preset::CloudSecretEgress.name(), "cloud-secret-egress");
     }
 }

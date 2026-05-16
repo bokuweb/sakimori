@@ -548,98 +548,134 @@ of value-per-implementation-cost.
     and install. Remaining follow-up: pnpm v11 SQLite + msgpackr-
     records reader (see above for the implementation footgun).
 15. **Lifecycle-script gate in the proxy** (Shai-Hulud-class
-    defence) — npm `preinstall` / `install` / `postinstall`,
-    pip build-backend hooks, and similar are the primary RCE
-    vector for worm-style supply-chain attacks (Shai-Hulud
-    1st/2nd wave, May 2026). `min-release-age` only narrows
-    the window; once a malicious version has aged past the
-    threshold, `npm install` still runs its postinstall. Add an
-    opt-in proxy flag `--lifecycle-policy <audit|block|strip>`
-    that inspects every fetched npm tarball's `package.json`
-    `scripts.{preinstall,install,postinstall,prepare}` and either
-    logs the script body (audit), refuses the fetch with 403
-    (block), or rewrites the tarball to remove those keys
-    (strip — equivalent to a per-package `--ignore-scripts`
-    without needing user buy-in across every install command).
-    Strip-mode is the interesting one: it lets a developer keep
-    using `npm install` without remembering the flag, and CI
-    builds that legitimately need a postinstall (e.g. native
-    addon compile) opt back in via a per-package allowlist
-    `--lifecycle-allow <name>[@<spec>]`. PyPI parallel: parse
-    `pyproject.toml` `build-system.build-backend` and flag
+    defence) — ✅ first slice implemented in `sakimori-proxy`.
+    New `sakimori proxy start --lifecycle-policy <audit|block>`
+    flag plus a repeatable `--lifecycle-allow <pkg>` for
+    legitimate native-addon exemptions (e.g. `sharp`, `bcrypt`).
+    `strip` is on the CLI for forward-compat but parses to a
+    distinct `StripNotImplemented` error today so users get a
+    helpful message instead of "unknown policy".
+
+    Implementation: `crates/sakimori-proxy/src/lifecycle.rs`
+    decodes the gzipped tarball, walks tar entries to find the
+    root `package/package.json` (nested `node_modules/*/package.json`
+    are deliberately ignored — bundled-dep scripts are a separate
+    threat model that lockfile pinning is supposed to cover),
+    parses `scripts.{preinstall,install,postinstall,prepare}`,
+    and returns an `Inspection { scripts: [...] }`. The
+    `ProxyHandler` captures `last_npm_tarball: (name, version)`
+    in `handle_request` for pinned npm tarball URLs and consults
+    it in `handle_response`: Audit mode logs script bodies and
+    passes the tarball through unchanged; Block mode returns 403
+    with `x-sakimori-deny: lifecycle-script` so npm never runs
+    the script. Bytes-don't-parse-as-gzip and `package.json`-
+    missing both fail open with a warning log — defence shouldn't
+    invent rejections for non-standard-but-legitimate artefacts.
+
+    Follow-ups: (a) `strip` mode — rewrite the tarball, drop the
+    scripts entries, regenerate gzip; equivalent to a per-package
+    `--ignore-scripts` without needing user buy-in across every
+    install command. Substantially larger because we have to
+    re-emit a valid tar+gz and the integrity hash npm later
+    consults must match the *original* sparse-index entry — the
+    proxy will also need to rewrite the packument's
+    `dist.integrity` for affected versions. (b) PyPI parallel —
+    parse `pyproject.toml` `build-system.build-backend` and flag
     non-stdlib backends; full strip there is harder because
     `setup.py` legacy projects can't be neutered without
     breaking install, so PyPI starts audit-only. Pairs naturally
     with `deps watch` — the proxy is the only layer that can
     catch the script *before* it runs.
 16. **Persistence-write rule pack** (Shai-Hulud-class defence) —
-    ✅ implemented as `sakimori policy preset persistence`. Renders
-    a `file.deny` YAML block covering OS-level persistence
-    locations: macOS launchd (`/Library/Launch{Agents,Daemons}/`,
-    `$HOME/Library/Launch{Agents,Daemons}/`), Linux systemd
-    (`/etc/systemd/system/`, `$HOME/.config/systemd/user/`,
-    `$HOME/.config/autostart/`), cron spool / drop-in dirs
-    (`/var/spool/cron/`, `/etc/cron.{d,hourly,daily,weekly,monthly}/`,
-    `/etc/init.d/`), SSH (`$HOME/.ssh/`), and shell rc / profile
-    files (`.bashrc`, `.bash_profile`, `.bash_logout`, `.profile`,
-    `.zshrc`, `.zprofile`, `.zshenv`). Per-user paths expand from
-    `$HOME` or `--home /path`; omitted home falls back to system
-    paths plus a comment noting the gap. The preset deliberately
-    exceeds the Linux 8-entry kernel cap on `file.deny` under
-    `mode: block` — the YAML header tells the operator to prune to
-    the 8 highest-value entries or use `mode: audit` (uncapped).
-    Workspace-relative paths (`.claude/setup.mjs`, `.vscode/tasks.json`)
-    are deliberately *not* in this preset — the file matcher is
-    absolute-prefix only, so those belong to the IOC workspace
-    scanner (item 18). Combined with the v0.23
+    ✅ first slice implemented as `sakimori policy preset
+    persistence`. Emits a ready-to-merge YAML block populating
+    `file.default: allow` + `file.deny: [...]` with the eight
+    highest-signal persistence paths: `~/.ssh/`,
+    `~/Library/LaunchAgents/`,
+    `/Library/Launch{Agents,Daemons}/`,
+    `~/.config/systemd/user/`, `/etc/systemd/system/`,
+    `~/.bashrc`, `~/.zshrc`. List size is bounded by the
+    kernel-side block cap (`FILE_DENY_MAX_ENTRIES = 8`) so the
+    output validates under `mode: block` without trimming. `$HOME`
+    is expanded at emit time (the policy parser does not expand
+    `~` itself) with a `--home` override for generating
+    cross-machine policies. `mode: audit` is the default in the
+    emitted YAML so users see what their build legitimately
+    touches before flipping to block. Commented-out follow-ups
+    (cron spool dirs, `.bash_profile`/`.zprofile`/`.profile`,
+    `.vscode/tasks.json`, `.claude/*.mjs`) document the gaps the
+    kernel cap forced — extend if you can spare slots.
+    Workspace-local hooks remain better surfaced by
+    `--snapshot-workspace` (#9). Combined with the v0.23
     attribution layer, a write to any of these paths from a
     package-manager-attributed subtree is the highest-confidence
-    "this install is malicious" signal sakimori can produce —
-    much stronger than a network event, because there is no
-    legitimate reason for `npm install` to touch
-    `~/Library/LaunchAgents/`. Block-mode SIGKILLs the writer.
+    "this install is malicious" signal sakimori can produce.
 17. **Cloud-credential exfiltration tripwire** (Shai-Hulud-class
-    defence) — ✅ first slice implemented as
-    `sakimori policy preset cloud-secret-egress`. Renders a
-    `network.deny` YAML block covering the link-local IMDS IP
-    (`169.254.169.254` — AWS / GCP / Azure all share it),
-    `metadata.google.internal`, `metadata.azure.com`, and
-    `sts.amazonaws.com`. `NetRule.target` is hostname/IP/CIDR
-    (no wildcards in the supervisor layer), so wildcarded
-    endpoints (`secretsmanager.*.amazonaws.com`,
-    `ssm.*.amazonaws.com`, regional STS variants) are not in
-    this preset — they'll land once the proxy gains a deny-list
-    HostMatcher and the preset learns to emit SNI patterns
-    alongside the cgroup-level rules. Follow-ups still on the
-    table: Vault default ports, crypto-wallet exfiltration
-    endpoints, and the "package-manager-attributed →
-    cloud_secret_egress" event category in the JSON log + step
-    summary (the proxy-side SNI deny pairing is the natural
-    pre-req for the latter).
+    defence) — ✅ first slice implemented as `sakimori policy
+    preset cloud-secret-egress`. Emits `network.default: allow` +
+    `network.deny: [...]` covering AWS/GCP/Azure IMDS
+    (`169.254.169.254`), `metadata.google.internal`,
+    `sts.amazonaws.com`, `secretsmanager.us-east-1.amazonaws.com`,
+    `ssm.us-east-1.amazonaws.com`, `vault.service.consul`, and
+    `vstoken.actions.githubusercontent.com` (the GHA OIDC token
+    mint). Regional AWS endpoints are intentionally explicit
+    rather than wildcard — `NetRule.target` does not support
+    middle-string wildcards and the SNI proxy grammar only accepts
+    leading `*.`. Pairs naturally with v0.33's SNI-based proxy
+    egress filter so the rule fires on the *hostname the client
+    asked for*, not a CDN-rotated IP. Follow-ups: surface
+    `cloud_secret_egress` as a distinct event category in the JSON
+    log + step summary when the offending PID's ancestor chain
+    matches a package manager (today it counts as a normal denied
+    connect); ship a richer wildcard pack via the proxy once
+    `*.amazonaws.com`-style entries can be ingested without a
+    NetRule grammar change.
 18. **Known-IOC workspace scanner** — ✅ first slice implemented as
-    `sakimori workspace scan-iocs <DIR>`. New
-    `sakimori_core::iocs` module walks the workspace honouring the
-    same skip list as `tamper` (`.git`, `node_modules`, `target`,
-    …) and reports hits against a bundled IOC catalog
-    (`crates/sakimori-core/iocs/coronarium-iocs.yml`, loaded via
-    `include_str!`). Pattern shapes: `relative_path` (exact-match
-    from the workspace root; cheap stat-only check) and `basename`
-    (basename anywhere in the tree; triggers the walk). Per-pattern
-    severity is `error` (fails the CLI with non-zero exit; gates
-    CI) or `warn` (surfaces only); operators suppress a triaged
-    false positive with `--allow-id <id>`. Custom feeds via
-    `--index <file>` (same schema). Hits are sorted stably by
-    `(pattern_id, path)` for snapshot-friendly output. Bundled
-    catalog seeded with two Shai-Hulud markers: the
-    `.claude/setup.mjs` drop (error) and the spoofed
-    `codeql_analysis.yml` (warn — real CodeQL workflows are
-    confusable). Follow-ups: content-fingerprint patterns (hash of
-    a known-bad blob), commit-author IOCs (the
-    `claude@users.noreply.github.com` worm marker — needs git
-    inspection, not just file walk), repo-name IOCs (the
-    dune-word-pattern names — needs GitHub API), and
-    `sakimori iocs update` to refresh the bundled YAML from an
-    upstream feed.
+    `sakimori-core::iocs` + two CLI surfaces:
+    - `sakimori workspace diff` now scans every added/modified path
+      against the bundled catalog by default (suppress with
+      `--no-check-iocs`). Findings render as a separate `❌ N
+      known-IOC hit(s)` block below the generic drift output and a
+      High-severity hit forces exit 1 even with `--allow-drift` —
+      the flag is meant for "I expect drift", not "I expect a
+      known-malicious fingerprint". JSON output gains an `iocs:
+      { catalog_version, findings: [...] }` object alongside the
+      existing diff fields.
+    - `sakimori workspace scan-iocs <dir>` is the standalone form —
+      walks the directory (honouring the same skip-list as
+      `snapshot`) and reports without needing a baseline. `--strict`
+      escalates Medium hits to exit 1.
+
+    Catalog (`CATALOG_VERSION = 2026.05.15`) covers the
+    high-confidence Shai-Hulud fingerprints (`.claude/setup.mjs`,
+    `shai-hulud-data.json`, `.github/workflows/shai-hulud-workflow.yml`
+    — all High) plus two Medium-severity generics
+    (`.github/workflows/codeql_analysis.yml`, basename `.npmrc` for
+    token-exfiltration / registry-redirection). Matching is
+    path-based with two kinds: `PathSuffix` (component-aligned, so
+    `.claude/setup.mjs` matches `subdir/.claude/setup.mjs` but not
+    `claude/setup.mjs`) and `Basename` (exact basename).
+
+    ✅ Wired into `sakimori run --snapshot-workspace` and `sakimori
+    daemon start --workspace-baseline …`: drift's added/modified
+    paths are scanned against the same catalog at shutdown,
+    findings surface in the JSON log under `workspace_iocs` and in
+    the step summary as a "❌ Known-IOC hits" table with severity
+    badges (🛑 HIGH / ⚠️ MED) and catalog version. A High-severity
+    hit forces exit 1 in *any* mode (Audit too) via a
+    `::error title=sakimori::known-IOC hit:` annotation — the
+    fingerprint is "this is a known supply-chain worm artefact",
+    not a policy call the user might want to override with
+    `--allow-drift`.
+
+    Remaining follow-ups: content-based fingerprints (suspicious
+    webhook URLs in `.npmrc`, dropper-signature bytes); the
+    `{dune_word}-{dune_word}-{3-digit}` repo-name and
+    authored-by-Claude commit indicators (both require GitHub API
+    rather than local file walk); `sakimori iocs update` for a
+    signed-YAML refresh path so the catalog can move faster than
+    the release cadence; HTML report integration (currently only
+    JSON + step summary).
 
 Explicitly **out of scope** (different product philosophy, not
 a missing feature):
