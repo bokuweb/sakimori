@@ -3,7 +3,6 @@ members = [
     "crates/sakimori",
     "crates/sakimori-common",
     "crates/sakimori-core",
-    "crates/sakimori-hub",
     "crates/sakimori-proxy",
 ]
 # NOTE: crates/sakimori-ebpf is built separately with a bpf target via xtask.

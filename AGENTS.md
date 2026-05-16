@@ -11,6 +11,16 @@ when acting on the repo.
 2. Skim `.github/workflows/ci.yml` to see what the smoke job
    asserts — if your change risks one of those assertions, flag it
    in the PR description.
+3. **Are you about to add `sakimori-hub` code here?** Stop.
+   `sakimori-hub` lives in the sibling repo
+   [`bokuweb/sakimori-hub`](https://github.com/bokuweb/sakimori-hub)
+   (local checkout: `../sakimori-hub`). It has its own deploy
+   target (Cloudflare Containers), its own deps, its own Cargo
+   workspace. This repo only owns the `InstallEvent` wire shape
+   and the `bokuweb/sakimori@v0` action that emits it.
+   A previous PR (#76) added `crates/sakimori-hub` here by
+   mistake and was reverted — if a future change tempts you to
+   re-add it, open it in the hub repo instead.
 
 ## Preferred workflow
 

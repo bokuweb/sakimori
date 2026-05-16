@@ -213,6 +213,18 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
    remains out of scope; sakimori-hub is "here's the server you
    can run yourself if you want push notifications across a team."
 
+   > **`sakimori-hub` lives in a separate repo: `bokuweb/sakimori-hub`
+   > (sibling directory `../sakimori-hub` in local checkouts).** Do
+   > NOT add hub code to this repo — the hub has its own deploy
+   > target (Cloudflare Containers), its own deps, and its own
+   > Cargo workspace. This repo (`sakimori`) only describes the
+   > `InstallEvent` wire shape the hub consumes and the
+   > `bokuweb/sakimori@v0` action that emits it; the hub
+   > implementation, schema, and migrations belong to the hub repo.
+   > A previous PR (#76) added `crates/sakimori-hub` here by
+   > mistake and was reverted — if a future change tempts you to
+   > re-add it, stop and open it in the hub repo instead.
+
    **Install inventory (`/ingest` + query API)** — beyond the
    advisory-JOIN path above, sakimori-hub is also the natural home
    for a **team-wide installed-package inventory**: every
