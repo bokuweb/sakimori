@@ -30,10 +30,23 @@ use sha2::{Digest, Sha256};
 
 use crate::tamper::DEFAULT_SKIP_DIRS;
 
-/// Bundled IOC index. Refreshed by editing
-/// `crates/sakimori-core/iocs/coronarium-iocs.yml`; a future
-/// `sakimori iocs update` will do this from an upstream feed.
+/// Bundled IOC index. Always present in the binary as a fallback;
+/// `sakimori iocs update` writes a refreshed copy to
+/// [`default_override_path`] which the scanner prefers when present.
 pub const BUNDLED_CATALOG_YAML: &str = include_str!("../iocs/coronarium-iocs.yml");
+
+/// User-writable IOC override location. Honoured by
+/// [`Catalog::load_with_fallback`]: present + parseable = used;
+/// absent or unparseable = fall back to bundled. Resolved from
+/// `$HOME` (or `$XDG_DATA_HOME` if set) at call time, not at
+/// compile time, so a test running with a tmp `HOME` doesn't
+/// accidentally read the developer's real cache.
+pub fn default_override_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".sakimori")))?;
+    Some(base.join("iocs.yml"))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -110,6 +123,39 @@ impl Catalog {
         Self::from_yaml(&text)
     }
 
+    /// Production loader: tries `override_path` first (typically the
+    /// `~/.sakimori/iocs.yml` cache written by `sakimori iocs update`),
+    /// falls back to the bundled catalog on any error. Returns the
+    /// catalog plus a `loaded_from` enum so the CLI can tell the user
+    /// which one is in effect.
+    ///
+    /// Fall-through on parse error is deliberate: a corrupted cache
+    /// (truncated download, malformed feed) must not brick the
+    /// scanner. The error is surfaced through `loaded_from` so the
+    /// caller can warn loudly without aborting.
+    pub fn load_with_fallback(override_path: Option<&Path>) -> (Self, LoadedFrom) {
+        if let Some(path) = override_path
+            && path.exists()
+        {
+            match Self::from_file(path) {
+                Ok(cat) => return (cat, LoadedFrom::Override(path.to_path_buf())),
+                Err(err) => {
+                    return (
+                        Self::bundled().expect("bundled catalog parses"),
+                        LoadedFrom::BundledAfterOverrideError {
+                            path: path.to_path_buf(),
+                            error: err.to_string(),
+                        },
+                    );
+                }
+            }
+        }
+        (
+            Self::bundled().expect("bundled catalog parses"),
+            LoadedFrom::Bundled,
+        )
+    }
+
     fn validate(&self) -> Result<()> {
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         for p in &self.patterns {
@@ -135,6 +181,78 @@ impl Catalog {
         }
         Ok(())
     }
+}
+
+/// Tells the CLI which on-disk source the catalog came from. Surfaced
+/// to the operator so a stale override that fails to parse can be
+/// noticed and fixed.
+#[derive(Debug, Clone)]
+pub enum LoadedFrom {
+    /// `BUNDLED_CATALOG_YAML` — the compile-time copy.
+    Bundled,
+    /// On-disk override (typically `~/.sakimori/iocs.yml`), parsed
+    /// cleanly.
+    Override(PathBuf),
+    /// On-disk override exists but failed to parse; the bundled
+    /// catalog was used as a fallback. Surface this loudly — the
+    /// override is silently stale until the operator fixes it.
+    BundledAfterOverrideError { path: PathBuf, error: String },
+}
+
+/// Fetcher abstraction so `update_from` can be unit-tested without a
+/// live HTTP request. Implementations: [`HttpFetcher`] for production,
+/// inline closures via [`FnFetcher`] for tests.
+pub trait Fetcher {
+    fn fetch(&self, url: &str) -> Result<String>;
+}
+
+pub struct HttpFetcher {
+    pub user_agent: String,
+}
+
+impl Fetcher for HttpFetcher {
+    fn fetch(&self, url: &str) -> Result<String> {
+        let resp = ureq::get(url)
+            .set("user-agent", &self.user_agent)
+            .call()
+            .with_context(|| format!("GET {url}"))?;
+        resp.into_string()
+            .with_context(|| format!("reading body from {url}"))
+    }
+}
+
+/// Test-friendly fetcher built from a closure.
+pub struct FnFetcher<F: Fn(&str) -> Result<String>>(pub F);
+impl<F: Fn(&str) -> Result<String>> Fetcher for FnFetcher<F> {
+    fn fetch(&self, url: &str) -> Result<String> {
+        (self.0)(url)
+    }
+}
+
+/// Fetch + validate + atomically write an IOC catalog. Returns the
+/// parsed catalog so the CLI can report the new version. The write is
+/// atomic (tempfile + rename) so a half-written cache can never leave
+/// a corrupted override on disk.
+///
+/// Validation happens *before* the write — a malformed upstream feed
+/// must not clobber a working local override.
+pub fn update_from(fetcher: &dyn Fetcher, url: &str, dest: &Path) -> Result<Catalog> {
+    let body = fetcher.fetch(url)?;
+    let cat = Catalog::from_yaml(&body)
+        .with_context(|| format!("fetched catalog from {url} did not validate"))?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating IOC cache dir {}", parent.display()))?;
+    }
+    // Atomic rename: write the validated bytes to a sibling tempfile
+    // first, then rename over the target. Rename is atomic within a
+    // filesystem on every platform we ship to.
+    let tmp = dest.with_extension("yml.tmp");
+    std::fs::write(&tmp, body.as_bytes())
+        .with_context(|| format!("writing temp {}", tmp.display()))?;
+    std::fs::rename(&tmp, dest)
+        .with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()))?;
+    Ok(cat)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -638,6 +756,97 @@ mod tests {
         // Plenty-large cap → hashes fine.
         let h = hash_file_capped(&f, 1024).expect("hash should succeed under the cap");
         assert_eq!(h.len(), 64);
+    }
+
+    #[test]
+    fn load_with_fallback_uses_bundled_when_no_override() {
+        let (cat, src) = Catalog::load_with_fallback(None);
+        assert!(!cat.patterns.is_empty());
+        assert!(matches!(src, LoadedFrom::Bundled));
+    }
+
+    #[test]
+    fn load_with_fallback_uses_override_when_present() {
+        let tmp = Tmp::new();
+        let path = tmp.0.join("iocs.yml");
+        fs::write(
+            &path,
+            "version: 42\npatterns:\n\
+             - id: just-one\n  description: t\n  severity: warn\n  \
+             match: {kind: basename, name: x}\n",
+        )
+        .unwrap();
+        let (cat, src) = Catalog::load_with_fallback(Some(&path));
+        assert_eq!(cat.version, 42);
+        assert_eq!(cat.patterns.len(), 1);
+        assert!(matches!(src, LoadedFrom::Override(p) if p == path));
+    }
+
+    #[test]
+    fn load_with_fallback_falls_back_on_parse_error_and_surfaces_it() {
+        // A corrupted override must not brick the scanner: bundled
+        // must still load, and the error has to be visible in
+        // LoadedFrom so the CLI can warn.
+        let tmp = Tmp::new();
+        let path = tmp.0.join("iocs.yml");
+        fs::write(&path, "this: [is, not: valid yaml at all").unwrap();
+        let (cat, src) = Catalog::load_with_fallback(Some(&path));
+        assert!(!cat.patterns.is_empty(), "bundled fallback must populate");
+        match src {
+            LoadedFrom::BundledAfterOverrideError { path: p, error } => {
+                assert_eq!(p, path);
+                assert!(!error.is_empty());
+            }
+            other => panic!("expected BundledAfterOverrideError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_from_writes_only_valid_upstream() {
+        let tmp = Tmp::new();
+        let dest = tmp.0.join("nested/iocs.yml"); // exercise mkdir
+        let upstream = "version: 7\npatterns:\n\
+                        - id: from-upstream\n  description: t\n  severity: error\n  \
+                        match: {kind: basename, name: y.js}\n";
+        let fetcher = FnFetcher(|_| Ok(upstream.to_string()));
+        let cat = update_from(&fetcher, "https://example.invalid/iocs.yml", &dest).unwrap();
+        assert_eq!(cat.version, 7);
+        // File on disk matches what we fetched.
+        let on_disk = fs::read_to_string(&dest).unwrap();
+        assert_eq!(on_disk, upstream);
+    }
+
+    #[test]
+    fn update_from_rejects_invalid_upstream_without_clobbering_existing() {
+        // Pre-existing good override + a bad upstream → the override
+        // is preserved untouched. This is the "don't trust the feed"
+        // safety we documented in update_from.
+        let tmp = Tmp::new();
+        let dest = tmp.0.join("iocs.yml");
+        let good = "version: 1\npatterns:\n\
+                    - id: keep-me\n  description: t\n  severity: warn\n  \
+                    match: {kind: basename, name: a}\n";
+        fs::write(&dest, good).unwrap();
+
+        let fetcher = FnFetcher(|_| Ok("this is not yaml: : :".to_string()));
+        let err = update_from(&fetcher, "https://example.invalid", &dest).unwrap_err();
+        // Either the YAML parser or the sha256 validator should refuse it.
+        assert!(format!("{err:#}").contains("validate") || format!("{err:#}").contains("parsing"));
+
+        // Original file is intact (atomic write means we never touched
+        // it because validation failed before the tempfile was renamed).
+        let after = fs::read_to_string(&dest).unwrap();
+        assert_eq!(after, good, "valid override must survive a failed update");
+    }
+
+    #[test]
+    fn update_from_surfaces_fetcher_errors() {
+        let tmp = Tmp::new();
+        let dest = tmp.0.join("iocs.yml");
+        let fetcher = FnFetcher(|_| Err(anyhow::anyhow!("network down")));
+        let err = update_from(&fetcher, "https://x", &dest).unwrap_err();
+        assert!(format!("{err:#}").contains("network down"));
+        assert!(!dest.exists(), "no file should be written on fetch failure");
     }
 
     #[test]

@@ -153,6 +153,40 @@ pub enum Command {
         #[command(subcommand)]
         cmd: AdvisoriesCommand,
     },
+    /// Manage the on-disk IOC catalog override used by
+    /// `workspace scan-iocs`. The bundled catalog ships in the
+    /// binary; `iocs update <url>` fetches a refreshed feed and
+    /// writes it to `~/.sakimori/iocs.yml`, where the scanner
+    /// picks it up automatically. A malformed feed never clobbers a
+    /// working override (validation runs before the atomic write).
+    Iocs {
+        #[command(subcommand)]
+        cmd: IocsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IocsCommand {
+    /// Fetch a YAML IOC catalog from `url`, validate it, and write
+    /// it to the local override path (defaults to
+    /// `~/.sakimori/iocs.yml`). Subsequent `workspace scan-iocs`
+    /// runs use the refreshed catalog automatically.
+    Update(IocsUpdateArgs),
+    /// Print which catalog the scanner will use right now (override
+    /// path, bundled, or override-failed-falling-back-to-bundled)
+    /// and the pattern count. Useful for confirming an `iocs update`
+    /// actually took effect.
+    Where,
+}
+
+#[derive(Debug, Parser)]
+pub struct IocsUpdateArgs {
+    /// URL to fetch. Anything `ureq` can GET — typically https.
+    pub url: String,
+    /// Destination file. Defaults to the same path
+    /// `workspace scan-iocs` reads (`~/.sakimori/iocs.yml`).
+    #[arg(long, short = 'o', value_name = "FILE")]
+    pub output: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1081,6 +1115,12 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Advisories {
             cmd: AdvisoriesCommand::Scan(args),
         } => run_advisories_scan(args),
+        Command::Iocs {
+            cmd: IocsCommand::Update(args),
+        } => run_iocs_update(args),
+        Command::Iocs {
+            cmd: IocsCommand::Where,
+        } => run_iocs_where(),
     }
 }
 
@@ -1233,11 +1273,25 @@ fn run_workspace_diff(args: WorkspaceDiffArgs) -> Result<()> {
 }
 
 fn run_workspace_scan_iocs(args: WorkspaceScanIocsArgs) -> Result<()> {
+    use sakimori_core::iocs::{Catalog, LoadedFrom, default_override_path};
     use std::collections::BTreeSet;
-    let catalog = match &args.index {
-        Some(p) => sakimori_core::iocs::Catalog::from_file(p)?,
-        None => sakimori_core::iocs::Catalog::bundled()?,
+    let (catalog, loaded_from) = match &args.index {
+        // Explicit --index bypasses the override-fallback chain
+        // entirely: when the operator says "use this file," surfacing
+        // a silent bundled fallback would be wrong.
+        Some(p) => (Catalog::from_file(p)?, LoadedFrom::Override(p.clone())),
+        None => Catalog::load_with_fallback(default_override_path().as_deref()),
     };
+    // Loud one-line warning when an override exists but failed to
+    // parse — the operator must know they're getting bundled defaults
+    // instead of their fresh feed.
+    if let LoadedFrom::BundledAfterOverrideError { path, error } = &loaded_from {
+        eprintln!(
+            "sakimori: warning: IOC override at {} failed to parse ({}); using bundled catalog",
+            path.display(),
+            error,
+        );
+    }
     let allow: BTreeSet<String> = args.allow_id.into_iter().collect();
     let report = sakimori_core::iocs::scan(&args.dir, &catalog, &allow)?;
 
@@ -1269,6 +1323,66 @@ fn run_workspace_scan_iocs(args: WorkspaceScanIocsArgs) -> Result<()> {
 
     if report.has_error() {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_iocs_update(args: IocsUpdateArgs) -> Result<()> {
+    use sakimori_core::iocs::{HttpFetcher, default_override_path, update_from};
+    let dest = match args.output {
+        Some(p) => p,
+        None => default_override_path().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot resolve default IOC override path: neither $XDG_DATA_HOME nor $HOME is set. \
+                 Pass --output explicitly."
+            )
+        })?,
+    };
+    let fetcher = HttpFetcher {
+        user_agent: format!("sakimori/{}", env!("CARGO_PKG_VERSION")),
+    };
+    let cat = update_from(&fetcher, &args.url, &dest)?;
+    eprintln!(
+        "sakimori: wrote IOC catalog v{} ({} pattern(s)) to {}",
+        cat.version,
+        cat.patterns.len(),
+        dest.display(),
+    );
+    Ok(())
+}
+
+fn run_iocs_where() -> Result<()> {
+    use sakimori_core::iocs::{Catalog, LoadedFrom, default_override_path};
+    let override_path = default_override_path();
+    let (cat, src) = Catalog::load_with_fallback(override_path.as_deref());
+    match src {
+        LoadedFrom::Override(p) => {
+            println!(
+                "override (v{}, {} pattern(s)) — {}",
+                cat.version,
+                cat.patterns.len(),
+                p.display()
+            );
+        }
+        LoadedFrom::Bundled => {
+            println!(
+                "bundled (v{}, {} pattern(s)){}",
+                cat.version,
+                cat.patterns.len(),
+                override_path
+                    .map(|p| format!(" — no override at {}", p.display()))
+                    .unwrap_or_default(),
+            );
+        }
+        LoadedFrom::BundledAfterOverrideError { path, error } => {
+            println!(
+                "bundled (v{}, {} pattern(s)) — override at {} failed to parse: {}",
+                cat.version,
+                cat.patterns.len(),
+                path.display(),
+                error,
+            );
+        }
     }
     Ok(())
 }

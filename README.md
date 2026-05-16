@@ -782,6 +782,17 @@ sakimori workspace scan-iocs $GITHUB_WORKSPACE
 sakimori workspace scan-iocs . --json
 ```
 
+**Refreshing the IOC catalog:** `sakimori iocs update <url>` fetches
+a refreshed catalog (same YAML schema) from an upstream feed,
+validates it, and atomically writes it to
+`~/.sakimori/iocs.yml` (override `--output`). The scanner picks
+the override up automatically on the next run. Run
+`sakimori iocs where` to confirm which catalog is in effect; a
+corrupted override is detected and the scanner falls back to the
+bundled copy with a loud warning, never silently. Validation runs
+before the atomic rename — a malformed feed cannot clobber a
+working override on disk.
+
 The HTML report includes:
 - verdict (ALLOW / DENY), kind, pid, comm
 - **host column** (PTR-resolved reverse DNS for connect events)
