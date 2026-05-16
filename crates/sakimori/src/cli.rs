@@ -393,6 +393,30 @@ pub enum PolicyCommand {
     /// block so you can pick which to deny — the suggester never
     /// auto-populates `process.deny_exec`.
     Suggest(PolicySuggestArgs),
+    /// Emit a curated rule pack for a known supply-chain attack
+    /// pattern (persistence-write, cloud-secret egress, ...) as a
+    /// ready-to-merge YAML block. See `--help` for the available
+    /// preset names.
+    Preset(PolicyPresetArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct PolicyPresetArgs {
+    /// Preset name. Known values:
+    ///   `persistence` — file.deny tripwire for launchd / systemd /
+    ///   cron / shell-rc / ~/.ssh.
+    ///   `cloud-secret-egress` — network.deny tripwire for cloud
+    ///   metadata services (AWS / GCP / Azure IMDS + STS).
+    pub name: String,
+    /// Where to write the rendered policy. Defaults to stdout.
+    #[arg(long, short = 'o')]
+    pub output: Option<PathBuf>,
+    /// Home directory used to expand `~/.ssh` etc. into absolute
+    /// paths. Defaults to `$HOME`. Only consulted by the
+    /// `persistence` preset; omitted entries cause the corresponding
+    /// per-user paths to be skipped.
+    #[arg(long, value_name = "PATH")]
+    pub home: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -1011,6 +1035,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Policy {
             cmd: PolicyCommand::Suggest(args),
         } => run_policy_suggest(args),
+        Command::Policy {
+            cmd: PolicyCommand::Preset(args),
+        } => run_policy_preset(args),
         Command::Actions {
             cmd: ActionsCommand::Audit(args),
         } => run_actions_audit(args),
@@ -1519,6 +1546,30 @@ fn run_policy_suggest(args: PolicySuggestArgs) -> Result<()> {
             std::fs::write(&path, yaml)
                 .with_context(|| format!("writing suggested policy to {}", path.display()))?;
             eprintln!("sakimori: wrote suggested policy to {}", path.display());
+        }
+        None => print!("{yaml}"),
+    }
+    Ok(())
+}
+
+fn run_policy_preset(args: PolicyPresetArgs) -> Result<()> {
+    use std::str::FromStr;
+    let preset = sakimori_core::presets::Preset::from_str(&args.name)?;
+    let home = args
+        .home
+        .map(|p| p.to_string_lossy().into_owned())
+        .or_else(|| std::env::var("HOME").ok());
+    let ctx = sakimori_core::presets::PresetCtx { home };
+    let yaml = sakimori_core::presets::format_yaml(preset, &ctx)?;
+    match args.output {
+        Some(path) => {
+            std::fs::write(&path, yaml)
+                .with_context(|| format!("writing preset policy to {}", path.display()))?;
+            eprintln!(
+                "sakimori: wrote preset `{}` to {}",
+                preset.name(),
+                path.display()
+            );
         }
         None => print!("{yaml}"),
     }

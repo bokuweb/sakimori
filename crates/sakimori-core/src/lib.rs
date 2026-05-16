@@ -20,6 +20,7 @@ pub mod html;
 pub mod installs;
 pub mod matcher;
 pub mod policy;
+pub mod presets;
 pub mod report;
 pub mod stats;
 pub mod suggest;

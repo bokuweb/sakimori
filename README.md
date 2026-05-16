@@ -745,6 +745,25 @@ commented `# observed_exec:` block — `process.deny_exec` is
 deliberately left empty because the suggester can't know which of
 the binaries the build actually wanted.
 
+**Curated rule packs (`policy preset`):** ready-to-merge YAML blocks
+for known supply-chain attack patterns. Currently shipped:
+
+- `sakimori policy preset persistence` — `file.deny` tripwire for
+  OS-level persistence writes (launchd / systemd / cron / shell rc
+  / `~/.ssh`). Per-user paths expand from `$HOME` (override with
+  `--home /path`); system paths always included.
+- `sakimori policy preset cloud-secret-egress` — `network.deny`
+  tripwire for AWS / GCP / Azure IMDS and STS-style secret
+  endpoints. Pairs with `sakimori proxy start --network-allow ...`
+  for SNI-level enforcement.
+
+Both presets print to stdout (or `-o policy.yml`) with explanatory
+comment headers so the operator can pick the entries that fit their
+threat model and merge into an existing policy. The persistence
+preset deliberately exceeds the Linux 8-entry kernel cap on
+`file.deny` under `mode: block` — prune to the most critical
+locations, or keep the full list under `mode: audit` (uncapped).
+
 The HTML report includes:
 - verdict (ALLOW / DENY), kind, pid, comm
 - **host column** (PTR-resolved reverse DNS for connect events)
