@@ -130,7 +130,18 @@ impl ScanReport {
 /// Walk `root` and report every IOC that matches. `allow_ids` is a
 /// set of pattern ids the caller has already triaged as false
 /// positives — they're skipped silently.
+///
+/// Errors when `root` does not exist or is not a directory. The
+/// loud failure is deliberate: a CI gate fed a stale or mistyped
+/// `$GITHUB_WORKSPACE` would otherwise see "0 hits, exit 0" and
+/// silently pass — exactly the worst behaviour for a tool whose
+/// job is to fail noisy.
 pub fn scan(root: &Path, catalog: &Catalog, allow_ids: &BTreeSet<String>) -> Result<ScanReport> {
+    let meta = std::fs::metadata(root)
+        .with_context(|| format!("scan root {} is not accessible", root.display()))?;
+    if !meta.is_dir() {
+        anyhow::bail!("scan root {} exists but is not a directory", root.display());
+    }
     let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let skip: BTreeSet<&str> = DEFAULT_SKIP_DIRS.iter().copied().collect();
 
@@ -342,6 +353,32 @@ mod tests {
         assert_eq!(report.hits.len(), 1, "must skip node_modules/");
         assert!(report.hits[0].path.starts_with("src/"));
         assert!(!report.has_error(), "warn-only hits don't gate CI");
+    }
+
+    #[test]
+    fn nonexistent_root_errors_loudly_not_silently_clean() {
+        // Regression for the codex review finding: a CI gate fed
+        // an unset / mistyped $GITHUB_WORKSPACE must fail loudly,
+        // not return "0 hits, exit 0".
+        let cat = Catalog::bundled().unwrap();
+        let err = scan(
+            Path::new("/definitely/does/not/exist/sakimori-iocs-test"),
+            &cat,
+            &BTreeSet::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not accessible"), "got: {err}");
+    }
+
+    #[test]
+    fn file_root_errors_not_silently_clean() {
+        let tmp = Tmp::new();
+        let f = tmp.0.join("not-a-dir.txt");
+        fs::write(&f, b"x").unwrap();
+        let cat = Catalog::bundled().unwrap();
+        let err = scan(&f, &cat, &BTreeSet::new()).unwrap_err().to_string();
+        assert!(err.contains("not a directory"), "got: {err}");
     }
 
     #[test]
