@@ -37,15 +37,35 @@ pub const BUNDLED_CATALOG_YAML: &str = include_str!("../iocs/coronarium-iocs.yml
 
 /// User-writable IOC override location. Honoured by
 /// [`Catalog::load_with_fallback`]: present + parseable = used;
-/// absent or unparseable = fall back to bundled. Resolved from
-/// `$HOME` (or `$XDG_DATA_HOME` if set) at call time, not at
-/// compile time, so a test running with a tmp `HOME` doesn't
+/// absent or unparseable = fall back to bundled. Resolved at call
+/// time, not compile time, so tests with a tmp `HOME` don't
 /// accidentally read the developer's real cache.
+///
+/// Resolution order (first hit wins):
+/// 1. `$XDG_DATA_HOME/sakimori/iocs.yml` (Linux/XDG-aware setups)
+/// 2. `$HOME/.sakimori/iocs.yml` (macOS + traditional Unix)
+/// 3. `%LOCALAPPDATA%\sakimori\iocs.yml` (Windows, matches the
+///    convention already used by `deps verify-cache` for the npm
+///    cacache root)
+/// 4. `%USERPROFILE%\.sakimori\iocs.yml` (Windows last-resort —
+///    older shells / Cygwin-like envs where LOCALAPPDATA is unset)
+///
+/// Returns `None` only when every candidate env var is unset, in
+/// which case the CLI tells the operator to pass `--output`.
 pub fn default_override_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".sakimori")))?;
-    Some(base.join("iocs.yml"))
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        return Some(PathBuf::from(xdg).join("sakimori").join("iocs.yml"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return Some(PathBuf::from(home).join(".sakimori").join("iocs.yml"));
+    }
+    if let Some(la) = std::env::var_os("LOCALAPPDATA") {
+        return Some(PathBuf::from(la).join("sakimori").join("iocs.yml"));
+    }
+    if let Some(up) = std::env::var_os("USERPROFILE") {
+        return Some(PathBuf::from(up).join(".sakimori").join("iocs.yml"));
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -756,6 +776,110 @@ mod tests {
         // Plenty-large cap → hashes fine.
         let h = hash_file_capped(&f, 1024).expect("hash should succeed under the cap");
         assert_eq!(h.len(), 64);
+    }
+
+    /// Drives `default_override_path` with a known env state to
+    /// exercise the resolution order without depending on the
+    /// developer machine's real env. Each candidate gets `var` (set
+    /// to a tmp value) or `remove`d for the test.
+    ///
+    /// `std::env::set_var` is process-global and `cargo test` runs
+    /// these in parallel, so we serialise via a mutex.
+    fn run_with_env(env: &[(&str, Option<&str>)], f: impl FnOnce()) {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let to_restore: Vec<(&str, Option<std::ffi::OsString>)> =
+            env.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
+        for (k, v) in env {
+            match v {
+                Some(val) => unsafe { std::env::set_var(k, val) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        f();
+        for (k, v) in to_restore {
+            match v {
+                Some(val) => unsafe { std::env::set_var(k, val) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
+
+    #[test]
+    fn default_override_path_resolution_order() {
+        // XDG wins when set.
+        run_with_env(
+            &[
+                ("XDG_DATA_HOME", Some("/xdg")),
+                ("HOME", Some("/home")),
+                ("LOCALAPPDATA", Some("C:/la")),
+                ("USERPROFILE", Some("C:/up")),
+            ],
+            || {
+                assert_eq!(
+                    default_override_path(),
+                    Some(PathBuf::from("/xdg/sakimori/iocs.yml"))
+                );
+            },
+        );
+        // HOME wins over Windows vars when XDG is unset.
+        run_with_env(
+            &[
+                ("XDG_DATA_HOME", None),
+                ("HOME", Some("/home")),
+                ("LOCALAPPDATA", Some("C:/la")),
+                ("USERPROFILE", Some("C:/up")),
+            ],
+            || {
+                assert_eq!(
+                    default_override_path(),
+                    Some(PathBuf::from("/home/.sakimori/iocs.yml"))
+                );
+            },
+        );
+        // Windows path: LOCALAPPDATA preferred over USERPROFILE.
+        run_with_env(
+            &[
+                ("XDG_DATA_HOME", None),
+                ("HOME", None),
+                ("LOCALAPPDATA", Some("C:/la")),
+                ("USERPROFILE", Some("C:/up")),
+            ],
+            || {
+                assert_eq!(
+                    default_override_path(),
+                    Some(PathBuf::from("C:/la/sakimori/iocs.yml"))
+                );
+            },
+        );
+        // USERPROFILE last-resort.
+        run_with_env(
+            &[
+                ("XDG_DATA_HOME", None),
+                ("HOME", None),
+                ("LOCALAPPDATA", None),
+                ("USERPROFILE", Some("C:/up")),
+            ],
+            || {
+                assert_eq!(
+                    default_override_path(),
+                    Some(PathBuf::from("C:/up/.sakimori/iocs.yml"))
+                );
+            },
+        );
+        // Nothing → None.
+        run_with_env(
+            &[
+                ("XDG_DATA_HOME", None),
+                ("HOME", None),
+                ("LOCALAPPDATA", None),
+                ("USERPROFILE", None),
+            ],
+            || {
+                assert_eq!(default_override_path(), None);
+            },
+        );
     }
 
     #[test]
