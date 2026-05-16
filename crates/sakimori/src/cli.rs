@@ -294,6 +294,28 @@ pub enum WorkspaceCommand {
     /// files. Exits non-zero when there's any drift (suppress with
     /// `--allow-drift`).
     Diff(WorkspaceDiffArgs),
+    /// Scan a directory against the bundled known-IOC index and
+    /// report any matching files (Shai-Hulud-class fingerprints).
+    /// Exits non-zero on any Error-severity hit; Warn-severity hits
+    /// surface but don't gate. Use `--allow-id` to suppress a
+    /// pattern the operator has already triaged as benign.
+    ScanIocs(WorkspaceScanIocsArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct WorkspaceScanIocsArgs {
+    /// Directory to scan.
+    pub dir: PathBuf,
+    /// Override the bundled IOC catalog with a custom YAML file
+    /// (same schema as `crates/sakimori-core/iocs/coronarium-iocs.yml`).
+    #[arg(long, value_name = "FILE")]
+    pub index: Option<PathBuf>,
+    /// Suppress a specific pattern by id. Repeatable.
+    #[arg(long = "allow-id", value_name = "ID")]
+    pub allow_id: Vec<String>,
+    /// Emit machine-readable JSON instead of the default text report.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -1047,6 +1069,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Workspace {
             cmd: WorkspaceCommand::Diff(args),
         } => run_workspace_diff(args),
+        Command::Workspace {
+            cmd: WorkspaceCommand::ScanIocs(args),
+        } => run_workspace_scan_iocs(args),
         Command::Daemon {
             cmd: DaemonCommand::Start(args),
         } => run_daemon_start(args).await,
@@ -1202,6 +1227,47 @@ fn run_workspace_diff(args: WorkspaceDiffArgs) -> Result<()> {
     }
 
     if !dif.is_clean() && !args.allow_drift {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_workspace_scan_iocs(args: WorkspaceScanIocsArgs) -> Result<()> {
+    use std::collections::BTreeSet;
+    let catalog = match &args.index {
+        Some(p) => sakimori_core::iocs::Catalog::from_file(p)?,
+        None => sakimori_core::iocs::Catalog::bundled()?,
+    };
+    let allow: BTreeSet<String> = args.allow_id.into_iter().collect();
+    let report = sakimori_core::iocs::scan(&args.dir, &catalog, &allow)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.is_clean() {
+        eprintln!(
+            "sakimori: scanned {} — no known IOCs matched (catalog v{}, {} pattern(s))",
+            report.root.display(),
+            catalog.version,
+            catalog.patterns.len(),
+        );
+    } else {
+        eprintln!(
+            "sakimori: {} IOC hit(s) in {} (catalog v{})\n",
+            report.hits.len(),
+            report.root.display(),
+            catalog.version,
+        );
+        for h in &report.hits {
+            let tag = match h.severity {
+                sakimori_core::iocs::Severity::Error => "ERROR",
+                sakimori_core::iocs::Severity::Warn => "WARN ",
+            };
+            println!("[{}] {}  {}", tag, h.pattern_id, h.path);
+            println!("        {}", h.description.replace('\n', " "));
+        }
+    }
+
+    if report.has_error() {
         std::process::exit(1);
     }
     Ok(())

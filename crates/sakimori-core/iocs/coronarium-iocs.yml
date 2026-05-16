@@ -1,0 +1,41 @@
+# Known-IOC index for `sakimori workspace scan-iocs`.
+#
+# Each pattern surfaces a specific file fingerprint observed in active
+# supply-chain worm campaigns. Conservatively scoped: a hit means
+# *this file's existence is a known compromise marker*, not "this file
+# looks suspicious." We do not auto-quarantine; the CLI just reports
+# and exits non-zero.
+#
+# When a known-good repo legitimately has one of these files (rare —
+# e.g. a real `.github/workflows/codeql_analysis.yml` actually used
+# for CodeQL scanning), pass `--allow-id <id>` to suppress it.
+#
+# Bumping `version` triggers no client behaviour today; it exists so
+# a future `sakimori iocs update` can compare local vs. upstream.
+
+version: 1
+
+patterns:
+  - id: shai-hulud-claude-setup
+    description: >-
+      Shai-Hulud npm worm (May 2026) drop site. The malicious
+      postinstall writes `.claude/setup.mjs` to the workspace so the
+      next Claude Code invocation auto-executes attacker code. No
+      legitimate Claude Code workflow places a setup.mjs at this
+      path.
+    severity: error
+    match:
+      kind: relative_path
+      path: .claude/setup.mjs
+
+  - id: shai-hulud-fake-codeql-workflow
+    description: >-
+      Shai-Hulud second wave — drops a workflow file masquerading as
+      a CodeQL analysis job (`codeql_analysis.yml`) that actually
+      exfiltrates `secrets.*` to an attacker-controlled webhook.
+      Real CodeQL workflows are usually named `codeql.yml` and call
+      `github/codeql-action/*`; review carefully before suppressing.
+    severity: warn
+    match:
+      kind: relative_path
+      path: .github/workflows/codeql_analysis.yml

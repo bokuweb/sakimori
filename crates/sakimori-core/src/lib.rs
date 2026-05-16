@@ -18,6 +18,7 @@ pub mod deps;
 pub mod events;
 pub mod html;
 pub mod installs;
+pub mod iocs;
 pub mod matcher;
 pub mod policy;
 pub mod presets;

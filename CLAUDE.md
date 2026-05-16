@@ -616,22 +616,30 @@ of value-per-implementation-cost.
     cloud_secret_egress" event category in the JSON log + step
     summary (the proxy-side SNI deny pairing is the natural
     pre-req for the latter).
-18. **Known-IOC workspace scanner** — extend `coronarium
-    workspace diff` (and `sakimori run --snapshot-workspace`)
-    with a known-bad-path index of file paths and content
-    fingerprints observed in current supply-chain worm campaigns:
-    `.claude/setup.mjs`, `.github/workflows/codeql_analysis.yml`
-    (when the repo doesn't legitimately use CodeQL),
-    `{dune_word}-{dune_word}-{3-digit}` repo names created via
-    the GitHub API during install, and authored-by
-    `claude <claude@users.noreply.github.com>` commits where the
-    user did not invoke Claude. Distinct from the generic
-    workspace-drift check because it elevates specific drift
-    patterns from "something changed" to "this is the Shai-Hulud
-    fingerprint". The index ships as a versioned YAML
-    (`coronarium-iocs.yml`) bundled with the binary, refreshable
-    by `coronarium iocs update`. Conservatively scoped: hits
-    surface as ❌ in the step summary; no auto-quarantine.
+18. **Known-IOC workspace scanner** — ✅ first slice implemented as
+    `sakimori workspace scan-iocs <DIR>`. New
+    `sakimori_core::iocs` module walks the workspace honouring the
+    same skip list as `tamper` (`.git`, `node_modules`, `target`,
+    …) and reports hits against a bundled IOC catalog
+    (`crates/sakimori-core/iocs/coronarium-iocs.yml`, loaded via
+    `include_str!`). Pattern shapes: `relative_path` (exact-match
+    from the workspace root; cheap stat-only check) and `basename`
+    (basename anywhere in the tree; triggers the walk). Per-pattern
+    severity is `error` (fails the CLI with non-zero exit; gates
+    CI) or `warn` (surfaces only); operators suppress a triaged
+    false positive with `--allow-id <id>`. Custom feeds via
+    `--index <file>` (same schema). Hits are sorted stably by
+    `(pattern_id, path)` for snapshot-friendly output. Bundled
+    catalog seeded with two Shai-Hulud markers: the
+    `.claude/setup.mjs` drop (error) and the spoofed
+    `codeql_analysis.yml` (warn — real CodeQL workflows are
+    confusable). Follow-ups: content-fingerprint patterns (hash of
+    a known-bad blob), commit-author IOCs (the
+    `claude@users.noreply.github.com` worm marker — needs git
+    inspection, not just file walk), repo-name IOCs (the
+    dune-word-pattern names — needs GitHub API), and
+    `sakimori iocs update` to refresh the bundled YAML from an
+    upstream feed.
 
 Explicitly **out of scope** (different product philosophy, not
 a missing feature):

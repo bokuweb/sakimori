@@ -766,6 +766,22 @@ enforce, prune to your 8 most critical paths and flip the `mode:`
 field to `block`. The cloud-secret-egress preset ships in
 `mode: block` (no cap on `network.deny`).
 
+**Known-IOC workspace scan (`workspace scan-iocs`):** walk a
+workspace and flag files whose existence is a known supply-chain
+compromise marker (e.g. `.claude/setup.mjs` dropped by the
+Shai-Hulud npm worm). Distinct from `workspace diff` — diff catches
+"something changed during the build," scan-iocs catches "this file
+exists at all, which it shouldn't." The catalog is shipped bundled
+in the binary (versioned YAML); override with `--index <file>` for
+private feeds, suppress a triaged false positive with `--allow-id
+<id>`. Exits non-zero on any Error-severity hit so it composes with
+CI gates; Warn-severity hits surface but don't gate.
+
+```bash
+sakimori workspace scan-iocs $GITHUB_WORKSPACE
+sakimori workspace scan-iocs . --json
+```
+
 The HTML report includes:
 - verdict (ALLOW / DENY), kind, pid, comm
 - **host column** (PTR-resolved reverse DNS for connect events)
