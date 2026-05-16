@@ -216,8 +216,9 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
    > **`sakimori-hub` lives in a separate repo: `bokuweb/sakimori-hub`
    > (sibling directory `../sakimori-hub` in local checkouts).** Do
    > NOT add hub code to this repo — the hub has its own deploy
-   > target (Cloudflare Containers), its own deps, and its own
-   > Cargo workspace. This repo (`sakimori`) only describes the
+   > target (Cloudflare Workers + D1 + R2 + Queues, IaC via
+   > Alchemy v2), its own deps (WASM-compatible — `worker-rs`,
+   > argon2, ed25519-dalek), and its own Cargo workspace. This repo (`sakimori`) only describes the
    > `InstallEvent` wire shape the hub consumes and the
    > `bokuweb/sakimori@v0` action that emits it; the hub
    > implementation, schema, and migrations belong to the hub repo.

@@ -15,8 +15,8 @@ when acting on the repo.
    `sakimori-hub` lives in the sibling repo
    [`bokuweb/sakimori-hub`](https://github.com/bokuweb/sakimori-hub)
    (local checkout: `../sakimori-hub`). It has its own deploy
-   target (Cloudflare Containers), its own deps, its own Cargo
-   workspace. This repo only owns the `InstallEvent` wire shape
+   target (Cloudflare Workers + D1 + R2 + Queues via Alchemy v2),
+   its own WASM-compatible deps, its own Cargo workspace. This repo only owns the `InstallEvent` wire shape
    and the `bokuweb/sakimori@v0` action that emits it.
    A previous PR (#76) added `crates/sakimori-hub` here by
    mistake and was reverted — if a future change tempts you to
