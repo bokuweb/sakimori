@@ -98,9 +98,21 @@ pub struct PresetCtx {
 }
 
 /// Build the [`Policy`] for the requested preset.
+///
+/// The persistence preset is rendered in `mode: audit` because its
+/// `file.deny` list deliberately exceeds the kernel-side 8-entry cap
+/// — emitting `mode: block` would produce a policy that fails the
+/// project's own [`Policy::validate`]. The header in
+/// [`format_yaml`] tells the operator to flip to `mode: block` only
+/// after pruning to the cap. The cloud-secret-egress preset stays in
+/// `mode: block` (no equivalent cap on `network.deny`).
 pub fn build(preset: Preset, ctx: &PresetCtx) -> Policy {
+    let mode = match preset {
+        Preset::Persistence => Mode::Audit,
+        Preset::CloudSecretEgress => Mode::Block,
+    };
     let mut policy = Policy {
-        mode: Mode::Block,
+        mode,
         network: NetworkPolicy {
             default: DefaultDecision::Allow,
             allow: Vec::new(),
@@ -222,9 +234,10 @@ pub fn format_yaml(preset: Preset, ctx: &PresetCtx) -> Result<String> {
                 );
             }
             out.push_str(
-                "# Kernel-side block (Linux) caps file.deny at 8 entries — prune to your \
-                 8 most critical\n# locations under `mode: block`, or keep the full list \
-                 under `mode: audit` (uncapped).\n",
+                "# Emitted as `mode: audit` because the Linux kernel caps file.deny at 8 \
+                 entries under\n# `mode: block` and this list deliberately exceeds that. \
+                 To enforce: prune to the 8 most\n# critical paths for your threat model, \
+                 then flip `mode:` to `block`.\n",
             );
         }
         Preset::CloudSecretEgress => {
@@ -317,7 +330,9 @@ mod tests {
         assert!(!p.file.deny.is_empty());
         assert!(p.network.deny.is_empty());
         assert_eq!(p.file.default, DefaultDecision::Allow);
-        assert_eq!(p.mode, Mode::Block);
+        // Audit, not block — the deny list exceeds the kernel 8-entry
+        // cap on purpose, so block mode would fail `Policy::validate`.
+        assert_eq!(p.mode, Mode::Audit);
     }
 
     #[test]
@@ -326,6 +341,28 @@ mod tests {
         assert!(!p.network.deny.is_empty());
         assert!(p.file.deny.is_empty());
         assert_eq!(p.network.default, DefaultDecision::Allow);
+        assert_eq!(p.mode, Mode::Block);
+    }
+
+    #[test]
+    fn rendered_presets_pass_their_own_effective_mode_validation() {
+        // Regression for the codex review finding: a rendered preset
+        // written straight to a policy file must load + validate
+        // under the mode it ships in. Persistence ships audit
+        // (uncapped); cloud-secret-egress ships block (no cap).
+        for preset in Preset::all() {
+            let yaml = format_yaml(
+                *preset,
+                &PresetCtx {
+                    home: Some("/h".into()),
+                },
+            )
+            .unwrap();
+            let parsed: Policy = serde_yaml::from_str(&yaml).unwrap();
+            parsed
+                .validate(parsed.mode)
+                .unwrap_or_else(|e| panic!("{} fails validation: {e}", preset.name()));
+        }
     }
 
     #[test]

@@ -760,9 +760,11 @@ for known supply-chain attack patterns. Currently shipped:
 Both presets print to stdout (or `-o policy.yml`) with explanatory
 comment headers so the operator can pick the entries that fit their
 threat model and merge into an existing policy. The persistence
-preset deliberately exceeds the Linux 8-entry kernel cap on
-`file.deny` under `mode: block` — prune to the most critical
-locations, or keep the full list under `mode: audit` (uncapped).
+preset ships in `mode: audit` because its full list exceeds the
+Linux 8-entry kernel cap on `file.deny` under `mode: block`; to
+enforce, prune to your 8 most critical paths and flip the `mode:`
+field to `block`. The cloud-secret-egress preset ships in
+`mode: block` (no cap on `network.deny`).
 
 The HTML report includes:
 - verdict (ALLOW / DENY), kind, pid, comm
