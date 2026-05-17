@@ -296,6 +296,7 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
         last_host: None,
         last_path: None,
         last_npm_tarball: None,
+        last_pypi_sdist: None,
         require_provenance: cfg.require_provenance,
         nuget_flat: NugetFlatContainerClient::new(cfg.user_agent.clone()),
         pypi_simple: PypiSimpleClient::new(cfg.user_agent.clone()),
@@ -415,6 +416,10 @@ struct SakimoriHandler {
     /// whether to run the lifecycle gate. Reset to `None` on every
     /// request so an earlier tarball's identity can't bleed across.
     last_npm_tarball: Option<(String, String)>,
+    /// As above for pinned PyPI source distributions (`.tar.gz` /
+    /// `.zip` ending). Wheels (`.whl`) are not tagged — they carry
+    /// no install-time hook surface to inspect.
+    last_pypi_sdist: Option<(String, String)>,
     /// Forwarded from [`ProxyConfig::lifecycle_policy`]. `None`
     /// disables the gate entirely (no tarball buffering, no inspect).
     lifecycle_policy: Option<crate::lifecycle::LifecyclePolicy>,
@@ -510,6 +515,112 @@ impl SakimoriHandler {
             }
         }
     }
+
+    /// PyPI counterpart to [`Self::lifecycle_inspect_npm_tarball`].
+    /// Block mode fires on `setup.py` presence — that's the
+    /// PEP-517-era legacy unbounded install hook with the same threat
+    /// model as npm's `postinstall`. Modern `pyproject.toml`-only
+    /// projects still execute the declared build backend, but the
+    /// scope is bounded by the backend's `build-requires` and the
+    /// audit log records what backend ran so a human can triage.
+    async fn lifecycle_inspect_pypi_sdist(
+        &self,
+        res: Response<Body>,
+        policy: crate::lifecycle::LifecyclePolicy,
+        name: &str,
+        version: &str,
+    ) -> Response<Body> {
+        use http_body_util::BodyExt;
+        let (mut parts, body) = res.into_parts();
+        let collected = match body.collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(e) => {
+                log::warn!(
+                    "lifecycle(pypi): failed to buffer sdist body for {name}@{version}: {e}"
+                );
+                return Response::from_parts(parts, Body::empty());
+            }
+        };
+        let pass_through = || -> Response<Body> {
+            let mut parts2 = parts.clone();
+            parts2.headers.remove(http::header::CONTENT_LENGTH);
+            Response::from_parts(
+                parts2,
+                Body::from(http_body_util::Full::new(collected.clone())),
+            )
+        };
+        let inspection = match crate::lifecycle::inspect_pypi_sdist(&collected) {
+            Ok(i) => i,
+            Err(e) => {
+                log::warn!(
+                    "lifecycle(pypi): fail-open on {name}@{version} — could not inspect sdist: {e}"
+                );
+                return pass_through();
+            }
+        };
+        if inspection.is_clean() {
+            log::debug!(
+                "lifecycle(pypi): {name}@{version} — no setup.py and no declared build backend"
+            );
+            return pass_through();
+        }
+        // Audit always records what we found so the log captures the
+        // backend even on a pass-through.
+        let backend_desc = inspection.build_backend.as_deref().unwrap_or("<none>");
+        log::warn!(
+            "lifecycle(pypi,{mode:?}): {name}@{version} — setup.py={setup}, build-backend={backend}",
+            mode = policy,
+            setup = inspection.has_setup_py,
+            backend = backend_desc,
+        );
+        if !inspection.build_requires.is_empty() {
+            log::info!(
+                "lifecycle(pypi): {name}@{version} declared build-requires: {}",
+                inspection.build_requires.join(", "),
+            );
+        }
+        match policy {
+            crate::lifecycle::LifecyclePolicy::Audit => pass_through(),
+            crate::lifecycle::LifecyclePolicy::Block => {
+                if !inspection.is_legacy_install_hook() {
+                    // Modern PEP 517 backends only — audit-log and let
+                    // it through. We deliberately don't extend Block
+                    // to backend-name matching in the first slice;
+                    // there's no clean denylist and the false-positive
+                    // cost would be high (every Hatch-built scientific
+                    // package would 403).
+                    return pass_through();
+                }
+                let reason = format!(
+                    "lifecycle(pypi): blocking {name}@{version} — sdist ships `setup.py`, a \
+                     legacy installer hook that runs arbitrary Python with the user's privileges. \
+                     Prefer a wheel (`pip install --only-binary=:all:`) if upstream publishes \
+                     one, add `{name}` to the lifecycle allow-list if this install is expected, \
+                     or relax to `--lifecycle-policy audit` to log without blocking."
+                );
+                log::warn!("{reason}");
+                parts.headers.remove(http::header::CONTENT_LENGTH);
+                Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("content-type", "text/plain; charset=utf-8")
+                    .header("x-sakimori-deny", "lifecycle-script")
+                    .body(Body::from(format!("{reason}\n")))
+                    .expect("static lifecycle deny response")
+            }
+        }
+    }
+}
+
+/// Recognise PyPI source distribution URLs by file extension. We
+/// only gate sdists because wheels carry no install-time hooks —
+/// pip's wheel installer is a deterministic file-copy + RECORD update.
+/// `.zip` sdists are rare (almost all of PyPI is `.tar.gz` now) but
+/// included for completeness; the inspector still requires a gzip
+/// magic byte so a real `.zip` will fail-open as "not gzip" and
+/// pass through with a warn log.
+fn path_is_pypi_sdist(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".zip")
 }
 
 impl HttpHandler for SakimoriHandler {
@@ -543,11 +654,13 @@ impl HttpHandler for SakimoriHandler {
             self.last_host = None;
             self.last_path = None;
             self.last_npm_tarball = None;
+            self.last_pypi_sdist = None;
             return RequestOrResponse::Request(req);
         }
         self.last_host = Some(host.clone());
         // Reset per-request; the `Pinned` branch below may set it back.
         self.last_npm_tarball = None;
+        self.last_pypi_sdist = None;
         let path: String = req
             .uri()
             .path_and_query()
@@ -585,6 +698,18 @@ impl HttpHandler for SakimoriHandler {
                     && !self.lifecycle_allow.contains(&name)
                 {
                     self.last_npm_tarball = Some((name.clone(), version.clone()));
+                }
+                // Same tagging for PyPI, but only for source
+                // distributions — wheels (`.whl`) are install-time
+                // hook-free, so subjecting them to the gate would
+                // burn cycles and risk false positives without any
+                // defensive value.
+                if self.lifecycle_policy.is_some()
+                    && matches!(ecosystem, sakimori_core::deps::Ecosystem::Pypi)
+                    && !self.lifecycle_allow.contains(&name)
+                    && path_is_pypi_sdist(&path)
+                {
+                    self.last_pypi_sdist = Some((name.clone(), version.clone()));
                 }
                 let now = Utc::now();
                 match self.decider.decide(ecosystem, &name, &version, now) {
@@ -632,6 +757,14 @@ impl HttpHandler for SakimoriHandler {
         {
             return self
                 .lifecycle_inspect_npm_tarball(res, policy, &name, &version)
+                .await;
+        }
+        if let Some(policy) = self.lifecycle_policy
+            && let Some((name, version)) = self.last_pypi_sdist.take()
+            && res.status().is_success()
+        {
+            return self
+                .lifecycle_inspect_pypi_sdist(res, policy, &name, &version)
                 .await;
         }
 

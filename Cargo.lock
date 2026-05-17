@@ -1998,6 +1998,7 @@ dependencies = [
  "tar",
  "time",
  "tokio",
+ "toml",
  "ureq",
 ]
 

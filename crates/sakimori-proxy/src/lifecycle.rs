@@ -8,10 +8,19 @@
 //! proxy fetch boundary** — before npm has even seen the bytes — so we
 //! can audit-log or hard-deny the install.
 //!
-//! Scope of this first slice:
-//! - **npm tarballs only** (`*.tgz`, gzipped POSIX tar with a single
-//!   top-level `package/` directory). PyPI's `setup.py` / build-backend
-//!   surface is structurally different and lands in a follow-up.
+//! Scope of this slice:
+//! - **npm tarballs** (`*.tgz`, gzipped POSIX tar with a single
+//!   top-level `package/` directory) — full Audit + Block via
+//!   [`inspect_npm_tarball`].
+//! - **PyPI sdists** (`*.tar.gz`, gzipped POSIX tar with a single
+//!   top-level `<name>-<version>/` directory) — Audit + Block via
+//!   [`inspect_pypi_sdist`]. Block fires when the sdist ships
+//!   `setup.py` (legacy unbounded install-time hook) regardless of
+//!   what `pyproject.toml` declares; the build-backend name is
+//!   recorded for audit log triage. Wheels (`.whl`) carry no
+//!   install-time hooks (pip just file-copies them into site-packages)
+//!   so the gate deliberately doesn't touch them — wheel pinning is
+//!   the right defence shape there.
 //! - `Audit` and `Block` policies only. `Strip` (rewriting the tarball
 //!   to drop the scripts entries) is the third roadmap mode and is
 //!   genuinely larger — see the module docs roadmap note.
@@ -217,6 +226,140 @@ fn parse_package_json(body: &[u8]) -> Inspection {
     Inspection { scripts: found }
 }
 
+// --- PyPI sdist inspection ------------------------------------------------
+
+/// Outcome of inspecting a PyPI source distribution.
+///
+/// `has_setup_py` is the high-signal field — a legacy `setup.py`
+/// runs arbitrary Python at install time with the user's privileges
+/// and is the closest analogue to npm's `postinstall`. `build_backend`
+/// records what `pyproject.toml` declared (`setuptools.build_meta`,
+/// `hatchling.build`, `poetry.core.masonry.api`, `flit_core.buildapi`,
+/// `pdm.backend`, `maturin`, `scikit_build_core.build`, …) so the
+/// audit log can rank "boring build-backend, no setup.py" against
+/// "unfamiliar build-backend, also setup.py present" without a
+/// human re-running inspection.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PypiInspection {
+    pub has_setup_py: bool,
+    /// `None` means no `pyproject.toml` (legacy-only project) or one
+    /// without a `[build-system]` table; we don't try to guess the
+    /// implicit default (`setuptools.build_meta:__legacy__`) here.
+    pub build_backend: Option<String>,
+    pub build_requires: Vec<String>,
+}
+
+impl PypiInspection {
+    /// Sdist is "definitely going to run code from this package at
+    /// install time". Today that's anchored to `setup.py` presence;
+    /// modern PEP 517 / 518 backends still execute the backend's
+    /// `build_*` hooks, but those run in an isolated environment with
+    /// only the declared `build-requires` available, which is a much
+    /// smaller attack surface than `setup.py`'s "anything on
+    /// sys.path".
+    pub fn is_legacy_install_hook(&self) -> bool {
+        self.has_setup_py
+    }
+
+    pub fn is_clean(&self) -> bool {
+        !self.has_setup_py && self.build_backend.is_none()
+    }
+}
+
+/// Inspect a PyPI source distribution. Same fail-open contract as
+/// [`inspect_npm_tarball`]: a tarball we can't decode returns `Err`,
+/// a decodable tarball without the markers we care about returns an
+/// empty `PypiInspection` (caller should pass-through the bytes
+/// rather than invent a denial).
+///
+/// We walk the tar entries looking for:
+/// - any `<root>/setup.py` (legacy installer hook → `has_setup_py`)
+/// - any `<root>/pyproject.toml` (parsed for the build backend)
+///
+/// `<root>` is the single top-level directory PyPI sdists carry,
+/// typically `<name>-<version>/` — we don't enforce that exact form
+/// because legitimate sdists from `flit`, `hatch`, etc. occasionally
+/// trim the version suffix, but we do require a single leading path
+/// component so a `node_modules/`-style nested file can't poison
+/// the inspection.
+pub fn inspect_pypi_sdist(body: &[u8]) -> Result<PypiInspection, InspectError> {
+    if !looks_like_gzip(body) {
+        return Err(InspectError::NotGzip);
+    }
+    let mut archive = Archive::new(GzDecoder::new(body));
+    let entries = archive
+        .entries()
+        .map_err(|e| InspectError::Tar(e.to_string()))?;
+    let mut out = PypiInspection::default();
+    for entry in entries {
+        let mut entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                log::debug!("lifecycle(pypi): skipping malformed tar entry: {e}");
+                continue;
+            }
+        };
+        let path = match entry.path() {
+            Ok(p) => p.into_owned(),
+            Err(_) => continue,
+        };
+        // Same single-top-level-dir guard as the npm inspector: the
+        // file must live exactly one directory below the root, so
+        // `<pkg>/setup.py` matches but `<pkg>/vendor/foo/setup.py`
+        // doesn't. Vendored installer hooks aren't a real attack
+        // shape today — pip only runs the top-level one — and
+        // matching them would inflate false positives.
+        let is_root_child = path.components().count() == 2;
+        if !is_root_child {
+            continue;
+        }
+        match path.file_name().and_then(|n| n.to_str()) {
+            Some("setup.py") => {
+                out.has_setup_py = true;
+            }
+            Some("pyproject.toml") => {
+                let mut buf = Vec::new();
+                if let Err(e) = entry.read_to_end(&mut buf) {
+                    return Err(InspectError::Read(e.to_string()));
+                }
+                if let Some((backend, requires)) = parse_pyproject(&buf) {
+                    out.build_backend = backend;
+                    out.build_requires = requires;
+                }
+            }
+            _ => continue,
+        }
+        // Early exit if we've seen everything we care about.
+        if out.has_setup_py && out.build_backend.is_some() {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Parse `pyproject.toml` and return `(build-backend, requires)` from
+/// the `[build-system]` table. Returns `None` if the file doesn't
+/// parse as TOML — fail-open same as the npm side.
+fn parse_pyproject(body: &[u8]) -> Option<(Option<String>, Vec<String>)> {
+    let text = std::str::from_utf8(body).ok()?;
+    let doc: toml::Value = toml::from_str(text).ok()?;
+    let build_system = doc.get("build-system")?.as_table()?;
+    let backend = build_system
+        .get("build-backend")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let requires = build_system
+        .get("requires")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some((backend, requires))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +498,130 @@ mod tests {
         let tgz = gz.finish().unwrap();
         let out = inspect_npm_tarball(&tgz).unwrap();
         assert!(!out.has_scripts());
+    }
+
+    // --- PyPI sdist tests -------------------------------------------------
+
+    /// Build a PyPI-shaped sdist tarball with the given `<root>/`
+    /// directory and an iterable of `(relative_path, bytes)` entries.
+    fn pack_sdist(root: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            for (rel, body) in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                let path = format!("{root}/{rel}");
+                builder.append_data(&mut header, &path, *body).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&tar_bytes).unwrap();
+        gz.finish().unwrap()
+    }
+
+    #[test]
+    fn pypi_detects_setup_py() {
+        let tgz = pack_sdist(
+            "foo-1.0.0",
+            &[("setup.py", b"from setuptools import setup\n")],
+        );
+        let out = inspect_pypi_sdist(&tgz).unwrap();
+        assert!(out.has_setup_py);
+        assert!(out.is_legacy_install_hook());
+        assert!(!out.is_clean());
+        assert!(out.build_backend.is_none());
+    }
+
+    #[test]
+    fn pypi_extracts_build_backend_from_pyproject() {
+        let pyproject = br#"
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+"#;
+        let tgz = pack_sdist("foo-1.0.0", &[("pyproject.toml", pyproject)]);
+        let out = inspect_pypi_sdist(&tgz).unwrap();
+        assert_eq!(out.build_backend.as_deref(), Some("hatchling.build"));
+        assert_eq!(out.build_requires, vec!["hatchling".to_string()]);
+        // No setup.py → not "legacy install hook" even though the build
+        // backend will still execute. Block mode deliberately doesn't
+        // fire here in the first slice.
+        assert!(!out.is_legacy_install_hook());
+        assert!(!out.is_clean());
+    }
+
+    #[test]
+    fn pypi_modern_project_with_both_setup_and_pyproject() {
+        // Real-world: scientific packages often ship both for compat
+        // with older pip versions. setup.py presence still pokes the
+        // legacy hook so we should flag it.
+        let pyproject = br#"
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+"#;
+        let tgz = pack_sdist(
+            "numpy-2.0.0",
+            &[
+                ("setup.py", b"import setuptools; setuptools.setup()\n"),
+                ("pyproject.toml", pyproject),
+            ],
+        );
+        let out = inspect_pypi_sdist(&tgz).unwrap();
+        assert!(out.has_setup_py);
+        assert_eq!(out.build_backend.as_deref(), Some("setuptools.build_meta"));
+    }
+
+    #[test]
+    fn pypi_clean_modern_sdist_is_clean() {
+        // pyproject-only project with no build-system table — perfectly
+        // possible (flit's old default). Should return clean.
+        let tgz = pack_sdist(
+            "foo-1.0.0",
+            &[("pyproject.toml", b"[project]\nname = \"foo\"\n")],
+        );
+        let out = inspect_pypi_sdist(&tgz).unwrap();
+        assert!(out.is_clean(), "got: {out:?}");
+    }
+
+    #[test]
+    fn pypi_ignores_nested_setup_py_in_vendored_tree() {
+        // Vendored installer hook inside a subdirectory must not be
+        // mistaken for the root one — only the top-level setup.py
+        // actually runs at install time.
+        let tgz = pack_sdist(
+            "foo-1.0.0",
+            &[("vendor/bar/setup.py", b"raise RuntimeError('pwned')\n")],
+        );
+        let out = inspect_pypi_sdist(&tgz).unwrap();
+        assert!(!out.has_setup_py, "nested setup.py must not trip the gate");
+        assert!(out.is_clean());
+    }
+
+    #[test]
+    fn pypi_malformed_pyproject_fails_open_to_no_backend() {
+        // Garbage TOML → no backend reported; rest of inspection
+        // proceeds. We never fail-closed on parse errors.
+        let tgz = pack_sdist(
+            "foo-1.0.0",
+            &[
+                ("setup.py", b"setup()\n"),
+                ("pyproject.toml", b"not [ valid toml ]\n"),
+            ],
+        );
+        let out = inspect_pypi_sdist(&tgz).unwrap();
+        assert!(out.has_setup_py);
+        assert!(out.build_backend.is_none());
+    }
+
+    #[test]
+    fn pypi_inspect_rejects_non_gzip() {
+        let err = inspect_pypi_sdist(b"this is not gzipped").unwrap_err();
+        assert!(matches!(err, InspectError::NotGzip));
     }
 
     #[test]

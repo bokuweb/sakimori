@@ -640,12 +640,30 @@ of value-per-implementation-cost.
     consults must match the *original* sparse-index entry — the
     proxy will also need to rewrite the packument's
     `dist.integrity` for affected versions. (b) PyPI parallel —
-    parse `pyproject.toml` `build-system.build-backend` and flag
-    non-stdlib backends; full strip there is harder because
-    `setup.py` legacy projects can't be neutered without
-    breaking install, so PyPI starts audit-only. Pairs naturally
-    with `deps watch` — the proxy is the only layer that can
-    catch the script *before* it runs.
+    ✅ first slice implemented as `inspect_pypi_sdist` in
+    `crates/sakimori-proxy/src/lifecycle.rs`. When
+    `--lifecycle-policy` is on and a request matches a pinned PyPI
+    *sdist* URL (`.tar.gz` / `.tgz` / `.zip` — wheels are skipped
+    because they carry no install-time hook surface), the proxy
+    buffers the response, walks the tarball for a top-level
+    `setup.py` and `pyproject.toml`, and decides:
+    - **Audit**: log `has_setup_py`, the declared `build-backend`
+      (`hatchling.build`, `setuptools.build_meta`,
+      `poetry.core.masonry.api`, etc.), and the declared
+      `build-requires`; pass the body through.
+    - **Block**: 403 with `x-sakimori-deny: lifecycle-script` when
+      the sdist ships `setup.py` (the legacy PEP-517-era unbounded
+      installer hook — same threat model as npm's `postinstall`).
+      Modern pyproject-only sdists pass through with the audit log
+      entry; backend-name denylisting was deliberately left out of
+      the first slice (no clean list exists and Hatch/Maturin
+      false-positives would dominate). Allow-list (`--lifecycle-allow
+      <pkg>`) honoured the same way as npm. Same fail-open
+      semantics: bytes-don't-parse-as-gzip / nested setup.py / TOML
+      garbage all yield "could not inspect; passing through" + a
+      warn log, never a fabricated 403. Pairs naturally with `deps
+      watch` — the proxy is the only layer that can catch the
+      script *before* it runs.
 16. **Persistence-write rule pack** (Shai-Hulud-class defence) —
     ✅ first slice implemented as `sakimori policy preset
     persistence`. Emits a ready-to-merge YAML block populating
