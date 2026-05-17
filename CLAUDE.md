@@ -213,14 +213,29 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
    remains out of scope; sakimori-hub is "here's the server you
    can run yourself if you want push notifications across a team."
 
+   > **`sakimori-hub` lives in a separate repo: `bokuweb/sakimori-hub`
+   > (sibling directory `../sakimori-hub` in local checkouts).** Do
+   > NOT add hub code to this repo — the hub has its own deploy
+   > target (Cloudflare Workers + D1 + R2 + Queues, IaC via
+   > Alchemy v2), its own deps (WASM-compatible — `worker-rs`,
+   > argon2, ed25519-dalek), and its own Cargo workspace. This repo (`sakimori`) only describes the
+   > `InstallEvent` wire shape the hub consumes and the
+   > `bokuweb/sakimori@v0` action that emits it; the hub
+   > implementation, schema, and migrations belong to the hub repo.
+   > A previous PR (#76) added `crates/sakimori-hub` here by
+   > mistake and was reverted — if a future change tempts you to
+   > re-add it, stop and open it in the hub repo instead.
+
    **Install inventory (`/ingest` + query API)** — beyond the
    advisory-JOIN path above, sakimori-hub is also the natural home
    for a **team-wide installed-package inventory**: every
    `InstallEvent` that hits `/ingest` is durably stored
    (`(ecosystem, name, version, resolved_at, execution_mode,
    user_agent, project_path, source)` with `source` ∈
-   `{actions, desktop}` derived from a hub-side classifier on
-   `user_agent` / `project_path`), and a small read API
+   `{actions, desktop, unknown}` (the `unknown` lane exists so
+   ambiguous events aren't mis-routed — see the hub repo's
+   `docs/port-from-sakimori-pr76.md` §2.1) derived from a
+   hub-side classifier on `user_agent` / `project_path`), and a small read API
    (`GET /installs?ecosystem=&name=&since=&source=`) plus a
    minimal HTML inventory view answer "**who installed `<pkg>@
    <ver>` and when, across CI and developer laptops**". Both
