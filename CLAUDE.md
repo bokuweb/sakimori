@@ -728,14 +728,21 @@ of value-per-implementation-cost.
     not a policy call the user might want to override with
     `--allow-drift`.
 
+    HTML report integration: ✅ when a supervised run produces a
+    workspace baseline + IOC scan, the HTML report now renders a
+    "Known-IOC hits" section between the events table and the
+    drift block, mirroring the step-summary layout (per-row
+    severity chip + catalog version in the hint). High-severity
+    presence escalates the section badge from warn to danger so
+    the worm fingerprint stands out at a glance.
+
     Remaining follow-ups: content-based fingerprints (suspicious
     webhook URLs in `.npmrc`, dropper-signature bytes); the
     `{dune_word}-{dune_word}-{3-digit}` repo-name and
     authored-by-Claude commit indicators (both require GitHub API
     rather than local file walk); `sakimori iocs update` for a
     signed-YAML refresh path so the catalog can move faster than
-    the release cadence; HTML report integration (currently only
-    JSON + step summary).
+    the release cadence.
 
 Explicitly **out of scope** (different product philosophy, not
 a missing feature):

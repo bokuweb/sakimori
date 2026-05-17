@@ -111,7 +111,13 @@ pub fn write(args: &ReportArgs<'_>, stats: &Stats) -> Result<()> {
             mode: args.mode,
             command: args.command,
         };
-        let rendered = html::render(args.policy, stats, meta, args.workspace_drift);
+        let rendered = html::render(
+            args.policy,
+            stats,
+            meta,
+            args.workspace_drift,
+            args.workspace_iocs,
+        );
         std::fs::write(path, rendered)?;
     }
 
