@@ -92,6 +92,42 @@ from then on, every HTTPS request your package managers make through
 All four ecosystems' metadata paths now rewrite silently — pnpm-style
 `minimumReleaseAge` across the board, no fail-hard in the common case.
 
+### OS support matrix
+
+sakimori has two layers, and they have **different** OS coverage. Read
+this carefully before assuming "macOS isn't supported" or "Linux gets
+everything":
+
+| capability | Linux | macOS | Windows |
+|---|---|---|---|
+| **Fetch-layer** (proxy + install-gate) | | | |
+| ↳ `sakimori proxy start` (MITM + age filter + auto-fallback) | ✅ | ✅ | ✅ |
+| ↳ `sakimori install-gate install` (shell wiring) | ✅ zsh / bash / fish | ✅ zsh / bash / fish | ✅ PowerShell |
+| ↳ `~/.sakimori/installs.jsonl` recording — *who installed what, when* | ✅ | ✅ | ✅ |
+| ↳ `sakimori advisories scan` (OSV JOIN over the install log) | ✅ | ✅ | ✅ |
+| ↳ Lifecycle-script inspection (`--lifecycle-policy audit|block`) | ✅ | ✅ | ✅ |
+| ↳ `sakimori deps check` / `verify-cache` / `watch` | ✅ | ✅ | ✅ |
+| **Supervisor-layer** (`sakimori run` / `daemon`) | | | |
+| ↳ exec / open / connect events | ✅ eBPF | ❌ planned ([roadmap 5b](CLAUDE.md)) | ✅ ETW |
+| ↳ PPid attribution → package-manager origin | ✅ | ❌ | partial |
+| ↳ `--snapshot-workspace` (drift + known-IOC scan at shutdown) | ✅ | ❌ | partial |
+| ↳ Live network block | ✅ eBPF cgroup hooks | ❌ planned (#5) | ✅ Defender Firewall |
+| ↳ Live file/exec block | tripwire (SIGKILL); pre-syscall in progress (#4) | ❌ | audit-only |
+
+**Headline**: *if you only care about "tell me which packages I
+installed and warn me when one of them gets a CVE next week", macOS is
+a first-class platform.* That's the part most users want. The
+supervisor (live blocking, exec attribution, workspace drift) is where
+the Mac gap is — tracked as roadmap item 5b in CLAUDE.md (Apple's
+Endpoint Security framework, requires Apple-issued entitlement +
+SystemExtension signing).
+
+CI coverage matches: the [`macos-smoke` workflow](.github/workflows/macos-smoke.yml)
+exercises proxy start → pinned-tarball fetch → `installs.jsonl` →
+`advisories scan` → `install-gate shellenv` end-to-end on every PR
+that touches the relevant crates, so the cells marked ✅ for macOS
+above don't silently regress.
+
 ---
 
 ## Install

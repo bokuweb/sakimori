@@ -1,0 +1,212 @@
+name: macos-smoke
+
+# Proves that the proxy-side install-recording stack works on macOS.
+# Linux has `proxy-smoke` for the rewrite-correctness path; this job is
+# the macOS counterpart focused on the cross-platform claims most likely
+# to silently break:
+#
+#   1. `sakimori proxy start` actually binds on macos-latest (TLS init,
+#      hudsucker, rustls — all of which have historically had
+#      Linux-only assumptions).
+#   2. A pinned tarball fetch through the proxy appends an
+#      `InstallEvent` to `installs.jsonl` byte-for-byte the same way
+#      Linux does (no `cfg(target_os)` gating regression in
+#      `sakimori-core::installs` or `sakimori-proxy`).
+#   3. `sakimori advisories scan` reads that log on macOS and produces
+#      a structurally-valid report (the OSV JOIN path is the user-
+#      visible payoff; if it can't parse a Mac-written log we've lost
+#      the headline feature).
+#   4. `sakimori install-gate shellenv --shell zsh` renders the
+#      snippet the user is told to `eval` in `~/.zshrc`, and the
+#      result actually parses under `zsh -n` (catches us regressing
+#      the rendered snippet into something that breaks shell startup
+#      for every Mac user).
+#
+# We *do not* re-run the per-ecosystem rewrite assertions — those are
+# OS-neutral and the Linux job already exercises them. This job is
+# specifically "the macOS-side wiring is intact", not "the rewriter is
+# correct".
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "crates/sakimori/**"
+      - "crates/sakimori-proxy/**"
+      - "crates/sakimori-core/**"
+      - ".github/workflows/macos-smoke.yml"
+
+jobs:
+  proxy-install-recording:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build sakimori (release)
+        run: cargo build --release -p sakimori
+
+      - name: Show runner identity
+        run: |
+          set -euxo pipefail
+          uname -a
+          sw_vers || true
+          which zsh
+          zsh --version
+
+      - name: Start proxy in the background
+        run: |
+          set -euo pipefail
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/xdg"
+          mkdir -p "$XDG_CONFIG_HOME"
+          echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME" >>"$GITHUB_ENV"
+          # 365d so the proxy always has something to filter out;
+          # the assertion in this job is *recording*, not rewriting,
+          # but a realistic min-age keeps the run shaped like a real
+          # one.
+          ./target/release/sakimori proxy start \
+              --listen 127.0.0.1:18910 \
+              --min-age 365d \
+              --install-log "$RUNNER_TEMP/installs.jsonl" \
+              > "$RUNNER_TEMP/proxy.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/proxy.pid"
+          # macOS doesn't ship `ss`; use `lsof` or fall back to a
+          # connect probe with `nc`. We use `nc -z` because it's
+          # in the base system and behaves the same on every macOS
+          # version we'll see in CI.
+          for i in $(seq 1 60); do
+            if nc -z 127.0.0.1 18910 2>/dev/null; then
+              echo "proxy up after ${i}00ms"
+              break
+            fi
+            sleep 0.1
+          done
+          if ! nc -z 127.0.0.1 18910 2>/dev/null; then
+            echo "::error::proxy never opened 127.0.0.1:18910"
+            echo "--- proxy.log ---"
+            cat "$RUNNER_TEMP/proxy.log"
+            exit 1
+          fi
+          # Locate the CA the proxy just minted so the curl probe can
+          # validate the MITM leaf without touching the system keychain.
+          ca="$XDG_CONFIG_HOME/sakimori/ca.pem"
+          test -f "$ca" || { echo "::error::CA not generated at $ca"; ls -la "$XDG_CONFIG_HOME/sakimori" || true; exit 1; }
+          echo "CA=$ca" >>"$GITHUB_ENV"
+
+      - name: Pinned tarball fetch — proxy records an InstallEvent
+        run: |
+          set -euo pipefail
+          # Same fixture as the Linux proxy-smoke: lodash@4.17.21 is
+          # old enough to clear the --min-age 365d filter on any
+          # plausible run date.
+          curl -fsS --cacert "$CA" -x http://127.0.0.1:18910 \
+            -o /dev/null \
+            -A 'npm/10.0.0 node/20.0.0 ci/true' \
+            https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz
+          test -f "$RUNNER_TEMP/installs.jsonl"
+          echo "--- installs.jsonl ---"
+          cat "$RUNNER_TEMP/installs.jsonl"
+          python3 - <<'PY'
+          import json, os
+          path = os.path.join(os.environ["RUNNER_TEMP"], "installs.jsonl")
+          rows = [json.loads(l) for l in open(path) if l.strip()]
+          hits = [r for r in rows
+                  if r["ecosystem"] == "npm"
+                  and r["name"] == "lodash"
+                  and r["version"] == "4.17.21"]
+          assert hits, f"no install event recorded for lodash@4.17.21 on macOS: {rows}"
+          # The npm/10.x UA we sent should classify as `persistent`.
+          assert hits[0]["execution_mode"] == "persistent", hits[0]
+          assert "user_agent" in hits[0]
+          assert "resolved_at" in hits[0]
+          print(f"✓ macOS proxy recorded {len(hits)} install event(s) for lodash@4.17.21")
+          PY
+
+      - name: advisories scan consumes the Mac-written log
+        # End-to-end: prove the JSONL we just wrote on macOS round-trips
+        # through `advisories scan`. We accept 0 (no hits) or 1 (hits
+        # found) — OSV may or may not list anything for lodash@4.17.21
+        # on a given day. Anything else means we broke the JSON shape.
+        run: |
+          set -uxo pipefail
+          set +e
+          ./target/release/sakimori advisories scan \
+              --install-log "$RUNNER_TEMP/installs.jsonl" \
+              --json > "$RUNNER_TEMP/scan.json"
+          rc=$?
+          set -e
+          if [ "$rc" != "0" ] && [ "$rc" != "1" ]; then
+            echo "::error::advisories scan exited unexpectedly on macOS (rc=$rc)"
+            cat "$RUNNER_TEMP/scan.json" || true
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os
+          r = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "scan.json")))
+          assert r["installs_scanned"] >= 1, r
+          assert "hits" in r and isinstance(r["hits"], list), r
+          print(f"ok macOS scan: scanned={r['installs_scanned']} hits={len(r['hits'])}")
+          PY
+
+      - name: install-gate shellenv (zsh) renders + parses under zsh -n
+        # Two things at once: prove `install-gate shellenv` runs at all
+        # on macOS, and that what it emits is syntactically valid zsh
+        # (so a Mac user evaling it in ~/.zshrc doesn't break their
+        # shell). We don't actually `source` it — we don't want to
+        # mutate the runner's env — just `zsh -n` syntax-check.
+        run: |
+          set -euxo pipefail
+          snippet="$RUNNER_TEMP/shellenv.zsh"
+          ./target/release/sakimori install-gate shellenv \
+              --shell zsh \
+              --listen 127.0.0.1:18910 \
+              > "$snippet"
+          echo "--- shellenv (zsh) ---"
+          cat "$snippet"
+          # Hard-fail if the proxy URL doesn't appear — catches us
+          # accidentally rendering an empty / placeholder snippet.
+          grep -q "HTTPS_PROXY='http://127.0.0.1:18910'" "$snippet"
+          grep -q "CARGO_HTTP_CAINFO" "$snippet"
+          grep -q "NODE_EXTRA_CA_CERTS" "$snippet"
+          # `zsh -n` is "syntax check only, do not execute". This is
+          # the cheapest way to catch the rendered snippet becoming
+          # unsourceable.
+          zsh -n "$snippet"
+          echo "✓ shellenv renders and parses under zsh -n on macOS"
+
+      - name: install-gate shellenv (bash) parses under bash -n
+        run: |
+          set -euxo pipefail
+          snippet="$RUNNER_TEMP/shellenv.bash"
+          ./target/release/sakimori install-gate shellenv \
+              --shell bash \
+              --listen 127.0.0.1:18910 \
+              > "$snippet"
+          bash -n "$snippet"
+          echo "✓ shellenv (bash) parses on macOS"
+
+      - name: Show proxy log
+        if: always()
+        run: tail -80 "$RUNNER_TEMP/proxy.log" || true
+
+      - name: Upload artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-smoke-artefacts
+          path: |
+            ${{ runner.temp }}/installs.jsonl
+            ${{ runner.temp }}/scan.json
+            ${{ runner.temp }}/shellenv.zsh
+            ${{ runner.temp }}/shellenv.bash
+            ${{ runner.temp }}/proxy.log
+
+      - name: Stop proxy
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/proxy.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/proxy.pid")" 2>/dev/null || true
+          fi

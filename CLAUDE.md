@@ -185,6 +185,45 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
    next slice.
 5. **macOS live block** — either a Network Extension (heavy, needs
    signing) or an HTTPS proxy (see #2).
+5b. **macOS supervised mode (exec + file attribution via Endpoint
+    Security)** — Linux has eBPF tracepoints + PPid-walk attribution
+    (v0.23) and Windows has ETW, but macOS today only sees installs
+    via the proxy. The matching primitive on macOS is the
+    **Endpoint Security framework** (`<EndpointSecurity/
+    EndpointSecurity.h>`), which delivers `ES_EVENT_TYPE_NOTIFY_EXEC`
+    / `..._FORK` / `..._OPEN` / `..._WRITE` with full
+    `audit_token_t` + parent pid + signing info — i.e. the same
+    "npm → sh → node postinstall → curl" chain sakimori currently
+    reconstructs from `/proc` on Linux, available natively without a
+    PPid walk. Required pieces:
+    - A separate signed binary with the
+      `com.apple.developer.endpoint-security.client` entitlement
+      (Apple-issued, gated approval — non-trivial onboarding cost,
+      same gate Jamf / CrowdStrike / SentinelOne pass through).
+      Notarised + Developer ID signed; the SystemExtension lives
+      under `/Library/SystemExtensions/` and the user has to approve
+      it once in System Settings → Privacy & Security.
+    - ES client subscribes to NOTIFY-class events for the
+      audit/observability path; AUTH-class events
+      (`ES_EVENT_TYPE_AUTH_EXEC`, `..._AUTH_OPEN`) are what would let
+      us *block* (the macOS analogue of `bpf_override_return`),
+      paralleling roadmap #4. AUTH responses are deadline-bound
+      (~tens of ms) so the policy match has to stay hot-path-cheap.
+    - Bridge into `sakimori-core::events` so JSON-log + step-summary
+      + HTML report reuse the existing shapes; attribution becomes
+      "read the responsible/parent audit_token directly" rather than
+      walking `/proc`.
+    - Packaging: ship as a separate `sakimori-mac` crate (mirrors
+      `sakimori-win`'s split) so ES bindings + Objective-C runtime
+      deps don't leak into the Linux build.
+    - Out of scope for the first slice: AUTH-mode pre-syscall block
+      (start with NOTIFY-only audit, same staging Linux did before
+      `bpf_send_signal`); container/VM-hosted installs (ES sees only
+      the host); per-script *content* inspection (proxy-side
+      lifecycle gate #15 already covers that and is OS-agnostic).
+    Pairs with #5 (HTTPS proxy live block) the way Linux pairs
+    network eBPF with file/exec eBPF — proxy handles "what was
+    fetched", ES handles "what ran and what it touched".
 6. **Retroactive CVE notification for past installs** — local-first
    half landed: the proxy's pinned-install path now appends every
    resolved fetch to `~/.sakimori/installs.jsonl`
