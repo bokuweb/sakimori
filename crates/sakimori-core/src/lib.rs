@@ -14,6 +14,7 @@
 pub mod actions;
 pub mod advisories;
 pub mod attribution;
+pub mod codeowners;
 pub mod deps;
 pub mod events;
 pub mod html;

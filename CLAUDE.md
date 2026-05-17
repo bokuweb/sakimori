@@ -515,18 +515,27 @@ of value-per-implementation-cost.
     cache key is provably untouchable from the PR side — all
     follow-ups.
 
-    **Follow-ups surfaced by the TanStack post-mortem** (open):
-    - **CODEOWNERS-for-`.github/` lint** — new repo-scoped
-      `sakimori actions audit-repo <root>` (or a `--repo` flag on
-      the existing command) that reads `CODEOWNERS` at the three
-      canonical locations (`.github/CODEOWNERS`, `CODEOWNERS`,
-      `docs/CODEOWNERS`) and emits a Warn-level finding if no
-      pattern covers `.github/workflows/` (or `.github/` broadly).
-      Reason: without owner gating, any maintainer push can ship a
-      workflow change that introduces the very rules this lint
-      catches. Different from the per-file `audit` because it
-      needs the repo structure, not just YAML — own subcommand
-      keeps the file-scoped invocation cheap.
+    **Follow-ups surfaced by the TanStack post-mortem**:
+    - **CODEOWNERS-for-`.github/` lint** — ✅ implemented as
+      `sakimori actions audit-repo <root>`. Walks the three
+      canonical CODEOWNERS locations (`.github/CODEOWNERS`,
+      `CODEOWNERS`, `docs/CODEOWNERS`) in GitHub's documented order,
+      parses pattern + owner rules, and reports whether any rule
+      with at least one owner token (`@user`, `@org/team`, or an
+      email) covers `.github/workflows/foo.yml` and
+      `.github/dependabot.yml`. Surfaces the matched rule (pattern,
+      owners, line number) so reviewers can jump straight to the
+      gate. The subcommand also walks `.github/workflows/*.{yml,
+      yaml}` and runs the per-file `audit` checks for free — one
+      repo-level invocation covers SHA-pinning, cache-poisoning,
+      untrusted-checkout, and ownership in a single report. Default
+      severity for a missing CODEOWNERS rule is Warn (most repos
+      historically didn't gate `.github/`; we don't want to break
+      their first audit run); `--strict-codeowners` escalates to
+      Error / non-zero exit. The matcher implements enough of
+      gitignore semantics for `.github/` gating (`*`, `**`, leading
+      `/` anchoring, trailing `/` directory-only) — character
+      classes and `?` are deliberately out of scope.
     - **`zizmor` parity surface** — sakimori's two rules cover the
       cache-poisoning + dangerous-checkout slices; zizmor catches
       a wider set (`template-injection`, `excessive-permissions`,

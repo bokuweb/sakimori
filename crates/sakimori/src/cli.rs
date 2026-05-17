@@ -379,6 +379,12 @@ pub enum ActionsCommand {
     /// is present (third-party `@v1` style); first-party warnings
     /// don't fail by default — pass `--strict` to escalate them.
     Audit(ActionsAuditArgs),
+    /// Repo-scoped audit: walks `.github/workflows/*.{yml,yaml}` and
+    /// runs the same per-file checks as `audit`, plus a CODEOWNERS
+    /// coverage lint that fires when no owner pattern protects the
+    /// `.github/` tree (the gate that would have caught the TanStack
+    /// 2025 workflow change before merge).
+    AuditRepo(ActionsAuditRepoArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -410,6 +416,24 @@ pub struct ActionsAuditArgs {
 pub enum ActionsFormat {
     Text,
     Json,
+}
+
+#[derive(Debug, Parser)]
+pub struct ActionsAuditRepoArgs {
+    /// Repo root. Defaults to the current directory.
+    #[arg(default_value = ".")]
+    pub root: PathBuf,
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: ActionsFormat,
+    /// Treat first-party (`actions/*`, `github/*`) mutable refs as
+    /// blocking too. Same semantics as on `audit`.
+    #[arg(long)]
+    pub strict: bool,
+    /// Escalate the CODEOWNERS-coverage warning to a blocking error.
+    /// Default is Warn — many repos historically didn't gate
+    /// `.github/` and we don't want to break their first audit run.
+    #[arg(long)]
+    pub strict_codeowners: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1090,6 +1114,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Actions {
             cmd: ActionsCommand::Audit(args),
         } => run_actions_audit(args),
+        Command::Actions {
+            cmd: ActionsCommand::AuditRepo(args),
+        } => run_actions_audit_repo(args),
         Command::Workspace {
             cmd: WorkspaceCommand::Snapshot(args),
         } => run_workspace_snapshot(args),
@@ -1684,6 +1711,219 @@ fn run_actions_audit(args: ActionsAuditArgs) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn run_actions_audit_repo(args: ActionsAuditRepoArgs) -> Result<()> {
+    use sakimori_core::actions::{
+        Finding, Severity, Summary, WorkflowFinding, audit_workflow_yaml, audit_yaml,
+    };
+    use sakimori_core::codeowners;
+    use serde::Serialize;
+    use std::path::Path;
+
+    let workflows_dir = args.root.join(".github").join("workflows");
+    let mut files: Vec<PathBuf> = Vec::new();
+    if workflows_dir.is_dir() {
+        for entry in std::fs::read_dir(&workflows_dir)
+            .with_context(|| format!("reading {}", workflows_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if matches!(ext.to_ascii_lowercase().as_str(), "yml" | "yaml") {
+                files.push(path);
+            }
+        }
+        files.sort();
+    }
+
+    let mut per_file: Vec<(PathBuf, Vec<Finding>, Vec<WorkflowFinding>)> = Vec::new();
+    for path in &files {
+        let yaml =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut findings =
+            audit_yaml(&yaml).with_context(|| format!("auditing {}", path.display()))?;
+        let workflow_findings = audit_workflow_yaml(&yaml)
+            .with_context(|| format!("auditing workflow rules in {}", path.display()))?;
+        if args.strict {
+            for f in &mut findings {
+                if f.severity == Severity::Warn {
+                    f.severity = Severity::Error;
+                }
+            }
+        }
+        per_file.push((path.clone(), findings, workflow_findings));
+    }
+
+    let coverage = codeowners::audit_repo(&args.root)?;
+
+    // The CODEOWNERS finding is a singleton — either the rule is
+    // satisfied (Ok), satisfied at the broader `.github/` level only
+    // (Warn-ish "fine but consider tightening to workflows/" — we
+    // collapse this into Ok for the lint), or unsatisfied (Warn /
+    // Error per `--strict-codeowners`).
+    let codeowners_status = if coverage.workflows_covered() {
+        CoStatus::Ok
+    } else if args.strict_codeowners {
+        CoStatus::Error
+    } else {
+        CoStatus::Warn
+    };
+
+    #[derive(Serialize)]
+    struct PerFile<'a> {
+        file: &'a Path,
+        findings: &'a [Finding],
+        workflow_findings: &'a [WorkflowFinding],
+        summary: Summary,
+    }
+    #[derive(Serialize)]
+    struct CodeownersReport<'a> {
+        source: Option<&'a Path>,
+        workflows_covered: bool,
+        github_covered: bool,
+        workflows_rule: Option<&'a codeowners::Rule>,
+        github_rule: Option<&'a codeowners::Rule>,
+        status: &'static str,
+        message: String,
+    }
+    #[derive(Serialize)]
+    struct RepoReport<'a> {
+        root: &'a Path,
+        files: Vec<PerFile<'a>>,
+        codeowners: CodeownersReport<'a>,
+    }
+
+    let co_message = describe_codeowners(&coverage);
+    let report = RepoReport {
+        root: &args.root,
+        files: per_file
+            .iter()
+            .map(|(p, f, wf)| PerFile {
+                file: p.as_path(),
+                findings: f,
+                workflow_findings: wf,
+                summary: Summary::from_findings(f),
+            })
+            .collect(),
+        codeowners: CodeownersReport {
+            source: coverage.source.as_deref(),
+            workflows_covered: coverage.workflows_covered(),
+            github_covered: coverage.github_covered(),
+            workflows_rule: coverage.workflows_rule.as_ref(),
+            github_rule: coverage.github_rule.as_ref(),
+            status: codeowners_status.label(),
+            message: co_message.clone(),
+        },
+    };
+
+    let mut blocking = 0usize;
+    match args.format {
+        ActionsFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        ActionsFormat::Text => {
+            for (path, findings, wfs) in &per_file {
+                let summary = Summary::from_findings(findings);
+                println!(
+                    "{}  ({} ok, {} warn, {} error)",
+                    path.display(),
+                    summary.ok,
+                    summary.warn,
+                    summary.error
+                );
+                for f in findings {
+                    if matches!(f.severity, Severity::Ok) {
+                        continue;
+                    }
+                    let tag = match f.severity {
+                        Severity::Error => "ERROR",
+                        Severity::Warn => "warn ",
+                        Severity::Ok => "ok   ",
+                    };
+                    let where_ = match &f.step {
+                        Some(name) => format!("{}/{name}", f.job),
+                        None => f.job.clone(),
+                    };
+                    println!("  {tag}  {where_}: {}", f.message);
+                }
+                for wf in wfs {
+                    let tag = match wf.severity {
+                        Severity::Error => "ERROR",
+                        Severity::Warn => "warn ",
+                        Severity::Ok => "ok   ",
+                    };
+                    println!("  {tag}  [{rule}] {msg}", rule = wf.rule, msg = wf.message);
+                }
+            }
+            let co_tag = match codeowners_status {
+                CoStatus::Ok => "ok   ",
+                CoStatus::Warn => "warn ",
+                CoStatus::Error => "ERROR",
+            };
+            println!("CODEOWNERS  {co_tag}  {co_message}");
+        }
+    }
+
+    for (_, findings, wfs) in &per_file {
+        blocking += findings.iter().filter(|f| f.is_blocking()).count();
+        blocking += wfs
+            .iter()
+            .filter(|w| matches!(w.severity, Severity::Error))
+            .count();
+    }
+    if matches!(codeowners_status, CoStatus::Error) {
+        blocking += 1;
+    }
+
+    if blocking > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CoStatus {
+    Ok,
+    Warn,
+    Error,
+}
+
+impl CoStatus {
+    fn label(&self) -> &'static str {
+        match self {
+            CoStatus::Ok => "ok",
+            CoStatus::Warn => "warn",
+            CoStatus::Error => "error",
+        }
+    }
+}
+
+fn describe_codeowners(c: &sakimori_core::codeowners::Coverage) -> String {
+    match (&c.source, c.workflows_covered(), c.github_covered()) {
+        (None, _, _) => "no CODEOWNERS file found at .github/CODEOWNERS, CODEOWNERS, or \
+             docs/CODEOWNERS — add one with a rule like `.github/ @your-org/security` to require \
+             a reviewer on every workflow change"
+            .to_string(),
+        (Some(src), false, _) => format!(
+            "{} exists but no rule with owners covers `.github/workflows/` — any maintainer can \
+             merge a workflow change unreviewed. Add e.g. `.github/ @your-org/security`.",
+            src.display()
+        ),
+        (Some(src), true, _) => {
+            let rule = c.workflows_rule.as_ref().unwrap();
+            format!(
+                "{} covers `.github/workflows/` via `{}` (line {}) → {}",
+                src.display(),
+                rule.pattern,
+                rule.line_no,
+                rule.owners.join(" ")
+            )
+        }
+    }
 }
 
 fn run_policy_suggest(args: PolicySuggestArgs) -> Result<()> {
