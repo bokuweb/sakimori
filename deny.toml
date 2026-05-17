@@ -1,0 +1,73 @@
+# cargo-deny configuration. See .github/workflows/security.yml.
+#
+# Philosophy: hard-fail on real risk (CVE, unmaintained crate,
+# unknown registry, copy-left license). Soft-warn on duplicates
+# and other lint-ish noise the workspace can't always avoid.
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+# vulnerability + unmaintained advisories block the build.
+# yanked = "warn" because crates.io yanks happen mid-day and
+# we'd rather merge a yanked-but-still-used release than block
+# every push until lockfile refresh.
+yanked = "warn"
+ignore = []
+
+[bans]
+# `multiple-versions = "warn"` is a deliberate first-cut: the
+# sakimori workspace pulls in aya / aya-ebpf / windows-rs /
+# aws-lc-rs trees that legitimately ship duplicate transitive
+# versions today. Tightening to `deny` would red-CI on first
+# contact. New duplicates introduced by a PR still stand out
+# in the workflow log. When the inherited dupes are consolidated
+# or each whitelisted with a `skip` + rationale, ratchet to
+# `deny`.
+multiple-versions = "warn"
+wildcards = "deny"
+# Crates we will NEVER want in this tree. Add reasons inline.
+deny = [
+  # `openssl-sys` would mean linking C OpenSSL into the wasm32
+  # build of any future wasm-targeted crate; sakimori today is
+  # native-only but the deny defends future wasm consumers
+  # (e.g. an eventual hub-side reuse of sakimori-core).
+  { name = "openssl-sys", reason = "prefer aws-lc-rs / rustls; flag accidental default-features" },
+]
+skip = []
+
+[licenses]
+version = 2
+# Anything in this list is fine to ship. The Cargo.toml
+# `license = "Apache-2.0"` is our own product; we accept
+# compatible permissive licenses transitively.
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "0BSD",
+  "CC0-1.0",
+  "BSL-1.0",
+  "MPL-2.0",        # file-level copyleft; we don't modify these
+  "OpenSSL",
+]
+# Refusing copyleft (GPL/AGPL/LGPL) by omission, not allowlist —
+# anything not listed above hard-fails.
+confidence-threshold = 0.93
+exceptions = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# aya-ebpf has historically required git refs; add explicit
+# entries here when a crate requires it, with rationale.
+allow-git = []

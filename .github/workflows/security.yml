@@ -1,0 +1,412 @@
+name: security
+
+# Supply-chain + SAST gates that complement `ci.yml`:
+#
+#   - cargo-audit          — RustSec advisory DB scan (CVE-style)
+#   - cargo-deny           — license + advisory + bans + sources
+#   - osv-scanner          — multi-ecosystem advisory scan (Cargo.lock)
+#   - semgrep              — SAST rule packs (rust + javascript +
+#                             secrets + owasp-top-ten). The js
+#                             coverage matters here: the bundled
+#                             GitHub Actions under `job/`, `proxy/`,
+#                             `verify-cache/` ship `main.js` /
+#                             `pre.js` / `post.js` that consumers
+#                             run pre/main/post a workflow step,
+#                             same threat model as any third-party
+#                             action.
+#   - codeql               — GitHub native SAST for javascript-
+#                             typescript (covers the action JS).
+#                             CodeQL has no Rust analyzer; Rust
+#                             coverage comes from cargo-audit +
+#                             cargo-deny + semgrep p/rust + osv.
+#   - dependency-review    — pulls vs PR base, blocks new
+#                             vulnerable / forbidden-license deps
+#                             before they land.
+#
+# Findings-style jobs upload SARIF to GitHub Code Scanning (this
+# repo is public, so the Security tab is on for free).
+#
+# ## Supply chain pinning
+#
+# Every external `uses:` is pinned to a 40-char commit SHA — the
+# floating `@v*` tags allow upstream drift and become a CI
+# compromise vector. The `# v<version>` comment is for humans;
+# the SHA is what GitHub actually resolves.
+#
+# `sakimori actions audit --strict` enforces this rule for
+# consumer workflows; running it against our own `.github/`
+# is a follow-up (the existing `ci.yml` / `release.yml` /
+# etc still use floating tags — see TODO at the bottom).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Daily refresh at 17:00 UTC (≈ 02:00 JST). New CVEs land
+    # in RustSec / OSV most weekdays; a daily run catches them
+    # without waiting for the next code change.
+    - cron: "0 17 * * *"
+
+# Least privilege at the top: every job below opts in to the
+# write scopes it actually needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------------
+  # Rust supply chain
+  # -------------------------------------------------------------
+
+  cargo-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Install cargo-audit
+        # Pin the tool version so the gate isn't subject to
+        # upstream cargo-audit behaviour drift between runs
+        # (codex round-1 finding). Bump deliberately.
+        run: cargo install cargo-audit --version 0.22.1 --locked
+      - name: Run cargo-audit
+        # `--deny warnings` makes "unmaintained" advisories fail
+        # alongside straight vulnerabilities. Override with
+        # `[advisories.ignore]` in `audit.toml` only after writing
+        # down the rationale in the same commit.
+        run: cargo audit --deny warnings
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Install cargo-deny
+        # Pin the tool version (codex round-1).
+        run: cargo install cargo-deny --version 0.19.6 --locked
+      - name: Run cargo-deny
+        # Checks: advisories (CVEs + unmaintained), bans
+        # (forbidden + duplicate crates), licenses (allowlist),
+        # sources (no git / no unknown registry).
+        run: cargo deny check
+
+  # -------------------------------------------------------------
+  # Multi-ecosystem advisory scan (OSV)
+  # -------------------------------------------------------------
+
+  osv-scanner:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      # github/codeql-action/upload-sarif v4 needs actions: read
+      # to fetch run-info for fingerprinting + telemetry.
+      actions: read
+    env:
+      # Bumping: update both. See header comment.
+      OSV_VERSION: v2.3.8
+      OSV_SHA256: bc98e15319ed0d515e3f9235287ba53cdc5535d576d24fd573978ecfe9ab92dc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Download osv-scanner (pinned version, verified SHA-256)
+        run: |
+          curl -fsSL -o /tmp/osv-scanner \
+            "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SHA256}  /tmp/osv-scanner" | sha256sum --check --status
+          chmod +x /tmp/osv-scanner
+      - name: Run osv-scanner
+        # Hard-fail on any finding (codex round-1: || true left
+        # critical vulns visible-but-non-gating). OSV findings
+        # are concrete vulnerable-version hits, not heuristic
+        # noise — failing the gate is the right tradeoff here.
+        # SARIF still emits on failure (osv-scanner writes the
+        # file before exiting non-zero).
+        run: |
+          /tmp/osv-scanner \
+            --format sarif \
+            --output osv.sarif \
+            -L Cargo.lock
+      - name: Ensure SARIF file exists (artifact upload still needs one)
+        # Fallback so the post-scan upload steps below don't
+        # hard-fail on missing SARIF (transient scanner outage,
+        # network glitch). The scan itself is gating above; this
+        # is purely about uploading whatever we have.
+        if: always()
+        run: |
+          if [ ! -s osv.sarif ]; then
+            echo '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"osv-scanner","informationUri":"https://google.github.io/osv-scanner/"}},"results":[]}]}' > osv.sarif
+          fi
+      - name: Upload OSV SARIF to Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@7c1e4cf0b20d7c1872b26569c00ba908797a59bf # v4
+        with:
+          sarif_file: osv.sarif
+          category: osv-scanner
+      - name: Upload OSV SARIF as workflow artifact (always)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: osv-sarif
+          path: osv.sarif
+
+  # -------------------------------------------------------------
+  # SAST: semgrep
+  # -------------------------------------------------------------
+  #
+  # ## Rule-set supply chain
+  #
+  # `semgrep ci --config p/<pack>` pulls rule packs over the
+  # network. Two mitigations live here:
+  #
+  #   (a) the semgrep CLI image is version-pinned (not `:latest`),
+  #       so a compromised pack still has to fit the rule grammar
+  #       of a vetted CLI version.
+  #   (b) failing `--error` is OFF in PR mode (`|| true`) so a
+  #       rule-pack flip that flags everything as critical doesn't
+  #       block merges; SARIF + Security tab is the source of truth.
+  #
+  # Follow-up: vendor the rule packs into `.semgrep/` so we're
+  # not network-dependent at CI time.
+
+  semgrep:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    container:
+      # Pinned semgrep version by digest (codex round-1: tags are
+      # mutable). 1.96.0 published manifest sha256:027ea6e8...
+      # Bump = update both version comment and digest in one
+      # commit.
+      image: semgrep/semgrep:1.96.0@sha256:027ea6e8a009cbf0031df5abe9d1491ca82656fe7c584257c198ab680d770eb7
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Mark workspace as a safe directory for the container user
+        # semgrep container runs as a non-root user that doesn't
+        # own the GitHub Actions workspace path; git's
+        # safe.directory check then aborts every git call —
+        # which upload-sarif (fingerprinting) needs.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Run semgrep (rust + js + nodejs + secrets + owasp-top-ten)
+        # `p/javascript` + `p/nodejs` cover the bundled GitHub
+        # Actions under job/, proxy/, verify-cache/ — those
+        # `main.js` / `pre.js` / `post.js` files run on consumer
+        # CI runners with the consumer's GITHUB_TOKEN.
+        #
+        # `|| true` is INTENTIONAL here (in contrast to
+        # osv-scanner above): p/rust + p/owasp-top-ten ship a lot
+        # of heuristic rules that flag real-but-non-issue patterns
+        # (cfg(test) unsafe, intentional unsafe in eBPF / Windows
+        # bridges). Forcing a hard gate before vendoring our own
+        # rule subset would turn every PR red. The SARIF upload
+        # + Security tab gives reviewers full visibility; a
+        # follow-up vendors `.semgrep/` rule packs and tightens
+        # the gate.
+        run: |
+          semgrep ci \
+            --config p/rust \
+            --config p/javascript \
+            --config p/nodejs \
+            --config p/secrets \
+            --config p/owasp-top-ten \
+            --sarif --output semgrep.sarif \
+            --error || true
+      - name: Ensure SARIF file exists
+        run: |
+          if [ ! -s semgrep.sarif ]; then
+            echo '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"semgrep","informationUri":"https://semgrep.dev/"}},"results":[]}]}' > semgrep.sarif
+          fi
+      - name: Upload semgrep SARIF to Code Scanning
+        uses: github/codeql-action/upload-sarif@7c1e4cf0b20d7c1872b26569c00ba908797a59bf # v4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+      - name: Upload semgrep SARIF as workflow artifact (always)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
+
+  # -------------------------------------------------------------
+  # SAST: GitHub CodeQL (native, javascript-typescript only)
+  # -------------------------------------------------------------
+
+  codeql:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # CodeQL doesn't ship a Rust analyzer; Rust coverage is
+        # cargo-audit + cargo-deny + semgrep p/rust + osv-scanner.
+        # JS analysis is for the bundled GitHub Actions in
+        # job/, proxy/, verify-cache/. `actions` covers
+        # workflow YAML itself (codex round-1: high-signal for a
+        # security-tooling repo whose own workflows are part of
+        # its threat model).
+        language: [javascript-typescript, actions]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: github/codeql-action/init@7c1e4cf0b20d7c1872b26569c00ba908797a59bf # v4
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-and-quality
+      - uses: github/codeql-action/analyze@7c1e4cf0b20d7c1872b26569c00ba908797a59bf # v4
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  # -------------------------------------------------------------
+  # PR-only: dependency-review
+  # -------------------------------------------------------------
+  #
+  # Compares HEAD vs base on a PR and fails if the PR introduces
+  # a vulnerable / forbidden-license / mutable-source dependency.
+  # Free on public repos. No-op on push events (the action
+  # short-circuits when there's no PR context).
+
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          # Fail the PR on `high` and above (CRITICAL implicit).
+          # `moderate` floods the signal — accept the operator
+          # tradeoff most repos make.
+          fail-on-severity: high
+          # Only gate on runtime deps (codex round-1) — a high-
+          # severity dev-dep CVE (build script tool, formatter)
+          # is real signal but shouldn't block a feature PR.
+          # Operators still see it in the dependency-review
+          # comment that this action posts.
+          fail-on-scopes: runtime
+          # GPL/AGPL/LGPL would force this repo's Apache
+          # licensing into copyleft territory. Reject.
+          deny-licenses: GPL-2.0, GPL-3.0, AGPL-3.0, LGPL-2.1, LGPL-3.0
+
+  # -------------------------------------------------------------
+  # Dogfood: run `sakimori actions audit` against our own workflows
+  # -------------------------------------------------------------
+  #
+  # sakimori ships an `actions audit` lint that flags floating
+  # `uses:` tags as Error/Warn. Running it on this repo's own
+  # `.github/workflows/` is the credibility check — if we don't
+  # meet the bar we ask consumers to meet, the tool doesn't
+  # deserve their trust.
+  #
+  # `continue-on-error: true` initially (codex round-1 (g)): the
+  # existing `ci.yml` / `release.yml` / etc are NOT yet SHA-pinned,
+  # so a strict run would red-CI on first contact. The dogfood
+  # output stays visible in the workflow log so reviewers can see
+  # the drift count. Follow-up PR mechanically pins all existing
+  # workflows, then ratchets this job to drop the
+  # continue-on-error and add `--strict`.
+
+  dogfood-actions-audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Build sakimori (release, default features)
+        # Build only the `sakimori` bin — skip the eBPF + Windows
+        # crates to keep the dogfood job under 5 min once cached.
+        run: cargo build -p sakimori --release --bin sakimori
+      - name: Audit our own workflows (non-strict, JSON for log)
+        # JSON output makes per-workflow findings greppable in the
+        # action log. Plain-text output goes to the step summary
+        # so the visible CI surface gets a flag count too.
+        #
+        # Codex round-2 + round-3 caught: blanket `|| true`
+        # swallows real execution failures (bad flag regression,
+        # YAML parse failure, binary missing) alongside the
+        # tolerated "audit found something" exit code. Replaced
+        # with explicit rc capture: distinguish 0 (clean) and 1
+        # (findings — tolerated, the job is continue-on-error
+        # anyway) from >=2 (binary actually broke — escalate).
+        # Also asserts the JSON artifact is non-empty before
+        # upload, so a silently-empty dogfood file doesn't sit
+        # in the artifacts tab pretending we audited.
+        shell: bash
+        run: |
+          set +e
+          ./target/release/sakimori actions audit \
+            --format json \
+            .github/workflows/*.yml > dogfood-audit.json
+          json_rc=$?
+          ./target/release/sakimori actions audit \
+            .github/workflows/*.yml > dogfood-audit.txt
+          text_rc=$?
+          set -e
+          {
+            echo "## sakimori actions audit (self) — exit: ${text_rc}"
+            echo '```'
+            cat dogfood-audit.txt || echo "audit produced no text output"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Tolerate "found findings" (rc=1) — the job is
+          # continue-on-error: true and the artifact carries the
+          # detail. Escalate on >=2: that's the binary actually
+          # broken (missing flag, YAML parse failure, etc.).
+          if [ "$json_rc" -ge 2 ] || [ "$text_rc" -ge 2 ]; then
+            echo "::error::actions audit binary failed (json_rc=$json_rc text_rc=$text_rc)"
+            exit 1
+          fi
+          if [ ! -s dogfood-audit.json ]; then
+            echo "::error::dogfood-audit.json is empty — audit did not emit JSON"
+            exit 1
+          fi
+      - name: Upload dogfood audit JSON
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dogfood-actions-audit
+          path: dogfood-audit.json
+
+# ============================================================
+# Follow-ups (not in this slice):
+#
+#   - Pin all existing workflows (ci.yml, release.yml,
+#     consumer-smoke.yml, etc.) to SHA-pinned uses: and ratchet
+#     `dogfood-actions-audit` here to drop continue-on-error +
+#     add --strict. The lint exists; the cleanup is mechanical
+#     but bulky.
+#
+#   - Vendor semgrep rule packs into `.semgrep/` and drop the
+#     `|| true` on the semgrep step, gating on real findings.
+#
+#   - Provenance: verify upstream action artifacts via
+#     slsa-verifier where the actions publish attestations
+#     (codex round-1 (h)). Most-impact target is release.yml's
+#     cross-platform binary publish.
+#
+#   - DAST: spin up `sakimori proxy` in CI and run a smoke
+#     scan from a known attack model (lifecycle script,
+#     persistence-path write, CDN-IP rotation). Better as a
+#     `pentest.yml` follow-up since it needs a longer runtime
+#     budget than the per-PR gates here.
+#
+#   - cargo-fuzz nightly against the proxy parsers (npm /
+#     pypi / nuget / crates rewriters, lifecycle.rs tarball
+#     decoder). Same shape as sakimori-hub's `fuzz` job.
+# ============================================================
