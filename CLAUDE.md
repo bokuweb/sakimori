@@ -232,8 +232,10 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
    `InstallEvent` that hits `/ingest` is durably stored
    (`(ecosystem, name, version, resolved_at, execution_mode,
    user_agent, project_path, source)` with `source` ∈
-   `{actions, desktop}` derived from a hub-side classifier on
-   `user_agent` / `project_path`), and a small read API
+   `{actions, desktop, unknown}` (the `unknown` lane exists so
+   ambiguous events aren't mis-routed — see the hub repo's
+   `docs/port-from-sakimori-pr76.md` §2.1) derived from a
+   hub-side classifier on `user_agent` / `project_path`), and a small read API
    (`GET /installs?ecosystem=&name=&since=&source=`) plus a
    minimal HTML inventory view answer "**who installed `<pkg>@
    <ver>` and when, across CI and developer laptops**". Both
