@@ -11,25 +11,25 @@
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0049"
-ignoreUntil = "2026-06-30"
+ignoreUntil = "2026-06-30T00:00:00Z"
 reason = "rustls-webpki 0.102 via hudsucker 0.22 → CRL Distribution Point matching. Bump hudsucker 0.22 → 0.24 (API migration in sakimori-proxy/src/proxy.rs)."
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0098"
-ignoreUntil = "2026-06-30"
+ignoreUntil = "2026-06-30T00:00:00Z"
 reason = "rustls-webpki 0.102 via hudsucker 0.22 → URI name constraints. Same fix as 0049."
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0099"
-ignoreUntil = "2026-06-30"
+ignoreUntil = "2026-06-30T00:00:00Z"
 reason = "rustls-webpki 0.102 via hudsucker 0.22 → wildcard name constraints. Same fix as 0049."
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0104"
-ignoreUntil = "2026-06-30"
+ignoreUntil = "2026-06-30T00:00:00Z"
 reason = "rustls-webpki 0.102 via hudsucker 0.22 → reachable panic in CRL parsing. Same fix as 0049."
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0119"
-ignoreUntil = "2026-06-30"
+ignoreUntil = "2026-06-30T00:00:00Z"
 reason = "hickory-proto 0.24.4 via hickory-resolver 0.24 → O(n²) message-encoding CPU exhaustion. Bump hickory-resolver 0.24 → 0.26 (NameServerConfig constructor + ResolverConfig::from_parts API broke)."
