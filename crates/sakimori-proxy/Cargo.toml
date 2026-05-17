@@ -38,6 +38,7 @@ semver = "1"
 # is the next stage and will introduce p256 / x509-parser / ed25519
 # deps. We keep this list intentionally small for now.
 base64 = "0.22"
+sha1 = "0.10"
 sha2 = "0.10"
 tar = "0.4"
 flate2 = "1"

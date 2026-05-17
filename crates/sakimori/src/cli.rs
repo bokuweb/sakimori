@@ -725,9 +725,13 @@ pub struct ProxyStartArgs {
     /// defence). `audit` logs every fetched tarball that ships
     /// `install` / `preinstall` / `postinstall` / `prepare` scripts
     /// without blocking; `block` returns 403 for those tarballs so
-    /// npm never runs the scripts. `strip` is on the roadmap but not
-    /// yet implemented — pass `audit` or `block` for now. Unset
-    /// disables the gate entirely (current default).
+    /// npm never runs the scripts. `strip` is the foundation for
+    /// tarball rewriting — Phase 1 dispatches to Block semantics for
+    /// the proxy path while the rewriter itself
+    /// (`lifecycle::strip_npm_tarball`) is implemented in core; the
+    /// packument-coherence orchestration lands in Phase 2 (CLAUDE.md
+    /// roadmap #15). Unset disables the gate entirely (current
+    /// default).
     #[arg(long = "lifecycle-policy", value_name = "MODE")]
     pub lifecycle_policy: Option<String>,
     /// Per-package allow-list for the lifecycle gate. Repeatable.

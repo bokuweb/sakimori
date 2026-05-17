@@ -648,12 +648,50 @@ of value-per-implementation-cost.
     records reader (see above for the implementation footgun).
 15. **Lifecycle-script gate in the proxy** (Shai-Hulud-class
     defence) — ✅ first slice implemented in `sakimori-proxy`.
-    New `sakimori proxy start --lifecycle-policy <audit|block>`
+    New `sakimori proxy start --lifecycle-policy <audit|block|strip>`
     flag plus a repeatable `--lifecycle-allow <pkg>` for
     legitimate native-addon exemptions (e.g. `sharp`, `bcrypt`).
-    `strip` is on the CLI for forward-compat but parses to a
-    distinct `StripNotImplemented` error today so users get a
-    helpful message instead of "unknown policy".
+
+    **Phase 1 of `strip` mode (current):** the rewriter itself —
+    `sakimori_proxy::lifecycle::strip_npm_tarball` — is the
+    load-bearing algorithmic piece and is implemented + unit-tested:
+    hard limits against gzip bombs / oversize tarballs / pathological
+    entry counts, zip-slip path validation (defence in depth even
+    though we never extract to disk), symlink + hardlink + directory
+    preservation, and SHA-512 / SHA-1 hash recomputation matching the
+    `dist.integrity` / `dist.shasum` shapes npm verifies. `serde_json`
+    is now built with `preserve_order` workspace-wide so the
+    rewritten `package.json` differs from the input only in the
+    removed lifecycle keys (byte-stable surrounding content).
+    `StripFailurePolicy` (`Block` default / `Passthrough`) is the
+    "rewriter itself failed, now what" knob — type lands here, CLI
+    wiring with Phase 2.
+
+    **Honest scope (after Codex plan review):** lockfile-pinned
+    installs (`npm ci`, `npm install` against an existing
+    `package-lock.json`, `pnpm install --frozen-lockfile`) validate
+    fetched tarballs against the **lockfile's** `integrity` field,
+    not the packument's, and the proxy cannot rewrite an on-disk
+    lockfile. Strip is therefore best-effort for non-lockfile
+    install paths only — `npm install <new-pkg>`, `npx`,
+    `pnpm dlx`, `yarn dlx`, `pnpm add <new-pkg>`. CI lockfile flows
+    stay on `--lifecycle-policy block`.
+
+    **Phase 1 proxy dispatch** routes `Strip` to a Block 403 with a
+    strip-specific message (`x-sakimori-deny: lifecycle-script`,
+    body explains "Phase 2 will add packument coherence"). This
+    keeps Strip honest (no silent `EINTEGRITY` surprises) while the
+    core rewriter is in place for Phase 2 to call. Phase 2 lands:
+    (a) lazy `(name, version, orig_integrity)` strip cache, (b)
+    packument rewriter walking the cache to update
+    `dist.integrity` / `dist.shasum` and drop `dist.attestations`
+    for stripped versions, (c) speculative pre-strip on
+    post-age-filter `dist-tags.latest` so cold-cache `npm install
+    <pkg>` succeeds without an `EINTEGRITY` surprise, (d) persistent
+    on-disk strip cache at `~/.sakimori/strip-cache/` so warm runs
+    on shared machines hit the cache. PyPI sdist strip stays out of
+    scope (different threat model — `setup.py` removal breaks the
+    build).
 
     Implementation: `crates/sakimori-proxy/src/lifecycle.rs`
     decodes the gzipped tarball, walks tar entries to find the

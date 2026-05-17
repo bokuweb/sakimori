@@ -513,6 +513,37 @@ impl SakimoriHandler {
                     .body(Body::from(format!("{reason}\n")))
                     .expect("static lifecycle deny response")
             }
+            crate::lifecycle::LifecyclePolicy::Strip => {
+                // Phase 1: Strip-mode tarball dispatch falls back to
+                // Block semantics. The rewriter itself
+                // (`lifecycle::strip_npm_tarball`) is implemented and
+                // unit-tested, but the packument-coherence pipe (a
+                // strip cache shared between the tarball handler and
+                // the packument rewriter, plus speculative
+                // pre-stripping during packument fetch so npm's
+                // integrity verifier agrees with the rewritten bytes)
+                // is intentionally deferred to Phase 2 — see
+                // CLAUDE.md roadmap #15. Until that lands, returning
+                // 403 here keeps Strip honest (no silent EINTEGRITY
+                // surprises) and matches what users opted into by
+                // choosing strip over audit.
+                let reason = format!(
+                    "lifecycle(strip): blocking {name}@{version} — ships install-time script(s): {}. \
+                     Strip mode's tarball-rewrite + packument-integrity coherence is implemented \
+                     in core (lifecycle::strip_npm_tarball) but the proxy-side orchestration lands \
+                     in Phase 2. For now Strip behaves like Block; add `{name}` to the lifecycle \
+                     allow-list if this install is expected.",
+                    stages.join(", ")
+                );
+                log::warn!("{reason}");
+                parts.headers.remove(http::header::CONTENT_LENGTH);
+                Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("content-type", "text/plain; charset=utf-8")
+                    .header("x-sakimori-deny", "lifecycle-script")
+                    .body(Body::from(format!("{reason}\n")))
+                    .expect("static lifecycle deny response")
+            }
         }
     }
 
@@ -581,6 +612,30 @@ impl SakimoriHandler {
         }
         match policy {
             crate::lifecycle::LifecyclePolicy::Audit => pass_through(),
+            crate::lifecycle::LifecyclePolicy::Strip => {
+                // Strip is npm-only. For PyPI sdists, `setup.py`
+                // removal generally breaks the build (the legacy
+                // backend has no `pyproject.toml`-only fallback path
+                // for most projects), so Strip falls back to Block
+                // semantics on the PyPI side. Documented in
+                // CLAUDE.md roadmap #15.
+                if !inspection.is_legacy_install_hook() {
+                    return pass_through();
+                }
+                let reason = format!(
+                    "lifecycle(pypi,strip→block): {name}@{version} — sdist ships `setup.py`. \
+                     Strip mode does not rewrite PyPI sdists (setup.py removal would break the \
+                     install); falling back to Block. Prefer a wheel or allow-list `{name}`."
+                );
+                log::warn!("{reason}");
+                parts.headers.remove(http::header::CONTENT_LENGTH);
+                Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("content-type", "text/plain; charset=utf-8")
+                    .header("x-sakimori-deny", "lifecycle-script")
+                    .body(Body::from(format!("{reason}\n")))
+                    .expect("static lifecycle deny response")
+            }
             crate::lifecycle::LifecyclePolicy::Block => {
                 if !inspection.is_legacy_install_hook() {
                     // Modern PEP 517 backends only — audit-log and let
