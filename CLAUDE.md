@@ -754,13 +754,26 @@ of value-per-implementation-cost.
     presence escalates the section badge from warn to danger so
     the worm fingerprint stands out at a glance.
 
-    Remaining follow-ups: content-based fingerprints (suspicious
-    webhook URLs in `.npmrc`, dropper-signature bytes); the
-    `{dune_word}-{dune_word}-{3-digit}` repo-name and
-    authored-by-Claude commit indicators (both require GitHub API
-    rather than local file walk); `sakimori iocs update` for a
-    signed-YAML refresh path so the catalog can move faster than
-    the release cadence.
+    Content-based fingerprints: ✅ implemented as
+    `RuleKind::ContentNeedle { needle, basename_filter }` + a new
+    `scan_paths_in_root(root, paths)` entry point that reads each
+    file once (capped at `MAX_CONTENT_BYTES = 64 KiB`) and runs
+    case-insensitive substring matches. Initial needles cover the
+    canonical low-effort exfil endpoints — `webhook.site`,
+    `discord.com/api/webhooks/`, `requestbin.com` — all High
+    severity because legitimate workspace files essentially never
+    embed them. Path-only callers stay on `scan_paths(paths)` with
+    no behaviour change; supervisor / daemon / `workspace diff` /
+    `workspace scan-iocs` were re-wired to pass the workspace root
+    so content rules light up automatically.
+
+    Remaining follow-ups: the `{dune_word}-{dune_word}-{3-digit}`
+    repo-name and authored-by-Claude commit indicators (both
+    require GitHub API rather than local file walk); `sakimori iocs
+    update` for a signed-YAML refresh path so the catalog can move
+    faster than the release cadence; additional content needles
+    (dropper-signature bytes, base64-encoded private-key headers)
+    as reproducible samples surface.
 
 Explicitly **out of scope** (different product philosophy, not
 a missing feature):

@@ -152,7 +152,9 @@ pub async fn start(args: DaemonStartArgs) -> Result<()> {
         args.workspace_dir.as_deref(),
         &args.workspace_skip,
     );
-    let ioc_report = drift.as_ref().map(scan_drift_for_iocs);
+    let ioc_report = drift
+        .as_ref()
+        .map(|d| scan_drift_for_iocs(d, args.workspace_dir.as_deref()));
 
     let report = ReportArgs {
         log: &args.log,
@@ -202,14 +204,26 @@ pub async fn start(args: DaemonStartArgs) -> Result<()> {
 /// that were already in the baseline get no re-check (the baseline-
 /// snapshot opportunity is the snapshot itself; pre-existing infections
 /// are caught by `workspace scan-iocs` before the run).
-fn scan_drift_for_iocs(drift: &sakimori_core::tamper::Diff) -> sakimori_core::iocs::Report {
+///
+/// `workspace_dir` is the root for content-rule reads. When `None`
+/// (older callers that haven't been wired through), falls back to `.`
+/// — content rules will silently see missing files and skip, which is
+/// the documented fail-open behaviour.
+fn scan_drift_for_iocs(
+    drift: &sakimori_core::tamper::Diff,
+    workspace_dir: Option<&Path>,
+) -> sakimori_core::iocs::Report {
     let paths: Vec<&std::path::Path> = drift
         .added
         .iter()
         .map(|p| p.as_path())
         .chain(drift.modified.iter().map(|m| m.path.as_path()))
         .collect();
-    sakimori_core::iocs::Report::new(sakimori_core::iocs::scan_paths(paths.iter().copied()))
+    let root = workspace_dir.unwrap_or_else(|| std::path::Path::new("."));
+    sakimori_core::iocs::Report::new(sakimori_core::iocs::scan_paths_in_root(
+        root,
+        paths.iter().copied(),
+    ))
 }
 
 /// Take a fresh snapshot of `dir`, diff against the baseline file. Returns

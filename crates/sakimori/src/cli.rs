@@ -1265,7 +1265,8 @@ fn run_workspace_diff(args: WorkspaceDiffArgs) -> Result<()> {
             .chain(dif.modified.iter().map(|m| m.path.as_path()))
             .collect()
     };
-    let ioc_findings = sakimori_core::iocs::scan_paths(ioc_targets.iter().copied());
+    let ioc_findings =
+        sakimori_core::iocs::scan_paths_in_root(&args.dir, ioc_targets.iter().copied());
     let ioc_report = sakimori_core::iocs::Report::new(ioc_findings);
 
     match args.format {
@@ -1337,7 +1338,7 @@ fn run_workspace_scan_iocs(args: WorkspaceScanIocsArgs) -> Result<()> {
     let opts = tamper_options(args.skip, sakimori_core::tamper::DEFAULT_MAX_FILE_BYTES);
     let snap = sakimori_core::tamper::Snapshot::take(&args.dir, &opts)
         .with_context(|| format!("scanning {}", args.dir.display()))?;
-    let findings = sakimori_core::iocs::scan_paths(snap.files.keys());
+    let findings = sakimori_core::iocs::scan_paths_in_root(&args.dir, snap.files.keys());
     let report = sakimori_core::iocs::Report::new(findings);
 
     match args.format {
@@ -2127,7 +2128,16 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
             .map(|p| p.as_path())
             .chain(d.modified.iter().map(|m| m.path.as_path()))
             .collect();
-        sakimori_core::iocs::Report::new(sakimori_core::iocs::scan_paths(paths.iter().copied()))
+        // The workspace dir is the right root for content reads —
+        // these paths are relative to it (snapshot keys are relative).
+        let root = args
+            .snapshot_workspace
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        sakimori_core::iocs::Report::new(sakimori_core::iocs::scan_paths_in_root(
+            root,
+            paths.iter().copied(),
+        ))
     });
 
     let command_str = args.command.join(" ");

