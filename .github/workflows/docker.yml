@@ -5,6 +5,12 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# Deny-by-default at the workflow level — the `proxy-image` job opts
+# back in to exactly what it needs (`contents: read` + `packages:
+# write`). Any future job added without an explicit `permissions:`
+# block gets an empty token instead of inheriting write-all.
+permissions: {}
+
 jobs:
   proxy-image:
     # Build + push the sakimori-proxy container image to GHCR on

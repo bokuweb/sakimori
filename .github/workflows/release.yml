@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
       - name: Install musl toolchain
@@ -32,7 +32,7 @@ jobs:
         run: cargo build --release -p sakimori --target ${{ matrix.target }}
 
       # eBPF object (arch-independent ELF but rebuilt per runner for reproducibility)
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
           components: rust-src
       - name: Install bpf-linker
@@ -73,7 +73,7 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: x86_64-apple-darwin,aarch64-apple-darwin
       - name: Build both macOS targets
@@ -110,7 +110,7 @@ jobs:
       TARGET: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - name: Build sakimori-win (ETW supervisor)
         working-directory: crates/sakimori-win
         run: cargo build --release

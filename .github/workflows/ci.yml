@@ -5,12 +5,18 @@ on:
     branches: [main]
   pull_request:
 
+# Default to read-only for GITHUB_TOKEN. Individual jobs that need
+# more opt in at the job level. Pinned per CodeQL's
+# "workflow-without-permissions" rule.
+permissions:
+  contents: read
+
 jobs:
   userspace:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy, rustfmt
       - run: cargo fmt --all -- --check
@@ -115,7 +121,7 @@ jobs:
     needs: userspace
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - run: cargo build --release -p sakimori
       - name: Generate CA + start proxy in background
         run: |
@@ -313,7 +319,7 @@ jobs:
     needs: userspace
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - run: cargo build --release -p sakimori
       - run: echo "SAKIMORI_BIN=$PWD/target/release/sakimori" >>"$GITHUB_ENV"
 
@@ -369,7 +375,7 @@ jobs:
           echo "✓ npm verify-cache detected tampering (rc=$rc)"
 
       # --- pnpm ---------------------------------------------------------
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 9
       - name: pnpm — populate store v3 via a real install
@@ -453,7 +459,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
           components: rust-src
       - name: Install bpf-linker
@@ -486,7 +492,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       # Build the userspace binary natively on this runner's arch.
       - name: Build sakimori (${{ matrix.arch }})
         run: cargo build --release -p sakimori
@@ -814,7 +820,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - name: Build sakimori (host arch)
         run: cargo build --release -p sakimori
       - uses: actions/download-artifact@v4
@@ -990,7 +996,7 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - name: Build sakimori
         run: cargo build --release -p sakimori
       - name: Resolve sakimori binary path
@@ -1146,7 +1152,7 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Build sakimori (main binary; cross-OS via cfg-gated eBPF deps)
         run: cargo build --release -p sakimori

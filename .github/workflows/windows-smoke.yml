@@ -10,12 +10,21 @@ on:
       - "crates/sakimori-core/**"
       - ".github/workflows/windows-smoke.yml"
 
+# Read-only token — the workflow only checks out and runs the binary,
+# uploading artifacts under the same GITHUB_TOKEN scope. Explicit so
+# CodeQL's "workflow-without-permissions" rule stays green.
+permissions:
+  contents: read
+
 jobs:
   audit-parity:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned per CodeQL "Unpinned tag for a non-immutable Action".
+      # Same SHA as security.yml / macos-smoke.yml so bumps stay
+      # coherent across workflows.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Show runner privileges
         shell: pwsh
