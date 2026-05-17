@@ -465,8 +465,13 @@ pub struct WorkflowFinding {
     /// `pull_request_target`, `workflow_run`).
     pub triggers: Vec<String>,
     /// Steps that write to the Actions cache. Empty when the rule
-    /// fires for a non-cache reason (none today; keep the door open).
+    /// did not fire for a cache-write reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cache_writers: Vec<CacheWriter>,
+    /// Steps that check out the PR head ref. Empty when the rule
+    /// did not fire for an untrusted-checkout reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub untrusted_checkouts: Vec<UntrustedCheckout>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -478,6 +483,18 @@ pub struct CacheWriter {
     /// — e.g. "actions/cache writes on post-step", "setup-node with
     /// cache: pnpm".
     pub reason: String,
+}
+
+/// An `actions/checkout` step that pulls the PR head ref into a
+/// workflow running under a privileged trigger. Surfaced by the
+/// `pull_request_target_with_untrusted_checkout` rule.
+#[derive(Debug, Clone, Serialize)]
+pub struct UntrustedCheckout {
+    pub job: String,
+    pub step: Option<String>,
+    pub uses: String,
+    /// Raw value of `with.ref:` (or the expression we matched on).
+    pub reference: String,
 }
 
 /// Triggers that grant the workflow base-repo cache write scope
@@ -509,27 +526,53 @@ pub fn audit_workflow_yaml(yaml: &str) -> Result<Vec<WorkflowFinding>> {
         return Ok(Vec::new());
     }
 
+    let mut out = Vec::new();
+
     let writers = collect_cache_writers(&doc);
-    if writers.is_empty() {
-        return Ok(Vec::new());
+    if !writers.is_empty() {
+        let trigger_list = dangerous.join(", ");
+        let msg = format!(
+            "workflow runs on `{trigger_list}` and writes to the Actions cache — an untrusted \
+             fork PR can poison the cache that a later trusted workflow restores (TanStack-style \
+             npm supply-chain compromise). Cache writes use a runner-internal token, so \
+             `permissions: contents: read` does not block them. Split cache-writing steps into \
+             a separate workflow that does not run on fork PRs, or gate this job behind \
+             `if: github.event.pull_request.head.repo.full_name == github.repository`."
+        );
+        out.push(WorkflowFinding {
+            rule: "pull_request_target_with_cache_write",
+            severity: Severity::Error,
+            message: msg,
+            triggers: dangerous.clone(),
+            cache_writers: writers,
+            untrusted_checkouts: Vec::new(),
+        });
     }
 
-    let trigger_list = dangerous.join(", ");
-    let msg = format!(
-        "workflow runs on `{trigger_list}` and writes to the Actions cache — an untrusted fork \
-         PR can poison the cache that a later trusted workflow restores (TanStack-style npm \
-         supply-chain compromise). Cache writes use a runner-internal token, so `permissions: \
-         contents: read` does not block them. Split cache-writing steps into a separate \
-         workflow that does not run on fork PRs, or gate this job behind \
-         `if: github.event.pull_request.head.repo.full_name == github.repository`."
-    );
-    Ok(vec![WorkflowFinding {
-        rule: "pull_request_target_with_cache_write",
-        severity: Severity::Error,
-        message: msg,
-        triggers: dangerous,
-        cache_writers: writers,
-    }])
+    let checkouts = collect_untrusted_checkouts(&doc);
+    if !checkouts.is_empty() {
+        let trigger_list = dangerous.join(", ");
+        let msg = format!(
+            "workflow runs on `{trigger_list}` and checks out the PR head ref — privileged \
+             triggers run with write-scoped `GITHUB_TOKEN` and the base repo's secrets, but the \
+             checked-out code is attacker-controlled. Any subsequent `run:` step (build, test, \
+             install, lint) will execute that code with those credentials. Move untrusted code \
+             execution to a `pull_request` workflow, or gate this job behind \
+             `if: github.event.pull_request.head.repo.full_name == github.repository`. \
+             (See GitHub's security guidance on `pull_request_target` and zizmor's \
+             `dangerous-triggers` audit.)"
+        );
+        out.push(WorkflowFinding {
+            rule: "pull_request_target_with_untrusted_checkout",
+            severity: Severity::Error,
+            message: msg,
+            triggers: dangerous,
+            cache_writers: Vec::new(),
+            untrusted_checkouts: checkouts,
+        });
+    }
+
+    Ok(out)
 }
 
 fn collect_triggers(on: &serde_yaml::Value) -> Vec<String> {
@@ -671,6 +714,93 @@ fn classify_cache_writer(uses: &str, with: Option<&serde_yaml::Mapping>) -> Opti
     }
 
     None
+}
+
+/// Walk every step and surface `actions/checkout` invocations whose
+/// `with.ref:` resolves to the PR head — the canonical "you just gave
+/// the attacker your privileged token" pattern. A bare
+/// `actions/checkout` (no `ref:`) under `pull_request_target` is
+/// **safe by default** because it checks out the base commit, not the
+/// PR head — so we deliberately only fire when an explicit head-ish
+/// ref is set.
+fn collect_untrusted_checkouts(doc: &serde_yaml::Value) -> Vec<UntrustedCheckout> {
+    let mut out = Vec::new();
+    let Some(jobs) = doc.get("jobs").and_then(|v| v.as_mapping()) else {
+        return out;
+    };
+    for (job_id, job_val) in jobs {
+        let job_id = job_id.as_str().unwrap_or("<non-string>").to_string();
+        let Some(job_map) = job_val.as_mapping() else {
+            continue;
+        };
+        let Some(steps) = job_map
+            .get(serde_yaml::Value::String("steps".into()))
+            .and_then(|v| v.as_sequence())
+        else {
+            continue;
+        };
+        for step in steps {
+            let Some(step_map) = step.as_mapping() else {
+                continue;
+            };
+            let Some(uses) = step_map
+                .get(serde_yaml::Value::String("uses".into()))
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            let path = uses.split_once('@').map(|(p, _)| p).unwrap_or(uses);
+            if !path.eq_ignore_ascii_case("actions/checkout") {
+                continue;
+            }
+            let with = match step_map
+                .get(serde_yaml::Value::String("with".into()))
+                .and_then(|v| v.as_mapping())
+            {
+                Some(m) => m,
+                None => continue,
+            };
+            let Some(ref_val) = with
+                .get(serde_yaml::Value::String("ref".into()))
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            if !is_untrusted_ref(ref_val) {
+                continue;
+            }
+            let step_name = step_map
+                .get(serde_yaml::Value::String("name".into()))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            out.push(UntrustedCheckout {
+                job: job_id.clone(),
+                step: step_name,
+                uses: uses.to_string(),
+                reference: ref_val.to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// Recognise common PR-head ref expressions. Matched as substrings
+/// so whitespace and surrounding `${{ … }}` decoration is irrelevant.
+/// Order matters only for readability — these are independent checks.
+fn is_untrusted_ref(s: &str) -> bool {
+    let needles = [
+        "github.event.pull_request.head.sha",
+        "github.event.pull_request.head.ref",
+        "github.event.pull_request.head.repo",
+        "github.head_ref",
+        "github.event.workflow_run.head_sha",
+        "github.event.workflow_run.head_branch",
+    ];
+    if needles.iter().any(|n| s.contains(n)) {
+        return true;
+    }
+    // Literal `refs/pull/<n>/merge` or `/head` — uncommon but unambiguous.
+    s.trim_start_matches('"').starts_with("refs/pull/")
 }
 
 fn is_falsy(v: &serde_yaml::Value) -> bool {
@@ -1253,6 +1383,150 @@ jobs:
         assert_eq!(f[0].cache_writers.len(), 2);
         let jobs: Vec<&str> = f[0].cache_writers.iter().map(|w| w.job.as_str()).collect();
         assert!(jobs.contains(&"a") && jobs.contains(&"b"));
+    }
+
+    // --- untrusted-checkout lint tests -----------------------------------
+
+    #[test]
+    fn workflow_lint_fires_on_pull_request_target_with_head_sha_checkout() {
+        let yaml = r#"
+on:
+  pull_request_target:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: ./build.sh
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert_eq!(f.len(), 1, "expected one finding: {f:#?}");
+        assert_eq!(f[0].rule, "pull_request_target_with_untrusted_checkout");
+        assert_eq!(f[0].severity, Severity::Error);
+        assert_eq!(f[0].untrusted_checkouts.len(), 1);
+        assert_eq!(f[0].untrusted_checkouts[0].uses, "actions/checkout@v4");
+    }
+
+    #[test]
+    fn workflow_lint_fires_on_github_head_ref() {
+        let yaml = r#"
+on: [pull_request_target]
+jobs:
+  build:
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "pull_request_target_with_untrusted_checkout");
+    }
+
+    #[test]
+    fn workflow_lint_quiet_for_bare_checkout_under_pull_request_target() {
+        // No `ref:` set → checkout pulls the base commit, not the PR
+        // head. This is the *intended* safe-by-default behaviour of
+        // pull_request_target — don't fire on it.
+        let yaml = r#"
+on: [pull_request_target]
+jobs:
+  build:
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo hi
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert!(f.is_empty(), "bare checkout must not trip the rule: {f:#?}");
+    }
+
+    #[test]
+    fn workflow_lint_quiet_for_checkout_with_trusted_ref() {
+        let yaml = r#"
+on: [pull_request_target]
+jobs:
+  build:
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn workflow_lint_emits_both_findings_when_both_patterns_present() {
+        // The TanStack workflow was both: PR head checkout AND cache
+        // write. Each gets its own finding so suppression / grep by
+        // rule id stays meaningful.
+        let yaml = r#"
+on: [pull_request_target]
+jobs:
+  build:
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/cache@v4
+        with: { path: ., key: k }
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert_eq!(f.len(), 2, "expected one finding per rule: {f:#?}");
+        let rules: Vec<&str> = f.iter().map(|w| w.rule).collect();
+        assert!(rules.contains(&"pull_request_target_with_cache_write"));
+        assert!(rules.contains(&"pull_request_target_with_untrusted_checkout"));
+    }
+
+    #[test]
+    fn workflow_lint_quiet_for_untrusted_checkout_under_pull_request() {
+        // Plain `pull_request` is fork-scoped — head checkout there
+        // is fine, that's the point of running CI on PRs.
+        let yaml = r#"
+on: [pull_request]
+jobs:
+  build:
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert!(f.is_empty(), "pull_request scope is safe: {f:#?}");
+    }
+
+    #[test]
+    fn workflow_lint_fires_on_workflow_run_head_sha_checkout() {
+        let yaml = r#"
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+jobs:
+  publish:
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "pull_request_target_with_untrusted_checkout");
+    }
+
+    #[test]
+    fn is_untrusted_ref_recognises_common_shapes() {
+        assert!(is_untrusted_ref(
+            "${{ github.event.pull_request.head.sha }}"
+        ));
+        assert!(is_untrusted_ref("${{github.head_ref}}"));
+        assert!(is_untrusted_ref("refs/pull/42/merge"));
+        assert!(!is_untrusted_ref("main"));
+        assert!(!is_untrusted_ref("${{ github.sha }}"));
+        assert!(!is_untrusted_ref("${{ github.ref }}"));
     }
 
     #[test]

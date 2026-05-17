@@ -481,28 +481,63 @@ of value-per-implementation-cost.
       own Runner.Worker = its own job = needs its own
       `bokuweb/sakimori/job@v0`).
 13. **GHA cache-poisoning lint** (TanStack-style PR-cache attack) —
-    extend `coronarium actions audit` with a workflow-level rule:
-    if `on:` contains `pull_request_target` (or `workflow_run` with
-    a writable cache) **and** any job step writes to the GitHub
-    Actions cache, emit an Error. Cache writers to detect:
-    `actions/cache@*`, `actions/cache/save@*`, any `actions/setup-*`
-    invocation with a `with.cache:` input, and a small allow-list
-    of well-known cache-providing actions (`Swatinem/rust-cache`,
-    `astral-sh/setup-uv`, `pnpm/action-setup` when paired with
-    `setup-node cache:`). Reason: cache writes use a runner-internal
-    token, not the workflow `GITHUB_TOKEN`, so `permissions:
-    contents: read` does not block them — an untrusted fork PR
-    running under `pull_request_target` can poison the
-    pnpm/npm/cargo store cache that a later trusted workflow
-    restores. This is the **TanStack npm supply-chain compromise
-    (2025)** vector and the static check would have caught it.
-    Output: workflow-level finding (file-scoped, not `uses:`-scoped)
-    naming the trigger + the offending step(s). JSON shape: new
-    `workflow_findings` array alongside the existing per-`uses:`
-    `findings`. Out of scope for the first slice: detecting cache
-    writes inside `run:` scripts (e.g. raw `gh actions-cache`
-    calls), and pruning false positives when the cache key is
-    proven untouchable from the PR side — both can be follow-ups.
+    ✅ implemented as workflow-level rules in `sakimori actions
+    audit`. Two sibling rules, each emitting its own Error finding
+    in the `workflow_findings` array (file-scoped, not
+    `uses:`-scoped):
+    - `pull_request_target_with_cache_write` — fires when `on:`
+      contains `pull_request_target` or `workflow_run` **and** any
+      job step writes to the Actions cache. Cache writer matchers:
+      `actions/cache@*`, `actions/cache/save@*`, `actions/setup-*`
+      with a truthy `with.cache:` input, `actions/setup-go` (which
+      defaults to caching on — fires unless `with.cache: false`),
+      `Swatinem/rust-cache`, `mozilla-actions/sccache-action`, and
+      `astral-sh/setup-uv` with `enable-cache: true`. Reason: cache
+      writes use a runner-internal token, not the workflow
+      `GITHUB_TOKEN`, so `permissions: contents: read` does not
+      block them — this is the **TanStack npm supply-chain
+      compromise (2025)** vector.
+    - `pull_request_target_with_untrusted_checkout` (added per the
+      TanStack post-mortem) — fires when a privileged trigger
+      checks out the PR head via `actions/checkout` with
+      `with.ref:` resolving to a head-ish expression
+      (`github.event.pull_request.head.{sha,ref,repo}`,
+      `github.head_ref`, `github.event.workflow_run.head_{sha,
+      branch}`, or a literal `refs/pull/…`). Bare `actions/checkout`
+      under `pull_request_target` is safe-by-default (it checks out
+      the base commit), so the rule explicitly only fires on an
+      explicit head-ish ref — same shape zizmor's
+      `dangerous-triggers` audit catches.
+
+    Out of scope: cache writes inside `run:` scripts (raw `gh
+    actions-cache` calls); cache writes by hand-rolled `pnpm/
+    action-setup`-style wrappers; pruning false positives when the
+    cache key is provably untouchable from the PR side — all
+    follow-ups.
+
+    **Follow-ups surfaced by the TanStack post-mortem** (open):
+    - **CODEOWNERS-for-`.github/` lint** — new repo-scoped
+      `sakimori actions audit-repo <root>` (or a `--repo` flag on
+      the existing command) that reads `CODEOWNERS` at the three
+      canonical locations (`.github/CODEOWNERS`, `CODEOWNERS`,
+      `docs/CODEOWNERS`) and emits a Warn-level finding if no
+      pattern covers `.github/workflows/` (or `.github/` broadly).
+      Reason: without owner gating, any maintainer push can ship a
+      workflow change that introduces the very rules this lint
+      catches. Different from the per-file `audit` because it
+      needs the repo structure, not just YAML — own subcommand
+      keeps the file-scoped invocation cheap.
+    - **`zizmor` parity surface** — sakimori's two rules cover the
+      cache-poisoning + dangerous-checkout slices; zizmor catches
+      a wider set (`template-injection`, `excessive-permissions`,
+      `unpinned-uses` overlap, `artipacked`, etc.). Open question
+      whether to grow native rules or ship a `sakimori actions
+      audit --via-zizmor` wrapper that installs+runs zizmor and
+      merges its SARIF into the same `workflow_findings` shape.
+      Native is more honest about what we actually validate;
+      wrapper is faster to ship and keeps us aligned with their
+      rule cadence. TanStack themselves chose to adopt zizmor —
+      not building it themselves is a reasonable signal.
 14. **`sakimori deps verify-cache`** — hash the package manager's
     local cache against the lockfile's `integrity:` fields before
     install. Detects the *content* half of the TanStack vector:

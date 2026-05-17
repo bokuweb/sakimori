@@ -1661,6 +1661,17 @@ fn run_actions_audit(args: ActionsAuditArgs) -> Result<()> {
                             r = w.reason
                         );
                     }
+                    for c in &wf.untrusted_checkouts {
+                        let where_ = match &c.step {
+                            Some(name) => format!("{}/{name}", c.job),
+                            None => c.job.clone(),
+                        };
+                        println!(
+                            "         · {where_} ({uses}): ref = `{r}`",
+                            uses = c.uses,
+                            r = c.reference
+                        );
+                    }
                     if matches!(wf.severity, Severity::Error) {
                         blocking += 1;
                     }
