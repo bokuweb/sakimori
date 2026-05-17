@@ -6,7 +6,7 @@
 
 use std::fmt::Write;
 
-use crate::{events::Event, policy::Policy, stats::Stats, tamper::Diff};
+use crate::{events::Event, iocs, policy::Policy, stats::Stats, tamper::Diff};
 
 /// Render the full report. The result is a complete `<!DOCTYPE html>`
 /// document.
@@ -15,6 +15,7 @@ pub fn render(
     stats: &Stats,
     meta: ReportMeta<'_>,
     drift: Option<&Diff>,
+    iocs: Option<&iocs::Report>,
 ) -> String {
     let mut html = String::with_capacity(16 * 1024);
 
@@ -123,6 +124,12 @@ pub fn render(
         && !d.is_clean()
     {
         render_drift_section(&mut html, d);
+    }
+
+    if let Some(r) = iocs
+        && !r.is_clean()
+    {
+        render_iocs_section(&mut html, r);
     }
 
     html.push_str(
@@ -377,6 +384,72 @@ fn render_drift_section(out: &mut String, drift: &Diff) {
     out.push_str("  </section>\n\n");
 }
 
+/// Cap on IOC rows surfaced before truncation. Same shape as the
+/// drift cap — the full list lives in `workspace_iocs` of the JSON
+/// log regardless.
+const HTML_IOCS_TOP_N: usize = 50;
+
+fn render_iocs_section(out: &mut String, report: &iocs::Report) {
+    let total = report.findings.len();
+    let high = report
+        .findings
+        .iter()
+        .filter(|f| f.severity == iocs::Severity::High)
+        .count();
+    // High-severity hits get the danger badge so the section header
+    // jumps out the same way the drift header does in modify-heavy
+    // runs. Medium-only stays warn-coloured to match its step-summary
+    // treatment.
+    let badge_class = if high > 0 {
+        "badge-danger"
+    } else {
+        "badge-warn"
+    };
+    let _ = write!(
+        out,
+        r#"  <section class="iocs">
+    <h2>Known-IOC hits <span class="badge {badge_class}">{total} hit{plural}</span></h2>
+    <p class="hint">Files matching the bundled IOC catalog
+       (<code>catalog {ver}</code>). A High-severity hit forces a
+       non-zero exit even in audit mode — these are known supply-chain
+       worm fingerprints, not policy calls to soften with
+       <code>--allow-drift</code>.</p>
+    <table class="events-table">
+      <thead><tr><th>severity</th><th>path</th><th>rule</th><th>family</th><th>description</th></tr></thead>
+      <tbody>
+"#,
+        badge_class = badge_class,
+        total = total,
+        plural = if total == 1 { "" } else { "s" },
+        ver = html_escape(report.catalog_version),
+    );
+    for f in report.findings.iter().take(HTML_IOCS_TOP_N) {
+        let (chip_class, label) = match f.severity {
+            iocs::Severity::High => ("chip-del", "🛑 HIGH"),
+            iocs::Severity::Medium => ("chip-mod", "⚠️ MED"),
+        };
+        let _ = writeln!(
+            out,
+            r#"        <tr><td><span class="chip {chip_class}">{label}</span></td><td><code>{path}</code></td><td><code>{rule}</code></td><td>{family}</td><td>{desc}</td></tr>"#,
+            chip_class = chip_class,
+            label = label,
+            path = html_escape(&f.path.display().to_string()),
+            rule = html_escape(f.rule_id),
+            family = html_escape(f.family),
+            desc = html_escape(f.description),
+        );
+    }
+    out.push_str("      </tbody>\n    </table>\n");
+    if total > HTML_IOCS_TOP_N {
+        let _ = writeln!(
+            out,
+            r#"    <p class="hint">… {} more rows omitted; full list is in <code>workspace_iocs</code> of the JSON log.</p>"#,
+            total - HTML_IOCS_TOP_N,
+        );
+    }
+    out.push_str("  </section>\n\n");
+}
+
 fn drift_modification_note(m: &crate::tamper::ModifiedEntry) -> String {
     use crate::tamper::Entry;
     match (&m.before, &m.after) {
@@ -561,6 +634,9 @@ main { max-width: 1200px; margin: 0 auto; padding: 32px; }
 .drift { margin-bottom: 32px; }
 .drift h2 { display: flex; gap: 12px; align-items: center; }
 
+.iocs { margin-bottom: 32px; }
+.iocs h2 { display: flex; gap: 12px; align-items: center; }
+
 .events { margin-bottom: 32px; }
 .toolbar {
   display: flex; justify-content: space-between; gap: 16px;
@@ -700,7 +776,7 @@ mod tests {
     fn html_includes_host_column_header() {
         let p = Policy::permissive_audit();
         let s = stats_with_one_connect("1.2.3.4", None);
-        let out = render(&p, &s, meta(), None);
+        let out = render(&p, &s, meta(), None, None);
         assert!(out.contains("<th>host</th>"), "host column header missing");
     }
 
@@ -708,7 +784,7 @@ mod tests {
     fn connect_row_shows_hostname_when_present() {
         let p = Policy::permissive_audit();
         let s = stats_with_one_connect("1.2.3.4", Some("example.com"));
-        let out = render(&p, &s, meta(), None);
+        let out = render(&p, &s, meta(), None, None);
         assert!(out.contains("example.com"), "hostname should render");
         // The IP still appears in the detail column.
         assert!(out.contains("1.2.3.4:443"));
@@ -718,7 +794,7 @@ mod tests {
     fn connect_row_shows_dash_when_hostname_missing() {
         let p = Policy::permissive_audit();
         let s = stats_with_one_connect("1.2.3.4", None);
-        let out = render(&p, &s, meta(), None);
+        let out = render(&p, &s, meta(), None, None);
         // Em-dash placeholder in the host cell.
         assert!(out.contains("—"), "dash placeholder expected when no PTR");
     }
@@ -745,7 +821,7 @@ mod tests {
             denied: false,
             source: None,
         });
-        let out = render(&p, &s, meta(), None);
+        let out = render(&p, &s, meta(), None, None);
         // Both rows should render; the host cell is simply empty for
         // non-connect events.
         assert!(out.contains("/bin/sh"));
@@ -756,7 +832,7 @@ mod tests {
     fn source_column_header_present() {
         let p = Policy::permissive_audit();
         let s = stats_with_one_connect("1.2.3.4", None);
-        let out = render(&p, &s, meta(), None);
+        let out = render(&p, &s, meta(), None, None);
         assert!(out.contains("<th>source</th>"), "source column missing");
     }
 
@@ -784,7 +860,7 @@ mod tests {
                 root_argv: Some("npm install left-pad@1.0.0".into()),
             }),
         });
-        let out = render(&p, &s, meta(), None);
+        let out = render(&p, &s, meta(), None, None);
         // Chip with the pm label rendered.
         assert!(
             out.contains(">npm<"),
@@ -802,7 +878,7 @@ mod tests {
         // Event without source → em-dash placeholder.
         let p = Policy::permissive_audit();
         let s = stats_with_one_connect("1.2.3.4", None);
-        let out = render(&p, &s, meta(), None);
+        let out = render(&p, &s, meta(), None, None);
         // Both the host and source cells use the em-dash placeholder
         // — count >=2 to confirm the source cell got one too.
         assert!(
@@ -820,7 +896,7 @@ mod tests {
         let s = Stats::default();
 
         // Clean diff → no section.
-        let out = render(&p, &s, meta(), Some(&Diff::default()));
+        let out = render(&p, &s, meta(), Some(&Diff::default()), None);
         assert!(!out.contains("Workspace drift"));
 
         // Real diff → section appears with chip rows.
@@ -839,12 +915,90 @@ mod tests {
             }],
             removed: vec![PathBuf::from("src/old.rs")],
         };
-        let out = render(&p, &s, meta(), Some(&drift));
+        let out = render(&p, &s, meta(), Some(&drift), None);
         assert!(out.contains("Workspace drift"));
         assert!(out.contains("chip-add"));
         assert!(out.contains("chip-mod"));
         assert!(out.contains("chip-del"));
         // Modification note exposes the size delta.
         assert!(out.contains("100 → 200 bytes"));
+    }
+
+    #[test]
+    fn iocs_section_renders_only_when_findings_present() {
+        use std::path::PathBuf;
+
+        let p = Policy::permissive_audit();
+        let s = Stats::default();
+
+        // Clean report → no section header.
+        let clean = iocs::Report::new(Vec::new());
+        let out = render(&p, &s, meta(), None, Some(&clean));
+        assert!(!out.contains("Known-IOC hits"));
+
+        // High + Medium findings → section appears with the danger
+        // badge (because there's at least one High) and both severity
+        // chips.
+        let report = iocs::Report::new(vec![
+            iocs::Finding {
+                path: PathBuf::from(".claude/setup.mjs"),
+                rule_id: "shai-hulud:claude-setup-mjs",
+                family: "shai-hulud",
+                severity: iocs::Severity::High,
+                description: "Shai-Hulud dropper",
+            },
+            iocs::Finding {
+                path: PathBuf::from(".npmrc"),
+                rule_id: "generic:npmrc-basename",
+                family: "generic",
+                severity: iocs::Severity::Medium,
+                description: "auth token risk",
+            },
+        ]);
+        let out = render(&p, &s, meta(), None, Some(&report));
+        assert!(
+            out.contains("Known-IOC hits"),
+            "expected IOC section heading"
+        );
+        assert!(
+            out.contains("badge-danger"),
+            "High-severity hit should escalate the badge"
+        );
+        // Both rows are rendered with the right severity chip class.
+        assert!(out.contains("chip-del"), "expected High-severity chip");
+        assert!(out.contains("chip-mod"), "expected Medium-severity chip");
+        // Catalog version surfaces in the hint so reviewers know which
+        // ruleset produced the finding.
+        assert!(
+            out.contains(iocs::Report::default().catalog_version)
+                || out.contains(crate::iocs::Report::new(Vec::new()).catalog_version),
+            "catalog version should appear in the hint"
+        );
+    }
+
+    #[test]
+    fn iocs_section_uses_warn_badge_when_only_medium_hits() {
+        // Medium-only should not promote the badge to danger — keeps
+        // the visual hierarchy honest about the severity ladder.
+        use std::path::PathBuf;
+        let p = Policy::permissive_audit();
+        let s = Stats::default();
+        let report = iocs::Report::new(vec![iocs::Finding {
+            path: PathBuf::from(".github/workflows/codeql_analysis.yml"),
+            rule_id: "generic:codeql-analysis-workflow",
+            family: "generic",
+            severity: iocs::Severity::Medium,
+            description: "generic typosquat name",
+        }]);
+        let out = render(&p, &s, meta(), None, Some(&report));
+        assert!(out.contains("Known-IOC hits"));
+        // The block starts with `Known-IOC hits` and the badge that
+        // follows should be `badge-warn`, not `badge-danger`.
+        let header_idx = out.find("Known-IOC hits").unwrap();
+        let tail = &out[header_idx..header_idx + 200];
+        assert!(
+            tail.contains("badge-warn") && !tail.contains("badge-danger"),
+            "Medium-only IOC report should use warn badge, got: {tail}"
+        );
     }
 }
