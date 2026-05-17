@@ -38,13 +38,24 @@ on:
       - "crates/sakimori-core/**"
       - ".github/workflows/macos-smoke.yml"
 
+# Read-only token: this workflow only checks out the repo and runs the
+# binary; it never writes back to GitHub. Explicit so CodeQL's
+# "workflow-without-permissions" rule stays green and so any future
+# step accidentally needing write has to opt in visibly.
+permissions:
+  contents: read
+
 jobs:
   proxy-install-recording:
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the same SHA used by `security.yml` (stable channel
+      # as of the pin date) — see CodeQL "Unpinned tag for a
+      # non-immutable Action". Update via the same workflow that
+      # bumps `security.yml`.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Build sakimori (release)
         run: cargo build --release -p sakimori
