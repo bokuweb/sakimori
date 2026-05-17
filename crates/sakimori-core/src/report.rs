@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::Result;
 
-use crate::{events::Event, html, iocs, policy::Policy, stats::Stats, tamper::Diff};
+use crate::{cloud_secrets, events::Event, html, iocs, policy::Policy, stats::Stats, tamper::Diff};
 
 /// How many rows we surface per breakdown table in the step summary.
 /// Picked to fit comfortably in a GitHub run page without scrolling
@@ -71,6 +71,15 @@ pub fn write(args: &ReportArgs<'_>, stats: &Stats) -> Result<()> {
     {
         payload["workspace_iocs"] = serde_json::to_value(iocs)?;
     }
+    // Cloud-secret egress tripwire: derived purely from the sampled
+    // events, no extra config required. Emits only when at least one
+    // Connect event from a package-manager subtree hit a known
+    // metadata / secret-store endpoint — quiet by default on clean
+    // runs the same way `workspace_drift` is.
+    let cloud_secret_hits = cloud_secrets::scan_events(&stats.samples);
+    if !cloud_secret_hits.is_empty() {
+        payload["cloud_secret_egress"] = serde_json::to_value(&cloud_secret_hits)?;
+    }
     let serialized = serde_json::to_string_pretty(&payload)?;
 
     if args.log == "-" {
@@ -100,6 +109,7 @@ pub fn write(args: &ReportArgs<'_>, stats: &Stats) -> Result<()> {
             stats,
             args.workspace_drift,
             args.workspace_iocs,
+            &cloud_secret_hits,
         );
         writeln!(f, "{body}")?;
     }
@@ -138,6 +148,7 @@ pub fn render_step_summary(
     stats: &Stats,
     drift: Option<&Diff>,
     ioc_report: Option<&iocs::Report>,
+    cloud_secret_hits: &[cloud_secrets::Hit],
 ) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "## sakimori\n");
@@ -192,7 +203,39 @@ pub fn render_step_summary(
     {
         push_ioc_section(&mut out, r);
     }
+    if !cloud_secret_hits.is_empty() {
+        push_cloud_secret_section(&mut out, cloud_secret_hits);
+    }
     out
+}
+
+fn push_cloud_secret_section(out: &mut String, hits: &[cloud_secrets::Hit]) {
+    let _ = writeln!(
+        out,
+        "\n### 🛑 Cloud-secret egress — package-manager subtree reached for credentials\n",
+    );
+    let _ = writeln!(
+        out,
+        "_Connect events whose destination matched the cloud-metadata / secret-store \
+         allowlist **and** whose originating PID's ancestor chain includes a known package \
+         manager. The {} entries below are the high-confidence \"this install just tried to \
+         steal your creds\" signal; the generic connect log carries any other allowed traffic._\n",
+        hits.len(),
+    );
+    let _ = writeln!(out, "| verdict | category | target | pid | comm | source |");
+    let _ = writeln!(out, "|:-:|---|---|---:|---|---|");
+    for h in hits {
+        let verdict = if h.denied { "❌ DENY" } else { "⚠️ ALLOW" };
+        let _ = writeln!(
+            out,
+            "| {verdict} | `{}` | `{}` | {} | `{}` | `{}` |",
+            h.category,
+            escape_pipe(&h.target),
+            h.pid,
+            escape_pipe(&h.comm),
+            escape_pipe(&h.package_manager),
+        );
+    }
 }
 
 fn push_ioc_section(out: &mut String, report: &iocs::Report) {
@@ -496,7 +539,7 @@ mod tests {
         stats.ingest(ev_open("/etc/hosts", false));
         stats.ingest(ev_exec("/bin/sh", false));
 
-        let s = render_step_summary("npm install", &stats, None, None);
+        let s = render_step_summary("npm install", &stats, None, None, &[]);
         // Header + command line.
         assert!(s.contains("## sakimori"));
         assert!(s.contains("`npm install`"));
@@ -522,7 +565,7 @@ mod tests {
         }
         stats.ingest(ev_connect(Some("evil.example"), "9.9.9.9", 443, true));
 
-        let s = render_step_summary("cmd", &stats, None, None);
+        let s = render_step_summary("cmd", &stats, None, None, &[]);
         let evil_pos = s.find("evil.example").expect("evil row present");
         let good_pos = s.find("good.example").expect("good row present");
         assert!(
@@ -539,7 +582,7 @@ mod tests {
         // headers in the summary).
         let mut stats = Stats::default();
         stats.ingest(ev_open("/x", false));
-        let s = render_step_summary("cmd", &stats, None, None);
+        let s = render_step_summary("cmd", &stats, None, None, &[]);
         assert!(s.contains("### Files"));
         assert!(!s.contains("### Network"));
         assert!(!s.contains("### Processes"));
@@ -548,7 +591,7 @@ mod tests {
     #[test]
     fn pipe_in_command_is_escaped_so_table_doesnt_break() {
         let stats = Stats::default();
-        let s = render_step_summary("bash -c 'foo | bar'", &stats, None, None);
+        let s = render_step_summary("bash -c 'foo | bar'", &stats, None, None, &[]);
         assert!(s.contains(r"bash -c 'foo \| bar'"));
     }
 
@@ -558,7 +601,7 @@ mod tests {
         for i in 0..(SUMMARY_TOP_N + 5) {
             stats.ingest(ev_open(&format!("/tmp/file-{i}"), false));
         }
-        let s = render_step_summary("cmd", &stats, None, None);
+        let s = render_step_summary("cmd", &stats, None, None, &[]);
         assert!(s.contains("more rows omitted"));
     }
 
@@ -569,7 +612,7 @@ mod tests {
             ..Stats::default()
         };
         stats.ingest(ev_open("/x", false));
-        let s = render_step_summary("cmd", &stats, None, None);
+        let s = render_step_summary("cmd", &stats, None, None, &[]);
         assert!(s.contains("⚠️"));
         assert!(s.contains("7 events were dropped"));
     }
@@ -581,7 +624,7 @@ mod tests {
         // No source attribution anywhere → table suppressed.
         let mut stats = Stats::default();
         stats.ingest(ev_connect(Some("a.example"), "1.1.1.1", 443, false));
-        let s = render_step_summary("cmd", &stats, None, None);
+        let s = render_step_summary("cmd", &stats, None, None, &[]);
         assert!(
             !s.contains("### Sources"),
             "with zero attribution the section must be hidden, got:\n{s}"
@@ -615,7 +658,7 @@ mod tests {
         stats.ingest(e2);
         stats.ingest(e3);
 
-        let s = render_step_summary("cmd", &stats, None, None);
+        let s = render_step_summary("cmd", &stats, None, None, &[]);
         assert!(s.contains("### Sources"), "section header missing");
         assert!(s.contains("`npm`"));
         assert!(s.contains("`pip`"));
@@ -643,7 +686,7 @@ mod tests {
             removed: vec![PathBuf::from("src/old.rs")],
         };
         let stats = Stats::default();
-        let s = render_step_summary("cmd", &stats, Some(&drift), None);
+        let s = render_step_summary("cmd", &stats, Some(&drift), None, &[]);
 
         assert!(s.contains("| drift    | **3** |"), "drift count missing");
         assert!(s.contains("### Workspace drift"), "drift section missing");
@@ -658,7 +701,7 @@ mod tests {
     fn drift_section_suppressed_when_clean() {
         use crate::tamper::Diff;
         let stats = Stats::default();
-        let s = render_step_summary("cmd", &stats, Some(&Diff::default()), None);
+        let s = render_step_summary("cmd", &stats, Some(&Diff::default()), None, &[]);
         assert!(!s.contains("### Workspace drift"));
         // Clean diff still gets a "drift | 0" row so the user knows
         // the snapshot ran.
@@ -678,7 +721,7 @@ mod tests {
             removed: vec![],
         };
         let stats = Stats::default();
-        let s = render_step_summary("cmd", &stats, Some(&drift), None);
+        let s = render_step_summary("cmd", &stats, Some(&drift), None, &[]);
         assert!(s.contains("more rows omitted"), "{s}");
     }
 
@@ -694,7 +737,7 @@ mod tests {
             description: "Shai-Hulud dropper",
         }]);
         let stats = Stats::default();
-        let s = render_step_summary("cmd", &stats, None, Some(&report));
+        let s = render_step_summary("cmd", &stats, None, Some(&report), &[]);
         assert!(s.contains("Known-IOC hits"), "{s}");
         assert!(s.contains("🛑 HIGH"), "{s}");
         assert!(s.contains(".claude/setup.mjs"), "{s}");
@@ -706,8 +749,53 @@ mod tests {
         use crate::iocs::Report;
         let report = Report::new(vec![]);
         let stats = Stats::default();
-        let s = render_step_summary("cmd", &stats, None, Some(&report));
+        let s = render_step_summary("cmd", &stats, None, Some(&report), &[]);
         assert!(!s.contains("Known-IOC hits"), "{s}");
+    }
+
+    #[test]
+    fn cloud_secret_section_renders_when_hits_present() {
+        let hits = vec![cloud_secrets::Hit {
+            category: "cloud-metadata-imds",
+            target: "169.254.169.254".into(),
+            pid: 1234,
+            comm: "node".into(),
+            denied: true,
+            package_manager: "npm".into(),
+        }];
+        let stats = Stats::default();
+        let s = render_step_summary("cmd", &stats, None, None, &hits);
+        assert!(s.contains("Cloud-secret egress"), "{s}");
+        assert!(s.contains("cloud-metadata-imds"), "{s}");
+        assert!(s.contains("169.254.169.254"), "{s}");
+        assert!(s.contains("❌ DENY"), "{s}");
+    }
+
+    #[test]
+    fn cloud_secret_section_omitted_when_no_hits() {
+        let stats = Stats::default();
+        let s = render_step_summary("cmd", &stats, None, None, &[]);
+        assert!(!s.contains("Cloud-secret egress"), "{s}");
+    }
+
+    #[test]
+    fn cloud_secret_section_marks_allow_distinctly_from_deny() {
+        // An allowed hit (user hasn't deployed the deny preset yet)
+        // should still appear — the signal is "the install tried",
+        // not "the install succeeded". The verdict column makes the
+        // distinction visible without burying the deny rows.
+        let hits = vec![cloud_secrets::Hit {
+            category: "cloud-secret-store",
+            target: "sts.amazonaws.com".into(),
+            pid: 1,
+            comm: "node".into(),
+            denied: false,
+            package_manager: "npm".into(),
+        }];
+        let stats = Stats::default();
+        let s = render_step_summary("cmd", &stats, None, None, &hits);
+        assert!(s.contains("⚠️ ALLOW"), "{s}");
+        assert!(!s.contains("❌ DENY"), "{s}");
     }
 
     #[test]

@@ -701,11 +701,26 @@ of value-per-implementation-cost.
     middle-string wildcards and the SNI proxy grammar only accepts
     leading `*.`. Pairs naturally with v0.33's SNI-based proxy
     egress filter so the rule fires on the *hostname the client
-    asked for*, not a CDN-rotated IP. Follow-ups: surface
-    `cloud_secret_egress` as a distinct event category in the JSON
-    log + step summary when the offending PID's ancestor chain
-    matches a package manager (today it counts as a normal denied
-    connect); ship a richer wildcard pack via the proxy once
+    asked for*, not a CDN-rotated IP.
+
+    Observability half: ✅ implemented as
+    `sakimori-core::cloud_secrets`. Post-run, the supervisor scans
+    the sampled Connect events; any whose `daddr` (or resolved
+    `hostname`) matches the canonical list **and** whose attribution
+    names a package-manager ancestor is surfaced as a `Hit { category,
+    target, pid, comm, denied, package_manager }`. Hits land in the
+    JSON log under the dedicated `cloud_secret_egress` array and in
+    the step summary as a "🛑 Cloud-secret egress" section with a
+    DENY/ALLOW verdict column — the allow case matters because the
+    signal is "this install just tried to read creds", not "this
+    install succeeded at reading creds". Lists are a single source
+    of truth shared with `policy preset cloud-secret-egress`. The
+    host matcher is component-aligned suffix (so a proper subdomain
+    like `regional.sts.amazonaws.com` hits, but
+    `attacker-sts.amazonaws.com.evil.tld` does not). Quiet on clean
+    runs.
+
+    Remaining follow-up: richer wildcard pack via the proxy once
     `*.amazonaws.com`-style entries can be ingested without a
     NetRule grammar change.
 18. **Known-IOC workspace scanner** — ✅ first slice implemented as
