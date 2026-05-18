@@ -122,6 +122,15 @@ pub struct ProxyConfig {
     /// count). Default sizes admit every legitimate npm package while
     /// refusing pathological inputs that would DoS the proxy.
     pub lifecycle_strip_limits: crate::lifecycle::StripLimits,
+    /// On-disk strip-cache directory (Phase 2b). `None` = pure
+    /// in-memory cache; restarting the proxy loses every entry.
+    /// `Some` = entries are persisted atomically and loaded back on
+    /// construction so `npm install <pkg>` after a proxy restart
+    /// reuses the warm cache instead of needing another speculative
+    /// pre-fetch (or worse, EINTEGRITY on the first attempt). The
+    /// CLI default is `~/.sakimori/strip-cache/` when strip policy
+    /// is active; pass `--lifecycle-no-strip-cache` to disable.
+    pub lifecycle_strip_cache_dir: Option<std::path::PathBuf>,
 }
 
 impl ProxyConfig {
@@ -149,6 +158,7 @@ impl ProxyConfig {
             lifecycle_allow: Vec::new(),
             lifecycle_strip_on_failure: crate::lifecycle::StripFailurePolicy::Block,
             lifecycle_strip_limits: crate::lifecycle::StripLimits::default(),
+            lifecycle_strip_cache_dir: None,
         })
     }
 }
@@ -320,7 +330,19 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
         lifecycle_allow: Arc::new(cfg.lifecycle_allow.into_iter().collect()),
         lifecycle_strip_on_failure: cfg.lifecycle_strip_on_failure,
         lifecycle_strip_limits: cfg.lifecycle_strip_limits,
-        strip_cache: Arc::new(crate::strip_cache::StripCache::new()),
+        strip_cache: Arc::new(match cfg.lifecycle_strip_cache_dir.as_ref() {
+            Some(dir) => match crate::strip_cache::StripCache::with_persist_dir(dir.clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!(
+                        "strip-cache: could not open persist dir {}: {e} — falling back to in-memory",
+                        dir.display(),
+                    );
+                    crate::strip_cache::StripCache::new()
+                }
+            },
+            None => crate::strip_cache::StripCache::new(),
+        }),
         upstream_user_agent: cfg.user_agent.clone(),
     };
 
