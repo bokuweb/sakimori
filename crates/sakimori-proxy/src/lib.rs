@@ -14,6 +14,7 @@ pub mod otlp;
 pub mod parser;
 pub mod proxy;
 pub mod pypi_simple_client;
+pub mod registries;
 pub mod rewrite;
 pub mod rewrite_npm;
 pub mod rewrite_nuget;
@@ -25,9 +26,10 @@ pub mod typosquat;
 pub use decision::{AgeOracle, Decider, Decision, RegistryOracle};
 pub use parser::{
     CratesIoParser, CratesIoSparseParser, ParseResult, RegistryParser, default_parsers,
-    parse_for_host,
+    parse_for_host, parsers_from_hosts,
 };
 pub use proxy::{ProxyConfig, run};
+pub use registries::RegistryHosts;
 pub use rewrite::{RewriteStats, rewrite_crates_index_jsonl};
 pub use rewrite_npm::{NpmRewriteStats, rewrite_npm_packument};
 pub use rewrite_nuget::{

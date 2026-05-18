@@ -23,8 +23,11 @@ use sakimori_core::installs::{ExecutionMode, InstallEvent, InstallLogger};
 use crate::ca::{CaFiles, ensure_ca, trust_instructions};
 use crate::decision::{AgeOracle, Decider, Decision};
 use crate::nuget_flatcontainer_client::NugetFlatContainerClient;
-use crate::parser::{ParseResult, RegistryParser, default_parsers, parse_for_host};
+#[cfg(test)]
+use crate::parser::default_parsers;
+use crate::parser::{ParseResult, RegistryParser, parse_for_host, parsers_from_hosts};
 use crate::pypi_simple_client::PypiSimpleClient;
+use crate::registries::RegistryHosts;
 use crate::rewrite::rewrite_crates_index_jsonl;
 use crate::rewrite_npm::{NpmRewriteOptions, rewrite_npm_packument_with};
 use crate::rewrite_nuget::{rewrite_nuget_flatcontainer, rewrite_nuget_registration};
@@ -131,6 +134,14 @@ pub struct ProxyConfig {
     /// CLI default is `~/.sakimori/strip-cache/` when strip policy
     /// is active; pass `--lifecycle-no-strip-cache` to disable.
     pub lifecycle_strip_cache_dir: Option<std::path::PathBuf>,
+    /// Per-ecosystem registry hosts. Defaults cover the canonical
+    /// public registries (`registry.npmjs.org`, `pypi.org` +
+    /// `files.pythonhosted.org`, `crates.io` + `index.crates.io`,
+    /// `api.nuget.org`). Append additional hosts (Verdaccio, GitHub
+    /// Packages, Artifactory, Takumi Guard, …) here so the same
+    /// rewriters / lifecycle gate fire on internal-mirror traffic.
+    /// See [`RegistryHosts`].
+    pub registries: RegistryHosts,
 }
 
 impl ProxyConfig {
@@ -159,6 +170,7 @@ impl ProxyConfig {
             lifecycle_strip_on_failure: crate::lifecycle::StripFailurePolicy::Block,
             lifecycle_strip_limits: crate::lifecycle::StripLimits::default(),
             lifecycle_strip_cache_dir: None,
+            registries: RegistryHosts::default(),
         })
     }
 }
@@ -313,8 +325,10 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
             cfg.user_agent.clone(),
         ))
     });
+    let registries = Arc::new(cfg.registries.clone());
     let handler = SakimoriHandler {
-        parsers: Arc::new(default_parsers()),
+        parsers: Arc::new(parsers_from_hosts(&cfg.registries)),
+        registries: registries.clone(),
         decider,
         last_host: None,
         last_path: None,
@@ -370,7 +384,9 @@ fn rcgen_cert_from_pem(pem: &[u8]) -> Result<rcgen::Certificate> {
 /// Only MITM traffic bound for hosts we care about. Everything else
 /// gets passed through as an opaque TCP tunnel.
 fn should_intercept(host: &str, parsers: &[Box<dyn RegistryParser>]) -> bool {
-    parsers.iter().any(|p| host.eq_ignore_ascii_case(p.host()))
+    parsers
+        .iter()
+        .any(|p| p.hosts().iter().any(|h| host.eq_ignore_ascii_case(h)))
 }
 
 /// Decide whether an incoming request should be denied by the
@@ -417,6 +433,10 @@ fn egress_deny_reason(
 #[derive(Clone)]
 struct SakimoriHandler {
     parsers: Arc<Vec<Box<dyn RegistryParser>>>,
+    /// Same host configuration the parsers were built from; consulted
+    /// by `classify_response` so the rewriters fire on user-configured
+    /// internal mirrors and not only the canonical public hosts.
+    registries: Arc<RegistryHosts>,
     decider: Arc<Decider<dyn AgeOracle>>,
     /// Host of the in-flight request, captured in `handle_request` so
     /// `handle_response` knows whether to rewrite the body. hudsucker
@@ -925,8 +945,11 @@ impl HttpHandler for SakimoriHandler {
         // Decide whether and how to rewrite based on host + path. Only
         // endpoints we specifically understand get touched; everything
         // else flows through byte-for-byte.
-        let Some(target) = classify_response(self.last_host.as_deref(), self.last_path.as_deref())
-        else {
+        let Some(target) = classify_response(
+            self.last_host.as_deref(),
+            self.last_path.as_deref(),
+            &self.registries,
+        ) else {
             return res;
         };
         // 2xx only — preserve 404 / 304 / etc. as-is.
@@ -1346,16 +1369,20 @@ enum RewriteTarget {
 /// `/@scope/<pkg>`. Per-version manifests (`/<pkg>/<version>`) and
 /// tarballs (`/<pkg>/-/<tgz>`) are not packuments and would be
 /// corrupted by packument-shaped filtering.
-fn classify_response(host: Option<&str>, path: Option<&str>) -> Option<RewriteTarget> {
+fn classify_response(
+    host: Option<&str>,
+    path: Option<&str>,
+    registries: &RegistryHosts,
+) -> Option<RewriteTarget> {
     let host = host?;
     let path = path?;
-    if host.eq_ignore_ascii_case("index.crates.io") {
+    if host_in(&registries.crates_sparse, host) {
         return Some(RewriteTarget::CratesSparse);
     }
-    if host.eq_ignore_ascii_case("registry.npmjs.org") && is_npm_packument_path(path) {
+    if host_in(&registries.npm, host) && is_npm_packument_path(path) {
         return Some(RewriteTarget::NpmPackument);
     }
-    if host.eq_ignore_ascii_case("pypi.org") {
+    if host_in(&registries.pypi_index, host) {
         if is_pypi_json_api_path(path) {
             return Some(RewriteTarget::PypiJsonApi);
         }
@@ -1368,7 +1395,7 @@ fn classify_response(host: Option<&str>, path: Option<&str>) -> Option<RewriteTa
             return Some(RewriteTarget::PypiSimpleIndex(pkg));
         }
     }
-    if host.eq_ignore_ascii_case("api.nuget.org") {
+    if host_in(&registries.nuget, host) {
         if is_nuget_registration_path(path) {
             return Some(RewriteTarget::NugetRegistration);
         }
@@ -1377,6 +1404,10 @@ fn classify_response(host: Option<&str>, path: Option<&str>) -> Option<RewriteTa
         }
     }
     None
+}
+
+fn host_in(set: &[String], host: &str) -> bool {
+    set.iter().any(|h| host.eq_ignore_ascii_case(h))
 }
 
 /// NuGet flat-container index: `/v3-flatcontainer/<id>/index.json`.
@@ -1654,37 +1685,40 @@ mod tests {
 
     #[test]
     fn classify_response_routes_to_correct_rewriter() {
+        let r = RegistryHosts::default();
         assert_eq!(
-            classify_response(Some("index.crates.io"), Some("/anything")),
+            classify_response(Some("index.crates.io"), Some("/anything"), &r),
             Some(RewriteTarget::CratesSparse)
         );
         assert_eq!(
-            classify_response(Some("registry.npmjs.org"), Some("/lodash")),
+            classify_response(Some("registry.npmjs.org"), Some("/lodash"), &r),
             Some(RewriteTarget::NpmPackument)
         );
         // tarball path — npm but not a packument
         assert_eq!(
             classify_response(
                 Some("registry.npmjs.org"),
-                Some("/lodash/-/lodash-4.17.21.tgz")
+                Some("/lodash/-/lodash-4.17.21.tgz"),
+                &r,
             ),
             None
         );
         // PyPI endpoints
         assert_eq!(
-            classify_response(Some("pypi.org"), Some("/pypi/requests/json")),
+            classify_response(Some("pypi.org"), Some("/pypi/requests/json"), &r),
             Some(RewriteTarget::PypiJsonApi)
         );
         assert_eq!(
-            classify_response(Some("pypi.org"), Some("/simple/requests/")),
+            classify_response(Some("pypi.org"), Some("/simple/requests/"), &r),
             Some(RewriteTarget::PypiSimpleIndex("requests".into()))
         );
-        assert_eq!(classify_response(Some("pypi.org"), Some("/")), None);
+        assert_eq!(classify_response(Some("pypi.org"), Some("/"), &r), None);
         // NuGet registration.
         assert_eq!(
             classify_response(
                 Some("api.nuget.org"),
-                Some("/v3/registration5-semver1/newtonsoft.json/index.json")
+                Some("/v3/registration5-semver1/newtonsoft.json/index.json"),
+                &r,
             ),
             Some(RewriteTarget::NugetRegistration)
         );
@@ -1692,7 +1726,8 @@ mod tests {
         assert_eq!(
             classify_response(
                 Some("api.nuget.org"),
-                Some("/v3-flatcontainer/newtonsoft.json/index.json")
+                Some("/v3-flatcontainer/newtonsoft.json/index.json"),
+                &r,
             ),
             Some(RewriteTarget::NugetFlatContainerIndex(
                 "newtonsoft.json".into()
@@ -1703,16 +1738,114 @@ mod tests {
         assert_eq!(
             classify_response(
                 Some("api.nuget.org"),
-                Some("/v3-flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg")
+                Some("/v3-flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg"),
+                &r,
             ),
             None
         );
         // unrecognised host
         assert_eq!(
-            classify_response(Some("evil.example.com"), Some("/foo")),
+            classify_response(Some("evil.example.com"), Some("/foo"), &r),
             None
         );
-        assert_eq!(classify_response(None, Some("/foo")), None);
+        assert_eq!(classify_response(None, Some("/foo"), &r), None);
+    }
+
+    #[test]
+    fn classify_response_honours_custom_npm_host() {
+        let mut r = RegistryHosts::default();
+        r.npm.push("npm.flatt.tech".into());
+        assert_eq!(
+            classify_response(Some("npm.flatt.tech"), Some("/lodash"), &r),
+            Some(RewriteTarget::NpmPackument)
+        );
+        // Original canonical host still works.
+        assert_eq!(
+            classify_response(Some("registry.npmjs.org"), Some("/lodash"), &r),
+            Some(RewriteTarget::NpmPackument)
+        );
+    }
+
+    #[test]
+    fn classify_response_honours_custom_pypi_index_host() {
+        let mut r = RegistryHosts::default();
+        r.pypi_index.push("pypi.flatt.tech".into());
+        assert_eq!(
+            classify_response(Some("pypi.flatt.tech"), Some("/pypi/requests/json"), &r),
+            Some(RewriteTarget::PypiJsonApi)
+        );
+        assert_eq!(
+            classify_response(Some("pypi.flatt.tech"), Some("/simple/requests/"), &r),
+            Some(RewriteTarget::PypiSimpleIndex("requests".into()))
+        );
+    }
+
+    #[test]
+    fn classify_response_honours_custom_nuget_host() {
+        let mut r = RegistryHosts::default();
+        r.nuget.push("nuget.flatt.tech".into());
+        assert_eq!(
+            classify_response(
+                Some("nuget.flatt.tech"),
+                Some("/v3/registration5-semver1/newtonsoft.json/index.json"),
+                &r,
+            ),
+            Some(RewriteTarget::NugetRegistration)
+        );
+        assert_eq!(
+            classify_response(
+                Some("nuget.flatt.tech"),
+                Some("/v3-flatcontainer/newtonsoft.json/index.json"),
+                &r,
+            ),
+            Some(RewriteTarget::NugetFlatContainerIndex(
+                "newtonsoft.json".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn classify_response_honours_custom_crates_sparse_host() {
+        let mut r = RegistryHosts::default();
+        r.crates_sparse.push("crates.flatt.tech".into());
+        assert_eq!(
+            classify_response(Some("crates.flatt.tech"), Some("/1/s/serde"), &r),
+            Some(RewriteTarget::CratesSparse)
+        );
+    }
+
+    #[test]
+    fn classify_response_with_empty_ecosystem_yields_none() {
+        // Disabling an ecosystem (empty host list) must also prevent
+        // its rewriter from firing on the canonical host.
+        let r = RegistryHosts {
+            npm: vec![],
+            ..RegistryHosts::default()
+        };
+        assert_eq!(
+            classify_response(Some("registry.npmjs.org"), Some("/lodash"), &r),
+            None
+        );
+    }
+
+    #[test]
+    fn should_intercept_picks_up_custom_hosts() {
+        let mut h = RegistryHosts::default();
+        h.npm.push("npm.flatt.tech".into());
+        h.pypi_index.push("pypi.flatt.tech".into());
+        h.nuget.push("nuget.flatt.tech".into());
+        let ps = parsers_from_hosts(&h);
+        for host in [
+            "npm.flatt.tech",
+            "NPM.FLATT.TECH",
+            "pypi.flatt.tech",
+            "nuget.flatt.tech",
+        ] {
+            assert!(should_intercept(host, &ps), "should intercept {host}");
+        }
+        for host in ["evil.example", "registry.npmjs.com"] {
+            assert!(!should_intercept(host, &ps), "should NOT intercept {host}");
+        }
     }
 
     #[test]

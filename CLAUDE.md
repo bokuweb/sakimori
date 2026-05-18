@@ -138,6 +138,73 @@ would require flipping the system-wide default-outbound to Block,
 which we won't do silently on a shared runner. `network.deny` is
 kernel-enforced; `network.default: deny` is audit-only + warn.
 
+## Custom / internal registries
+
+The proxy's per-ecosystem rewriters + lifecycle gate dispatch by
+**hostname**: traffic to `registry.npmjs.org` runs the npm packument
+rewriter, traffic to `pypi.org` runs the PyPI rewriters, etc. By
+default only the canonical public hosts are watched. Teams that route
+installs through an internal mirror (Verdaccio, GitHub Packages,
+Artifactory, Takumi Guard, JFrog, Nexus, …) need to teach the proxy
+about those hosts; otherwise traffic to e.g.
+`https://npm.flatt.tech/` passes through opaquely and none of the
+release-age / lifecycle defences fire.
+
+The configuration surface lives in `sakimori-proxy::RegistryHosts`
+(`crates/sakimori-proxy/src/registries.rs`) with three layered
+sources, applied in this order with case-insensitive dedupe:
+
+1. Built-in defaults (the canonical public host per ecosystem — always
+   in).
+2. Optional TOML config: `--registries-config <FILE>`. Schema:
+
+   ```toml
+   [registries]
+   npm           = ["registry.npmjs.org", "npm.flatt.tech"]
+   pypi_index    = ["pypi.org"]
+   pypi_files    = ["files.pythonhosted.org"]
+   crates        = ["crates.io"]
+   crates_sparse = ["index.crates.io"]
+   nuget         = ["api.nuget.org"]
+   ```
+
+3. Per-ecosystem CLI flags on `sakimori proxy start` (repeatable):
+   `--npm-registry`, `--pypi-registry`, `--pypi-files-host`,
+   `--cargo-registry-host`, `--cargo-sparse-host`, `--nuget-registry`.
+   Each accepts a bare hostname or a URL whose host is extracted
+   (`https://npm.flatt.tech:8443/` → `npm.flatt.tech`).
+
+The proxy then constructs parsers via
+`parser::parsers_from_hosts(&RegistryHosts)`; `classify_response`
+consults the same struct so the npm packument rewriter / PyPI index
+rewriter / NuGet registration rewriter / crates sparse-index
+rewriter / lifecycle gate fire on every configured host of the
+right ecosystem.
+
+**What does NOT switch by hostname** (yet, see Roadmap if applicable):
+
+- **URL path shape**. The custom host must serve the canonical
+  registry's URL shape (npm: `/<pkg>` packument + `/<pkg>/-/
+  <pkg>-<ver>.tgz` tarballs; PyPI Warehouse JSON / PEP 503/691
+  Simple index; NuGet v3 registration + flat-container; cargo sparse
+  index). A mirror that exposes a different shape (e.g. an
+  Artifactory repo at `/artifactory/api/npm/<repo>/`) needs a path-
+  prefix-aware variant of the parser — not implemented.
+- **Tarball pin URLs in the npm packument**. When the rewriter
+  retargets `dist-tags.latest` or surfaces strip-mode integrity
+  values, it edits the upstream's own `dist.tarball` URL byte-for-
+  byte; the URL host is whatever the upstream packument said, so
+  internal mirrors that rewrite `dist.tarball` to themselves keep
+  doing so transparently. No change required.
+- **OSV-mirror / typosquat-mirror**. These are sakimori-hosted
+  metadata feeds, not package registries; they have their own
+  `--osv-mirror-url` / `--typosquat-mirror-url` flags.
+
+Egress filtering (`--network-allow`) is orthogonal and stacks
+naturally: to lock the proxy to *only* internal mirrors and forbid
+the canonical public hosts, list the internal hosts under
+`--network-allow` and the public ones won't survive the default-deny.
+
 ## Roadmap (what to build next, in priority order)
 
 1. **`sakimori install-gate`** — ✅ implemented in v0.19. Three

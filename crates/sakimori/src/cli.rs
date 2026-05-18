@@ -22,6 +22,39 @@ fn ca_files_for(dir: Option<PathBuf>) -> anyhow::Result<sakimori_proxy::ca::CaFi
 /// plus an optional file. Returns `None` (= "feature off") when no
 /// patterns came from either source — `Some(empty)` would also work
 /// but `None` lets the proxy skip the per-request check entirely.
+/// Normalise a CLI-provided list of registry hosts (URL or bare
+/// host) into bare lowercased hostnames. Bad inputs error out with
+/// `--flag-name` context so the user sees which flag was rejected.
+fn normalize_hosts(flag: &str, raw: &[String]) -> Result<Vec<String>> {
+    raw.iter()
+        .map(|s| {
+            sakimori_proxy::RegistryHosts::normalize_host(s)
+                .map_err(|e| anyhow::anyhow!("{flag} `{s}`: {e}"))
+        })
+        .collect()
+}
+
+/// Build the `RegistryHosts` for `proxy start` from the optional
+/// config file plus the per-ecosystem CLI flags. Built-in defaults
+/// (`registry.npmjs.org` etc.) are always included; the file +
+/// flags append + dedupe on top.
+fn build_registries(args: &ProxyStartArgs) -> Result<sakimori_proxy::RegistryHosts> {
+    let file = args
+        .registries_config
+        .as_deref()
+        .map(sakimori_proxy::RegistryHosts::load_toml)
+        .transpose()?;
+    let cli = sakimori_proxy::RegistryHosts {
+        npm: normalize_hosts("--npm-registry", &args.npm_registry)?,
+        pypi_index: normalize_hosts("--pypi-registry", &args.pypi_registry)?,
+        pypi_files: normalize_hosts("--pypi-files-host", &args.pypi_files_host)?,
+        crates: normalize_hosts("--cargo-registry-host", &args.cargo_registry_host)?,
+        crates_sparse: normalize_hosts("--cargo-sparse-host", &args.cargo_sparse_host)?,
+        nuget: normalize_hosts("--nuget-registry", &args.nuget_registry)?,
+    };
+    Ok(sakimori_proxy::RegistryHosts::merge(file, cli))
+}
+
 fn build_network_allow(
     flags: &[String],
     file: &Option<PathBuf>,
@@ -771,6 +804,52 @@ pub struct ProxyStartArgs {
     /// only) keeps working.
     #[arg(long = "lifecycle-no-strip-cache")]
     pub lifecycle_no_strip_cache: bool,
+    /// Additional npm registry host to watch (repeatable). The
+    /// canonical `registry.npmjs.org` is always watched too; this
+    /// flag teaches the proxy about internal mirrors / replacement
+    /// registries (Verdaccio, GitHub Packages, Artifactory, Takumi
+    /// Guard, etc.) so the same packument rewriter + lifecycle gate
+    /// fire on their traffic. Accepts a bare host
+    /// (`npm.flatt.tech`) or a URL whose host is extracted
+    /// (`https://npm.flatt.tech/`).
+    #[arg(long = "npm-registry", value_name = "HOST")]
+    pub npm_registry: Vec<String>,
+    /// Additional PyPI **metadata** host to watch (repeatable). The
+    /// canonical `pypi.org` is always watched.
+    #[arg(long = "pypi-registry", value_name = "HOST")]
+    pub pypi_registry: Vec<String>,
+    /// Additional PyPI **artefact** host to watch (repeatable). The
+    /// canonical `files.pythonhosted.org` is always watched.
+    #[arg(long = "pypi-files-host", value_name = "HOST")]
+    pub pypi_files_host: Vec<String>,
+    /// Additional crates.io API host to watch (repeatable). The
+    /// canonical `crates.io` is always watched.
+    #[arg(long = "cargo-registry-host", value_name = "HOST")]
+    pub cargo_registry_host: Vec<String>,
+    /// Additional crates.io sparse-index host to watch (repeatable).
+    /// The canonical `index.crates.io` is always watched.
+    #[arg(long = "cargo-sparse-host", value_name = "HOST")]
+    pub cargo_sparse_host: Vec<String>,
+    /// Additional NuGet v3 host to watch (repeatable). The canonical
+    /// `api.nuget.org` is always watched.
+    #[arg(long = "nuget-registry", value_name = "HOST")]
+    pub nuget_registry: Vec<String>,
+    /// TOML file describing the same per-ecosystem host lists.
+    /// Layered after the built-in defaults and before the `--*-
+    /// registry` CLI flags; all three sources are appended + deduped
+    /// case-insensitively. Schema:
+    ///
+    /// ```toml
+    /// [registries]
+    /// npm = ["registry.npmjs.org", "npm.flatt.tech"]
+    /// pypi_index = ["pypi.org"]
+    /// pypi_files = ["files.pythonhosted.org"]
+    /// crates = ["crates.io"]
+    /// crates_sparse = ["index.crates.io"]
+    /// nuget = ["api.nuget.org"]
+    /// ```
+    #[arg(long = "registries-config", value_name = "FILE")]
+    pub registries_config: Option<PathBuf>,
 }
 
 fn parse_kv(s: &str) -> std::result::Result<(String, String), String> {
@@ -1053,7 +1132,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             cmd: ProxyCommand::Start(args),
         } => {
             let min_age = parse_simple_duration(&args.min_age)?;
-            let ca_files = ca_files_for(args.config_dir)?;
+            let registries = build_registries(&args)?;
+            let ca_files = ca_files_for(args.config_dir.clone())?;
             let network_allow = build_network_allow(&args.network_allow, &args.network_allow_file)?;
             let lifecycle_policy = args
                 .lifecycle_policy
@@ -1105,6 +1185,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 lifecycle_strip_on_failure,
                 lifecycle_strip_limits: sakimori_proxy::lifecycle::StripLimits::default(),
                 lifecycle_strip_cache_dir,
+                registries,
             };
             sakimori_proxy::run(cfg).await?;
             Ok(())
@@ -2351,4 +2432,135 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
     let results = crate::doctor::run_checks(&inputs);
     print!("{}", crate::doctor::render_report(&results));
     std::process::exit(crate::doctor::exit_code(&results));
+}
+
+#[cfg(test)]
+mod proxy_start_registries_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse_start(args: &[&str]) -> ProxyStartArgs {
+        let mut argv = vec!["sakimori", "proxy", "start"];
+        argv.extend_from_slice(args);
+        let cli = Cli::parse_from(argv);
+        match cli.command {
+            Command::Proxy {
+                cmd: ProxyCommand::Start(a),
+            } => *a,
+            other => panic!("expected proxy start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registries_defaults_apply_with_no_flags() {
+        let args = parse_start(&[]);
+        let r = build_registries(&args).unwrap();
+        assert_eq!(r, sakimori_proxy::RegistryHosts::default());
+    }
+
+    #[test]
+    fn npm_registry_flag_appends_one_host() {
+        let args = parse_start(&["--npm-registry", "https://npm.flatt.tech/"]);
+        let r = build_registries(&args).unwrap();
+        assert!(r.npm.iter().any(|h| h == "npm.flatt.tech"));
+        // Default kept too.
+        assert!(r.npm.iter().any(|h| h == "registry.npmjs.org"));
+    }
+
+    #[test]
+    fn npm_registry_flag_is_repeatable_and_normalises_each_value() {
+        let args = parse_start(&[
+            "--npm-registry",
+            "NPM.A.EXAMPLE",
+            "--npm-registry",
+            "https://npm.b.example:8443/path",
+        ]);
+        let r = build_registries(&args).unwrap();
+        assert!(r.npm.iter().any(|h| h == "npm.a.example"));
+        assert!(r.npm.iter().any(|h| h == "npm.b.example"));
+    }
+
+    #[test]
+    fn every_ecosystem_flag_targets_the_right_field() {
+        let args = parse_start(&[
+            "--npm-registry",
+            "npm.x",
+            "--pypi-registry",
+            "pypi.x",
+            "--pypi-files-host",
+            "files.x",
+            "--cargo-registry-host",
+            "crates.x",
+            "--cargo-sparse-host",
+            "sparse.x",
+            "--nuget-registry",
+            "nuget.x",
+        ]);
+        let r = build_registries(&args).unwrap();
+        assert!(r.npm.iter().any(|h| h == "npm.x"));
+        assert!(r.pypi_index.iter().any(|h| h == "pypi.x"));
+        assert!(r.pypi_files.iter().any(|h| h == "files.x"));
+        assert!(r.crates.iter().any(|h| h == "crates.x"));
+        assert!(r.crates_sparse.iter().any(|h| h == "sparse.x"));
+        assert!(r.nuget.iter().any(|h| h == "nuget.x"));
+    }
+
+    #[test]
+    fn registries_config_file_merges_before_cli_flags() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!(
+            "sakimori-cli-registries-{}-{nanos}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &p,
+            r#"
+[registries]
+npm = ["npm.from-file"]
+"#,
+        )
+        .unwrap();
+
+        let args = parse_start(&[
+            "--registries-config",
+            p.to_str().unwrap(),
+            "--npm-registry",
+            "npm.from-cli",
+        ]);
+        let r = build_registries(&args).unwrap();
+        let _ = std::fs::remove_file(&p);
+
+        let pos_default = r
+            .npm
+            .iter()
+            .position(|h| h == "registry.npmjs.org")
+            .expect("default present");
+        let pos_file = r
+            .npm
+            .iter()
+            .position(|h| h == "npm.from-file")
+            .expect("file present");
+        let pos_cli = r
+            .npm
+            .iter()
+            .position(|h| h == "npm.from-cli")
+            .expect("cli present");
+        assert!(
+            pos_default < pos_file && pos_file < pos_cli,
+            "want defaults < file < cli, got {pos_default} < {pos_file} < {pos_cli} from {:?}",
+            r.npm
+        );
+    }
+
+    #[test]
+    fn invalid_registry_url_is_reported_with_flag_name() {
+        let args = parse_start(&["--npm-registry", ""]);
+        let err = build_registries(&args).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--npm-registry"), "{msg}");
+    }
 }
