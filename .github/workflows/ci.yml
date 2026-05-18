@@ -16,6 +16,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # Dogfood: audit every subsequent step of this job with our
+      # own job-scoped supervisor. Reads `.github/sakimori.yml`
+      # (mode: audit) and posts the per-host/per-path/per-binary
+      # tables into this job's step summary at post-time. The
+      # rendered report is also uploaded as a build artifact at
+      # the end of the job. If a future change here pulls in a
+      # crate whose build script reaches for IMDS or rewrites
+      # `.bashrc`, the deny rules in the policy file will surface
+      # it as a ❌ row even in audit mode.
+      # SHA-pinned per our own `sakimori actions audit` rule —
+      # mutable third-party tags (`@v0`) trip an Error finding, so
+      # we eat our own dogfood and pin the action by commit. Bump
+      # the comment + SHA when cutting a new floating-v0 release.
+      #
+      # `version: v0` is required because `job/pre.js` derives the
+      # release tag from `GITHUB_ACTION_REF`, which here is the
+      # 40-char SHA. The installer treats unknown refs as literal
+      # release tags and 404s. Passing `version` explicitly skips
+      # that path — supply-chain integrity stays on the SHA pin,
+      # the installer just learns which release tarball to fetch.
+      - uses: bokuweb/sakimori/job@8491d10e50cf65e438bedb87cd6f4e496140ac29 # v0
+        with:
+          mode: audit
+          version: v0
+
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy, rustfmt
@@ -110,6 +136,21 @@ jobs:
             grep -q "${label}/" /tmp/mixed.txt || { echo "::error::no ${label} violations surfaced"; exit 1; }
           done
           echo "✓ all 4 ecosystems produced violations at --min-age 3650d"
+
+      # Upload the audit log + HTML report produced by the
+      # `bokuweb/sakimori/job` supervisor above. `if: always()` so
+      # we get the artefact even on a failed cargo step — that's
+      # exactly when you want it. The daemon writes both files
+      # during its post-hook.
+      - name: Upload sakimori audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sakimori-userspace-audit
+          path: |
+            sakimori.log.json
+            sakimori-report.html
+          if-no-files-found: ignore
 
   proxy-smoke:
     # End-to-end check that the MITM proxy correctly rewrites metadata
