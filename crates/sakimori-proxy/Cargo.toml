@@ -43,3 +43,6 @@ sha2 = "0.10"
 tar = "0.4"
 flate2 = "1"
 toml = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

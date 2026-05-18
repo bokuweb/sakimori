@@ -22,3 +22,6 @@ notify = { workspace = true }
 sha2 = "0.10"
 base64 = "0.22"
 sakimori-common = { path = "../sakimori-common", features = ["user"] }
+
+[dev-dependencies]
+proptest = { workspace = true }

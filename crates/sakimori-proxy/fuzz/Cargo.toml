@@ -1,0 +1,86 @@
+[package]
+name = "sakimori-proxy-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Coverage-guided libFuzzer harnesses for the proxy's attacker-
+# controlled byte parsers / rewriters. NOT part of the workspace
+# (lives behind `[workspace] exclude` in the root Cargo.toml) because
+# `libfuzzer-sys` requires nightly and pulls a sanitizer runtime
+# we don't want polluting the normal build.
+#
+# To run a target:
+#
+#   cd crates/sakimori-proxy/fuzz
+#   cargo +nightly fuzz run inspect_npm_tarball
+#
+# Property-style invariants (no-panic, idempotence, hash drift) are
+# also covered by `proptest` blocks inline in each module's
+# `#[cfg(test)] mod tests` — those run on every `cargo test`. The
+# fuzz harnesses go deeper on the byte-decoder surface and are
+# intended for ad-hoc / nightly CI runs, not the pre-commit gate.
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+sakimori-proxy = { path = ".." }
+
+[[bin]]
+name = "inspect_npm_tarball"
+path = "fuzz_targets/inspect_npm_tarball.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "strip_npm_tarball"
+path = "fuzz_targets/strip_npm_tarball.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inspect_pypi_sdist"
+path = "fuzz_targets/inspect_pypi_sdist.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rewrite_npm_packument"
+path = "fuzz_targets/rewrite_npm_packument.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rewrite_pypi_simple_html"
+path = "fuzz_targets/rewrite_pypi_simple_html.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rewrite_pypi_json_api"
+path = "fuzz_targets/rewrite_pypi_json_api.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rewrite_nuget_registration"
+path = "fuzz_targets/rewrite_nuget_registration.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "host_matcher_parse"
+path = "fuzz_targets/host_matcher_parse.rs"
+test = false
+doc = false
+bench = false

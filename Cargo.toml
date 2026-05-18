@@ -7,7 +7,14 @@ members = [
 ]
 # NOTE: crates/sakimori-ebpf is built separately with a bpf target via xtask.
 # crates/sakimori-win is Windows-only; has its own workspace.
-exclude = ["crates/sakimori-ebpf", "crates/sakimori-win"]
+exclude = [
+    "crates/sakimori-ebpf",
+    "crates/sakimori-win",
+    # libFuzzer harnesses; require nightly and pull libfuzzer-sys.
+    # Built via `cargo +nightly fuzz run <target>` from inside
+    # `crates/sakimori-proxy/fuzz/`. See that crate's README.
+    "crates/sakimori-proxy/fuzz",
+]
 resolver = "2"
 
 [workspace.package]
@@ -41,3 +48,9 @@ uuid = { version = "1", features = ["v4"] }
 nix = { version = "0.29", features = ["sched", "process", "user", "fs"] }
 bytes = "1"
 futures = "0.3"
+
+# Dev-only: property-based testing. Used inline in `#[cfg(test)] mod`
+# blocks across the workspace to harden parsers / rewriters / matchers
+# against adversarial inputs. Kept on the stable proptest 1.x line so
+# `cargo test` works without nightly.
+proptest = "1"

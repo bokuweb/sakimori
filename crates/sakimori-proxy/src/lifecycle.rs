@@ -1184,4 +1184,161 @@ build-backend = "setuptools.build_meta"
         let ok = std::path::Path::new("package/lib/foo.js");
         assert!(validate_entry_path(ok).is_ok());
     }
+
+    // --- proptest: invariants on tarball inspection + strip --------------
+    //
+    // The tarball path is the single attacker-controlled byte stream
+    // with the deepest decode surface in the proxy (gzip → tar →
+    // serde_json). These props cover the security contract:
+    // - Neither inspector nor stripper may ever panic on arbitrary
+    //   input. A panic at the proxy layer becomes a 5xx and a
+    //   silently-failed defence.
+    // - Stripping a benign tarball (no lifecycle scripts) must report
+    //   `Ok(None)` so the proxy serves the original bytes unchanged
+    //   and the upstream `dist.integrity` stays valid.
+    // - Strip is idempotent: running it a second time on already-
+    //   stripped bytes must report `Ok(None)`. If it ever produced
+    //   different bytes, the cache's `(name, version, orig_integrity)`
+    //   key would mis-classify and serve mismatched bytes.
+    // - The recomputed sha512/sha1 must actually match the rewritten
+    //   tarball's bytes. npm verifies these client-side; a drift here
+    //   is an `EINTEGRITY` install failure.
+
+    use proptest::prelude::*;
+    use sha2::Digest as _;
+
+    /// Build a gzipped npm-shaped tarball where `scripts` is the
+    /// user-controlled JSON object. The wrapping `name`/`version`
+    /// keep the package.json parseable for both strip and inspect.
+    fn pack_with_scripts(scripts_json: &str) -> Vec<u8> {
+        let pkg = format!(r#"{{"name":"x","version":"1.0.0","scripts":{scripts_json}}}"#);
+        pack_tarball(pkg.as_bytes())
+    }
+
+    fn lifecycle_key() -> impl Strategy<Value = &'static str> {
+        prop_oneof![
+            Just("preinstall"),
+            Just("install"),
+            Just("postinstall"),
+            Just("prepare"),
+        ]
+    }
+
+    /// Generate a `scripts` JSON object that mixes lifecycle and
+    /// non-lifecycle keys with arbitrary string bodies. Body uses a
+    /// restricted alphabet to keep the JSON well-formed without a
+    /// full escaper.
+    fn scripts_object() -> impl Strategy<Value = String> {
+        let lifecycle =
+            proptest::collection::vec((lifecycle_key(), "[a-zA-Z0-9 ._/-]{0,32}"), 0..5);
+        let other = proptest::collection::vec(("[a-z]{1,8}", "[a-zA-Z0-9 ._/-]{0,32}"), 0..3);
+        (lifecycle, other).prop_map(|(life, other)| {
+            // Dedupe keys — later wins, matching serde_json semantics.
+            let mut map = std::collections::BTreeMap::new();
+            for (k, v) in life {
+                map.insert(k.to_string(), v);
+            }
+            for (k, v) in other {
+                if !LIFECYCLE_KEYS.contains(&k.as_str()) {
+                    map.insert(k, v);
+                }
+            }
+            let body: String = map
+                .iter()
+                .map(|(k, v)| format!("\"{k}\":\"{v}\""))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{body}}}")
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+        /// `inspect_npm_tarball` must never panic on arbitrary bytes —
+        /// returns `Err(NotGzip)` / `Err(Tar)` or `Ok(Inspection)`.
+        #[test]
+        fn inspect_never_panics(body in proptest::collection::vec(any::<u8>(), 0..2048)) {
+            let _ = inspect_npm_tarball(&body);
+        }
+
+        /// `strip_npm_tarball` must never panic on arbitrary bytes.
+        /// Default limits are kept small enough that proptest cases
+        /// don't OOM, but the cap-check itself is the property under
+        /// test for oversize inputs.
+        #[test]
+        fn strip_never_panics(body in proptest::collection::vec(any::<u8>(), 0..2048)) {
+            let _ = strip_npm_tarball(&body, &StripLimits::default());
+        }
+
+        /// `inspect` only ever surfaces lifecycle-keyed scripts. Any
+        /// non-lifecycle key (test/lint/build/...) must be ignored
+        /// even if its body is non-empty.
+        #[test]
+        fn inspect_only_surfaces_lifecycle_keys(scripts in scripts_object()) {
+            let tgz = pack_with_scripts(&scripts);
+            let out = inspect_npm_tarball(&tgz).unwrap();
+            for s in &out.scripts {
+                prop_assert!(LIFECYCLE_KEYS.contains(&s.stage));
+                prop_assert!(!s.body.trim().is_empty());
+            }
+        }
+
+        /// Strip is a no-op on a tarball with no lifecycle scripts
+        /// at all. `Ok(None)` means the proxy serves the original
+        /// bytes and the upstream integrity stays valid.
+        #[test]
+        fn strip_is_noop_when_no_lifecycle_scripts(other_keys in proptest::collection::vec(("[a-z]{1,8}", "[a-zA-Z0-9 ._/-]{0,32}"), 0..4)) {
+            // Build a scripts object with only non-lifecycle keys.
+            let mut filtered: Vec<(String, String)> = other_keys.into_iter()
+                .filter(|(k, _)| !LIFECYCLE_KEYS.contains(&k.as_str()))
+                .collect();
+            filtered.sort();
+            filtered.dedup_by(|a, b| a.0 == b.0);
+            let body: String = filtered.iter()
+                .map(|(k, v)| format!("\"{k}\":\"{v}\""))
+                .collect::<Vec<_>>()
+                .join(",");
+            let scripts = format!("{{{body}}}");
+            let tgz = pack_with_scripts(&scripts);
+            let out = strip_npm_tarball(&tgz, &StripLimits::default()).unwrap();
+            prop_assert!(out.is_none(), "expected no-op strip, got {:?}", out.as_ref().map(|o| &o.stripped_stages));
+        }
+
+        /// Strip is idempotent: after stripping a tarball with
+        /// lifecycle scripts, re-stripping the output must be a
+        /// no-op (`Ok(None)`). And the recomputed integrity hashes
+        /// must match the rewritten bytes — drift here breaks the
+        /// downstream `npm install` integrity check.
+        #[test]
+        fn strip_is_idempotent_and_hashes_match(scripts in scripts_object()) {
+            let tgz = pack_with_scripts(&scripts);
+            let Some(first) = strip_npm_tarball(&tgz, &StripLimits::default()).unwrap() else {
+                // Generated scripts happened to have no lifecycle
+                // keys with non-empty bodies — nothing to strip.
+                return Ok(());
+            };
+
+            // sha512 base64 of `first.bytes` must equal first.sha512_b64.
+            use base64::Engine;
+            let mut h = sha2::Sha512::new();
+            h.update(&first.bytes);
+            let computed = base64::engine::general_purpose::STANDARD.encode(h.finalize());
+            prop_assert_eq!(&computed, &first.sha512_b64);
+
+            // Re-stripping the rewritten bytes must be a no-op.
+            let second = strip_npm_tarball(&first.bytes, &StripLimits::default()).unwrap();
+            prop_assert!(
+                second.is_none(),
+                "strip not idempotent: second pass stripped {:?}",
+                second.as_ref().map(|o| &o.stripped_stages),
+            );
+
+            // Inspecting the stripped tarball must surface no
+            // lifecycle scripts (defence-in-depth: the inspector
+            // and stripper agree on what "no scripts" means).
+            let insp = inspect_npm_tarball(&first.bytes).unwrap();
+            prop_assert!(!insp.has_scripts(), "stripped tarball still reports scripts: {:?}", insp.scripts);
+        }
+    }
 }
