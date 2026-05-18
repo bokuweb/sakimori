@@ -870,20 +870,31 @@ pub enum DepsCommand {
     /// Re-hash the package manager's local cache against the
     /// `integrity:` fields in a lockfile. Catches the *content* half
     /// of TanStack-style GHA cache poisoning: cache restored bytes
-    /// that don't match what the lockfile pinned. MVP: npm cacache
-    /// only (default root `~/.npm/_cacache`).
+    /// that don't match what the lockfile pinned. Lockfile flavour
+    /// is auto-detected by basename — `package-lock.json` (npm
+    /// cacache), `pnpm-lock.yaml` (pnpm store v3; v11 SQLite
+    /// reported as Unsupported), or `Cargo.lock` (cargo registry
+    /// `.crate` cache). Default cache root per ecosystem is the
+    /// canonical per-OS location; override with `--cache`.
     #[command(name = "verify-cache")]
     VerifyCache(DepsVerifyCacheArgs),
 }
 
 #[derive(Debug, Parser)]
 pub struct DepsVerifyCacheArgs {
-    /// Lockfile to read integrity hashes from. MVP supports
-    /// `package-lock.json` (npm v2/v3).
+    /// Lockfile to read integrity hashes from. Supported (auto-
+    /// detected by basename): `package-lock.json` (npm v2/v3),
+    /// `pnpm-lock.yaml` (v6–v10; v11+ SQLite stores are detected
+    /// and surface as Unsupported rather than silently passing),
+    /// `Cargo.lock` (any cargo-generated lockfile).
     #[arg(long, short = 'l')]
     pub lockfile: PathBuf,
-    /// Path to the package manager's cache root. Defaults to
-    /// `~/.npm/_cacache` (npm cacache layout).
+    /// Path to the package manager's cache root. Defaults per
+    /// ecosystem: `~/.npm/_cacache` (npm); `~/.local/share/pnpm/
+    /// store/v3` on Linux, `~/Library/pnpm/store/v3` on macOS,
+    /// `%LOCALAPPDATA%\pnpm\store\v3` on Windows (pnpm);
+    /// `$CARGO_HOME/registry/cache` — typically `~/.cargo/registry/
+    /// cache` (cargo).
     #[arg(long)]
     pub cache: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "text")]
