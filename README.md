@@ -278,54 +278,28 @@ Start the MITM HTTPS proxy in the foreground. `install-daemon`
 wraps this for background use; run it directly when you want logs
 on stdout or you're running the proxy yourself in Docker.
 
+Run `sakimori proxy start --help` for the canonical, always-up-to-date
+flag list. The grouping below summarises the surface so you know
+what knobs exist; defaults are tuned for "drop into `~/.zshrc` and
+forget" desktop use — CI workflows usually want to layer on the
+lifecycle gate and provenance check.
+
 ```
 sakimori proxy start [OPTIONS]
-
-Options:
-  --listen <ADDR>              [default: 127.0.0.1:8910]
-  --min-age <DURATION>         [default: 7d]
-      Grammar: `<N>{d,h,m,s}`. Versions younger than this are
-      invisible to the resolver.
-  --fail-on-missing            Treat unknown publish dates as deny
-                               (default: fail-open / allow through).
-  --require-provenance         Strict mode. Drop every npm package
-                               version without a Sigstore provenance
-                               claim. Forces publishers to have gone
-                               through OIDC-authenticated CI.
-                               (npm only for now.)
-  --osv                        Consult OSV.dev on every decision.
-                               Versions flagged as malicious
-                               packages (MAL-* or advisories
-                               mentioning "malicious") are hard-
-                               denied regardless of --min-age.
-                               Live API, per-version cached.
-  --osv-mirror                 Same blocking rule as --osv, but
-                               consumed from the sakimori-hosted
-                               pre-filtered snapshot. O(1) in-memory
-                               lookup after a single ~10-minute
-                               background refresh. ~10 min behind
-                               OSV publish time in exchange for
-                               not hitting api.osv.dev per request.
-                               Combine with --osv to additionally
-                               fall back to the live API for
-                               entries the mirror hasn't indexed.
-  --osv-mirror-url <URL>       Override mirror URL (e.g. self-hosted).
-  --network-allow <HOST>       Hostname egress allow-list (repeatable).
-                               Patterns: `host.example.com` (exact) or
-                               `*.example.com` (any subdomain, excludes
-                               apex). When set, the proxy default-denies
-                               every CONNECT/HTTP whose target host
-                               doesn't match, returning 403. Off by
-                               default — without any flag, every host
-                               passes through.
-  --network-allow-file <PATH>  Read additional `--network-allow`
-                               patterns from a file (one per line;
-                               `#` comments / blank lines skipped).
-  --config-dir <PATH>          Override CA / config directory.
-                               Defaults to $XDG_CONFIG_HOME/sakimori
-                               on Unix, %LOCALAPPDATA%\sakimori on
-                               Windows.
 ```
+
+| group | flags | what it does |
+|---|---|---|
+| **Networking** | `--listen <ADDR>` (default `127.0.0.1:8910`), `--config-dir <PATH>` | Where the proxy listens; where its CA / config files live. |
+| **Release-age gate** | `--min-age <DURATION>` (default `7d`), `--fail-on-missing` | Versions younger than `--min-age` are silently dropped from the metadata response the client sees. `--fail-on-missing` treats unknown publish dates as deny (default: fail-open). |
+| **Provenance gate** (npm only) | `--require-provenance` | Drop every npm version that doesn't carry a Sigstore provenance claim. Closes the "stolen publish token" hole `--min-age` alone can't cover — a thief can publish immediately, but without an OIDC-authenticated CI run can't attach valid provenance. |
+| **Known-malicious gate** | `--osv`, `--osv-mirror`, `--osv-mirror-url <URL>` | Consult OSV.dev (live) and/or the sakimori-hosted pre-filtered mirror; hard-deny versions tagged MAL-* / known-malicious regardless of `--min-age`. |
+| **Typosquat detection** | `--typosquat {warn,block}`, `--typosquat-mirror`, `--typosquat-mirror-url <URL>` | Compare incoming package names against a top-N-per-ecosystem list (lodash, requests, tokio, Newtonsoft.Json, …) and warn or block close-distance candidates. |
+| **Lifecycle-script gate** (Shai-Hulud-class defence) | `--lifecycle-policy {audit,block,strip}`, `--lifecycle-allow <PKG>` (repeatable), `--lifecycle-strip-on-failure {block,passthrough}`, `--lifecycle-strip-cache-dir <DIR>`, `--lifecycle-no-strip-cache` | `audit` logs install-time scripts; `block` 403s tarballs that ship them; `strip` rewrites the tarball in place to drop the script keys + recompute the SRI hash + amend the packument so npm's integrity verifier agrees. See CLAUDE.md Roadmap #15 for the threat model. |
+| **Egress allow-list** | `--network-allow <HOST>` (repeatable), `--network-allow-file <PATH>` | Default-deny hostname filter. Patterns: `host.example.com` (exact) or `*.example.com` (any subdomain, excludes apex). Off by default. |
+| **Install log + advisories** | `--no-install-log`, `--install-log <PATH>` | The local-first append-only audit log feeding `sakimori advisories scan`. On by default at `~/.sakimori/installs.jsonl`. |
+| **OTLP fan-out** | `--otlp-endpoint <URL>`, `--otlp-header <K=V>` (repeatable) | Mirror every allowed install as an OTLP/HTTP `LogRecord` to Datadog / Honeycomb / Loki / a self-run otel-collector. |
+| **Custom registries** | `--npm-registry`, `--pypi-registry`, `--pypi-files-host`, `--cargo-registry-host`, `--cargo-sparse-host`, `--nuget-registry` (all repeatable), `--registries-config <FILE>` | Teach the proxy about internal mirrors / replacement registries so the rewriters + lifecycle gate fire on their traffic too. See the [Custom registries](#custom--internal-registries) subsection below. |
 
 **First-run side effect**: generates a self-signed root CA at the
 config dir and prints the OS-specific trust command. Subsequent runs
@@ -345,6 +319,81 @@ sakimori proxy start \
     --network-allow '*.githubusercontent.com' \
     --network-allow registry.npmjs.org
 ```
+
+#### Custom / internal registries
+
+The rewriters + lifecycle gate dispatch by **hostname**. By default
+only the canonical public hosts are watched — traffic to
+`registry.npmjs.org` runs the npm packument rewriter, traffic to
+`pypi.org` runs the PyPI rewriters, etc. Internal mirrors /
+replacement registries (Verdaccio, GitHub Packages, Artifactory,
+Takumi Guard, JFrog, Nexus, …) are passed through opaquely unless
+you teach the proxy about them.
+
+Three layered sources, applied in order with case-insensitive
+dedupe: built-in defaults → optional TOML config file
+(`--registries-config <FILE>`) → per-ecosystem CLI flags. The
+canonical public hosts remain watched alongside your additions.
+
+```bash
+# CLI flags (repeatable). Each accepts a bare hostname or a URL —
+# the host part is extracted (https://npm.flatt.tech:8443/path →
+# npm.flatt.tech).
+sakimori proxy start \
+    --npm-registry npm.flatt.tech \
+    --npm-registry 'https://npm.corp.internal:8443/' \
+    --pypi-registry pypi.corp.internal \
+    --nuget-registry nuget.corp.internal
+```
+
+| flag | feeds | canonical default |
+|---|---|---|
+| `--npm-registry`        | npm packument + tarball             | `registry.npmjs.org`        |
+| `--pypi-registry`       | PyPI Warehouse JSON + Simple index  | `pypi.org`                  |
+| `--pypi-files-host`     | PyPI sdist + wheel downloads        | `files.pythonhosted.org`    |
+| `--cargo-registry-host` | crates.io API `/api/v1/crates/…`    | `crates.io`                 |
+| `--cargo-sparse-host`   | crates.io sparse index              | `index.crates.io`           |
+| `--nuget-registry`      | NuGet registration + flat-container | `api.nuget.org`             |
+
+Or pin the same lists in a config file (so a team can ship one
+canonical config and not paste the same flags into every
+invocation):
+
+```toml
+# ~/.config/sakimori/registries.toml
+[registries]
+npm           = ["registry.npmjs.org", "npm.flatt.tech"]
+pypi_index    = ["pypi.org"]
+pypi_files    = ["files.pythonhosted.org"]
+crates        = ["crates.io"]
+crates_sparse = ["index.crates.io"]
+nuget         = ["api.nuget.org"]
+```
+
+```bash
+sakimori proxy start --registries-config ~/.config/sakimori/registries.toml
+```
+
+To lock the proxy to *only* the internal mirrors and reject the
+canonical public hosts, combine with `--network-allow`:
+
+```bash
+sakimori proxy start \
+    --registries-config /etc/sakimori/registries.toml \
+    --network-allow npm.corp.internal \
+    --network-allow pypi.corp.internal
+```
+
+**Non-goals** (intentionally not done):
+- **Path-shape rewriting.** The custom host must serve the canonical
+  registry's URL shape (npm packument + `/<pkg>/-/<pkg>-<ver>.tgz`;
+  PyPI Warehouse JSON / PEP 503/691 Simple; NuGet v3 registration +
+  flat-container; cargo sparse). A mirror that exposes a different
+  layout (e.g. Artifactory at `/artifactory/api/npm/<repo>/`) needs
+  a path-prefix-aware parser variant — not implemented.
+- **`dist.tarball` URL rewriting.** The npm rewriter preserves the
+  upstream's own tarball URL byte-for-byte — mirrors that serve
+  their own tarball URLs keep doing so transparently.
 
 ### `proxy install-ca` / `uninstall-ca`
 
@@ -805,31 +854,36 @@ field to `block`. The cloud-secret-egress preset ships in
 `mode: block` (no cap on `network.deny`).
 
 **Known-IOC workspace scan (`workspace scan-iocs`):** walk a
-workspace and flag files whose existence is a known supply-chain
-compromise marker (e.g. `.claude/setup.mjs` dropped by the
-Shai-Hulud npm worm). Distinct from `workspace diff` — diff catches
-"something changed during the build," scan-iocs catches "this file
-exists at all, which it shouldn't." The catalog is shipped bundled
-in the binary (versioned YAML); override with `--index <file>` for
-private feeds, suppress a triaged false positive with `--allow-id
-<id>`. Exits non-zero on any Error-severity hit so it composes with
-CI gates; Warn-severity hits surface but don't gate.
+workspace and flag files whose path / basename / content matches
+a known supply-chain compromise fingerprint (e.g. `.claude/
+setup.mjs` dropped by the Shai-Hulud npm worm; basename `.npmrc`
+for token-exfil; content needles for `webhook.site`,
+`discord.com/api/webhooks/`, `requestbin.com`). Distinct from
+`workspace diff` — diff catches "something changed during the
+build," scan-iocs catches "this file exists at all, which it
+shouldn't." The catalog is bundled in the binary (versioned;
+`CATALOG_VERSION` in `sakimori-core::iocs`). Exits non-zero on
+any High-severity hit; `--strict` escalates Medium-severity hits
+to exit 1 too. Same skip list as `workspace snapshot` (`.git`,
+`node_modules`, `target`, …); extend with `--skip <NAME>`.
 
 ```bash
 sakimori workspace scan-iocs $GITHUB_WORKSPACE
-sakimori workspace scan-iocs . --json
+sakimori workspace scan-iocs . --format json
+sakimori workspace scan-iocs . --strict --skip my-build-artefact
 ```
 
-**Refreshing the IOC catalog:** `sakimori iocs update <url>` fetches
-a refreshed catalog (same YAML schema) from an upstream feed,
-validates it, and atomically writes it to
-`~/.sakimori/iocs.yml` (override `--output`). The scanner picks
-the override up automatically on the next run. Run
-`sakimori iocs where` to confirm which catalog is in effect; a
-corrupted override is detected and the scanner falls back to the
-bundled copy with a loud warning, never silently. Validation runs
-before the atomic rename — a malformed feed cannot clobber a
-working override on disk.
+`scan-iocs` is also wired into `workspace diff`, `sakimori run
+--snapshot-workspace`, and `sakimori daemon start
+--workspace-baseline …` automatically — every added / modified
+path in the drift report is scanned against the same catalog and
+the findings land in the JSON log under `workspace_iocs`. A
+High-severity hit forces exit 1 in any mode (Audit too); `--allow-
+drift` does not suppress it.
+
+The bundled catalog is the only source today. A signed-YAML
+refresh path (`sakimori iocs update`) is a roadmap item — see
+CLAUDE.md Roadmap #18 for the planned surface.
 
 The HTML report includes:
 - verdict (ALLOW / DENY), kind, pid, comm
@@ -1259,9 +1313,12 @@ printed `security add-trusted-cert …` line and run it yourself.
 2. Is `HTTPS_PROXY` set in **this** shell? (install-gate only
    applies to new shells.) `echo $HTTPS_PROXY`
 3. Is the package being downloaded from a host sakimori
-   intercepts? Only crates.io, registry.npmjs.org,
-   files.pythonhosted.org, pypi.org, api.nuget.org are intercepted.
-   Custom registries pass through unchanged.
+   intercepts? By default only the canonical public hosts
+   (`registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`,
+   `crates.io`, `index.crates.io`, `api.nuget.org`) are watched.
+   Internal mirrors / replacement registries need to be added —
+   see [Custom / internal registries](#custom--internal-registries)
+   for the `--npm-registry` / `--registries-config` flags.
 
 ### Container / remote Docker usage
 
@@ -1290,17 +1347,14 @@ Honest assessment. Full details in [CLAUDE.md](CLAUDE.md).
   which is already meaningful (npm refuses to attach it unless
   the publish came from OIDC-authenticated CI) but the bundle
   itself isn't cryptographically verified.
-<!-- DNS round-robin drift: addressed by `--dns-refresh-interval <secs>`
-     on `sakimori run`. Re-resolves hostname rules on the given
-     interval and additively inserts any newly-observed IPs into the
-     eBPF maps. Default is 0 (off); set to 60–300 for long-running
-     CDN-heavy jobs. Entries are never removed, so increasing the
-     rate is safe and won't kill active connections. -->
 - **CDN IP rotation across long runs**: handled by
   `sakimori run --dns-refresh-interval <secs>`, which re-resolves
   `network.allow` / `network.deny` hostnames every N seconds and
-  additively inserts new IPs. Off by default (0); 60–300 is typical
-  for CI jobs that run for hours behind round-robin DNS.
+  additively inserts new IPs into the eBPF maps. Default `15`
+  (seconds); set `0` to disable, raise to 60–300 for very long
+  CI jobs behind round-robin DNS. Entries are never removed once
+  written, so increasing the rate is safe and won't kill active
+  connections.
 
 ### Linux supervised run
 
