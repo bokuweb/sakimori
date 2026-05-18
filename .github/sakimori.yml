@@ -1,0 +1,47 @@
+# sakimori policy for this repo's own CI — dogfood reference.
+#
+# The `userspace` job in .github/workflows/ci.yml runs every step
+# under `bokuweb/sakimori/job@v0`, which reads this file. We keep it
+# in `mode: audit` so the supervisor only *reports* what cargo /
+# rustup / git / etc. touch — nothing is blocked. A future iteration
+# can tighten to `mode: block` once the audit log has shown what a
+# clean run actually looks like.
+#
+# The deny-lists below are intentionally short and high-signal:
+# they describe destinations / paths that a healthy Rust build
+# never legitimately touches but a supply-chain compromise of a
+# build-script / proc-macro would reach for. In audit mode each
+# match shows up as a ❌ row in the step summary and JSON log — a
+# loud, free smoke alarm with zero risk of false-blocking the build.
+
+mode: audit
+
+network:
+  default: allow
+  deny:
+    # IMDS — AWS / GCP / Azure cloud-credential exfiltration. A
+    # Rust build script has no business reading instance metadata.
+    - target: 169.254.169.254
+    # GHA OIDC token mint. A compromised proc-macro stealing the
+    # `id-token: write` workflow token would call this endpoint;
+    # legitimate Rust builds never do.
+    - target: vstoken.actions.githubusercontent.com
+
+file:
+  default: allow
+  deny:
+    # SSH keys — the highest-value exfil target on a CI runner.
+    - /root/.ssh
+    - /home/runner/.ssh
+    # Persistent shell rc — used by Shai-Hulud-class droppers to
+    # establish persistence across runner reuse.
+    - /home/runner/.bashrc
+    - /home/runner/.zshrc
+
+process:
+  # Audit-only list of binaries that should be visible if invoked
+  # — none of these get blocked, but their appearance in the JSON
+  # log is the first thing to look at if anything looks off.
+  deny_exec:
+    - /usr/bin/whoami
+    - /usr/bin/curl
