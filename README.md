@@ -4,6 +4,8 @@
 [![release](https://img.shields.io/github/v/release/bokuweb/sakimori?sort=semver)](https://github.com/bokuweb/sakimori/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+🚧Work In Progress🚧
+
 **Cross-platform supply-chain guard for every package manager on your
 machine.** Silently blocks too-young versions, known-malicious packages
 and unsigned publishes — across **npm, cargo, pypi, nuget** — without
