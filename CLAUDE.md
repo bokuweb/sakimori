@@ -720,9 +720,25 @@ of value-per-implementation-cost.
     original packument integrity, so the first attempt fails
     `EINTEGRITY`; a retry succeeds because the lazy strip on the
     first attempt populated the cache. This is documented in the
-    `--lifecycle-policy strip` help text. Persistent on-disk strip
-    cache at `~/.sakimori/strip-cache/` (so warm runs across proxy
-    restarts hit cached results) is the next slice — Phase 2b.
+    `--lifecycle-policy strip` help text.
+
+    **Phase 2b — persistent on-disk strip cache.** Landed. The
+    cache now optionally writes through to
+    `~/.sakimori/strip-cache/` (default when strip policy is
+    active; override with `--lifecycle-strip-cache-dir <DIR>`;
+    disable with `--lifecycle-no-strip-cache`). Layout is flat:
+    `<sha256(name|version|orig_integrity)>.json` metadata paired
+    with a sibling `.tgz` body file (omitted for `NoStripNeeded`
+    entries). Writes are atomic — `tmp` + `rename` after `sync_data`
+    — so a crashed proxy never leaves a torn record. Schema is
+    versioned (`v: 1`); future-version entries are skipped with a
+    warn log rather than mis-decoded. On startup the cache loads
+    every valid entry into the in-memory map, so a restarted proxy
+    immediately hits the same `(name, version)` warm — `npx`-style
+    ephemeral runs and lockfile-pinned re-installs of versions the
+    proxy has seen before no longer pay the `EINTEGRITY`-then-retry
+    cost across restarts. No eviction in v0; operators that need
+    bounded growth `rm -rf` the directory.
 
     PyPI sdist strip stays out of scope (different threat model —
     `setup.py` removal breaks the build).

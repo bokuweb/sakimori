@@ -757,6 +757,20 @@ pub struct ProxyStartArgs {
         default_value = "block"
     )]
     pub lifecycle_strip_on_failure: String,
+    /// On-disk directory for the strip-mode cache (Phase 2b). When
+    /// set, every successful strip is written through atomically and
+    /// the cache is loaded on startup, so `npm install <pkg>` after
+    /// a proxy restart reuses the warm cache. Defaults to
+    /// `~/.sakimori/strip-cache/` when `--lifecycle-policy strip` is
+    /// active. Ignored under other policies.
+    #[arg(long = "lifecycle-strip-cache-dir", value_name = "DIR")]
+    pub lifecycle_strip_cache_dir: Option<std::path::PathBuf>,
+    /// Disable the on-disk strip cache. Useful for ephemeral CI
+    /// runners where `~/` is throwaway anyway, or for debugging
+    /// reproducibility issues. The in-memory cache (current process
+    /// only) keeps working.
+    #[arg(long = "lifecycle-no-strip-cache")]
+    pub lifecycle_no_strip_cache: bool,
 }
 
 fn parse_kv(s: &str) -> std::result::Result<(String, String), String> {
@@ -1051,6 +1065,22 @@ pub async fn run(cli: Cli) -> Result<()> {
                 &args.lifecycle_strip_on_failure,
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+            // Pick the strip-cache persist dir per these rules:
+            //   - `--lifecycle-no-strip-cache`         → None
+            //   - policy != strip                      → None (cache is irrelevant)
+            //   - `--lifecycle-strip-cache-dir <DIR>`  → DIR
+            //   - otherwise                            → ~/.sakimori/strip-cache (when $HOME resolves)
+            let lifecycle_strip_cache_dir = if args.lifecycle_no_strip_cache
+                || !matches!(
+                    lifecycle_policy,
+                    Some(sakimori_proxy::lifecycle::LifecyclePolicy::Strip)
+                ) {
+                None
+            } else if let Some(dir) = args.lifecycle_strip_cache_dir.clone() {
+                Some(dir)
+            } else {
+                sakimori_proxy::strip_cache::default_persist_dir()
+            };
             let cfg = sakimori_proxy::ProxyConfig {
                 listen: args.listen,
                 min_age,
@@ -1074,6 +1104,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 lifecycle_allow: args.lifecycle_allow,
                 lifecycle_strip_on_failure,
                 lifecycle_strip_limits: sakimori_proxy::lifecycle::StripLimits::default(),
+                lifecycle_strip_cache_dir,
             };
             sakimori_proxy::run(cfg).await?;
             Ok(())
