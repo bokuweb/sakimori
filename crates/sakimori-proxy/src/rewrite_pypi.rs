@@ -800,4 +800,67 @@ mod tests {
         // No href at all.
         assert_eq!(extract_href_value(r#"<a class="foo">y</a>"#), None);
     }
+
+    // --- proptest: no-panic + identity invariants -----------------------
+    //
+    // The Simple HTML rewriter is the most fragile of the three PyPI
+    // shapes — it walks raw bytes, finds anchor boundaries, and
+    // mutates around them. Property tests here are the cheapest way
+    // to catch off-by-one / unicode-boundary panics that hand-written
+    // tests miss.
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+        #[test]
+        fn json_api_never_panics(body in proptest::collection::vec(any::<u8>(), 0..1024)) {
+            let _ = rewrite_pypi_json_api(&body, Duration::from_secs(86_400), Utc::now());
+        }
+
+        #[test]
+        fn simple_json_never_panics(body in proptest::collection::vec(any::<u8>(), 0..1024)) {
+            let _ = rewrite_pypi_simple_json(&body, Duration::from_secs(86_400), Utc::now());
+        }
+
+        #[test]
+        fn simple_html_never_panics(body in proptest::collection::vec(any::<u8>(), 0..1024)) {
+            let _ = rewrite_pypi_simple_html(&body, Duration::from_secs(86_400), Utc::now(), |_| None);
+        }
+
+        /// An oracle that returns `None` for every version means
+        /// "we don't know any publish times" — the HTML rewriter
+        /// must then leave the body byte-for-byte identical. A
+        /// regression here would drop entries the oracle never
+        /// claimed are too young.
+        #[test]
+        fn empty_oracle_is_identity(body in ".{0,512}") {
+            let (out, stats) = rewrite_pypi_simple_html(
+                body.as_bytes(),
+                Duration::from_secs(86_400),
+                Utc::now(),
+                |_| None,
+            );
+            prop_assert_eq!(stats.dropped, 0);
+            prop_assert_eq!(out, body.as_bytes());
+        }
+
+        /// min_age = 0 → JSON API rewriter is a no-op.
+        #[test]
+        fn json_zero_min_age_drops_nothing(version_count in 0usize..=8) {
+            let now = Utc::now();
+            let mut releases = serde_json::Map::new();
+            for i in 0..version_count {
+                let v = format!("{i}.0.0");
+                releases.insert(
+                    v,
+                    serde_json::json!([{"upload_time_iso_8601": now.to_rfc3339()}]),
+                );
+            }
+            let body = serde_json::to_vec(&serde_json::json!({"releases": releases})).unwrap();
+            let (_out, stats) = rewrite_pypi_json_api(&body, Duration::ZERO, now);
+            prop_assert_eq!(stats.dropped, 0);
+        }
+    }
 }

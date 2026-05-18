@@ -560,4 +560,67 @@ mod tests {
         assert_eq!(stats.dropped, 0);
         assert_eq!(stats.kept, 2);
     }
+
+    // --- proptest: no-panic + min_age=0 noop ----------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+        #[test]
+        fn registration_never_panics(body in proptest::collection::vec(any::<u8>(), 0..1024)) {
+            let _ = rewrite_nuget_registration(&body, Duration::from_secs(86_400), Utc::now());
+        }
+
+        #[test]
+        fn flatcontainer_never_panics(body in proptest::collection::vec(any::<u8>(), 0..1024)) {
+            let _ = rewrite_nuget_flatcontainer(
+                &body,
+                Duration::from_secs(86_400),
+                Utc::now(),
+                |_| None,
+            );
+        }
+
+        /// Registration rewriter with min_age=0 must not drop anything.
+        #[test]
+        fn registration_zero_min_age_is_noop(leaf_count in 0usize..=8) {
+            let now = Utc::now();
+            let items: Vec<serde_json::Value> = (0..leaf_count)
+                .map(|i| {
+                    serde_json::json!({
+                        "catalogEntry": {
+                            "version": format!("{i}.0.0"),
+                            "published": now.to_rfc3339(),
+                        }
+                    })
+                })
+                .collect();
+            let body = serde_json::to_vec(&serde_json::json!({
+                "count": leaf_count,
+                "items": items,
+            })).unwrap();
+            let (_out, stats) = rewrite_nuget_registration(&body, Duration::ZERO, now);
+            prop_assert_eq!(stats.dropped, 0);
+            prop_assert_eq!(stats.kept, leaf_count);
+        }
+
+        /// Flat-container with an empty oracle is fail-open: every
+        /// version is kept (the registration-index lookup may have
+        /// failed; pinned .nupkg fetches still hard-deny). A change
+        /// that flipped this to fail-closed would brick installs.
+        #[test]
+        fn flatcontainer_empty_oracle_is_fail_open(versions in proptest::collection::vec("[0-9]+\\.[0-9]+\\.[0-9]+", 0..6)) {
+            let now = Utc::now();
+            let body = serde_json::to_vec(&serde_json::json!({"versions": versions})).unwrap();
+            let (_out, stats) = rewrite_nuget_flatcontainer(
+                &body,
+                Duration::from_secs(86_400),
+                now,
+                |_| None,
+            );
+            prop_assert_eq!(stats.dropped, 0);
+        }
+    }
 }

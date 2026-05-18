@@ -286,4 +286,109 @@ mod tests {
         assert_eq!(strip_port("[::1]:8080"), "::1");
         assert_eq!(strip_port("[2001:db8::1]:443"), "2001:db8::1");
     }
+
+    // --- proptest: invariants on the parser + matcher -------------------
+    //
+    // The hand-written tests above cover specific shapes; the props
+    // below assert the *behaviour* that defines the feature, so any
+    // future tweak that breaks the security contract trips a counter-
+    // example instead of slipping through.
+
+    use proptest::prelude::*;
+
+    /// A label that's safe to splice into a hostname: a non-empty
+    /// ASCII-alphanumeric/hyphen string. Stops the generator from
+    /// emitting strings that contain `*` or `:` (those are tested
+    /// elsewhere) so each property targets exactly one contract.
+    fn host_label() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9-]{0,15}"
+    }
+
+    fn host_name() -> impl Strategy<Value = String> {
+        proptest::collection::vec(host_label(), 1..5).prop_map(|segs| segs.join("."))
+    }
+
+    proptest! {
+        /// Parser never panics. Any byte string either parses or
+        /// returns a structured `ParseError`.
+        #[test]
+        fn parse_never_panics(input in ".{0,64}") {
+            let _ = HostMatcher::from_patterns([input]);
+        }
+
+        /// Match path never panics for arbitrary host inputs.
+        #[test]
+        fn allows_never_panics(
+            pats in proptest::collection::vec(host_name(), 0..4),
+            host in ".{0,64}",
+        ) {
+            let m = HostMatcher::from_patterns(pats).unwrap_or_default();
+            let _ = m.allows(&host);
+        }
+
+        /// Security contract: `*.suffix` must NEVER match the bare
+        /// apex `suffix`. A regression here turns the wildcard into a
+        /// silent egress hole.
+        #[test]
+        fn wildcard_never_matches_apex(apex in host_name()) {
+            let pat = format!("*.{apex}");
+            let m = HostMatcher::from_patterns([pat]).unwrap();
+            prop_assert!(!m.allows(&apex));
+        }
+
+        /// Security contract: `*.suffix` must NOT match strings that
+        /// only happen to end in `suffix` (e.g. `notexample.com` vs
+        /// `*.example.com`, or `example.com.attacker.com`).
+        #[test]
+        fn wildcard_only_matches_proper_subdomains(
+            suffix in host_name(),
+            prefix in host_label(),
+            attacker_tail in host_name(),
+        ) {
+            let m = HostMatcher::from_patterns([format!("*.{suffix}")]).unwrap();
+            let proper = format!("{prefix}.{suffix}");
+            prop_assert!(m.allows(&proper));
+            let collision = format!("{prefix}{suffix}");
+            prop_assert!(!m.allows(&collision));
+            let evil = format!("{suffix}.{attacker_tail}");
+            let dot_suffix = format!(".{suffix}");
+            if !evil.ends_with(&dot_suffix) {
+                prop_assert!(!m.allows(&evil));
+            }
+        }
+
+        /// Match is case-insensitive on both sides.
+        #[test]
+        fn match_is_case_insensitive(host in host_name()) {
+            let m = HostMatcher::from_patterns([host.to_uppercase()]).unwrap();
+            prop_assert!(m.allows(&host));
+            prop_assert!(m.allows(&host.to_uppercase()));
+        }
+
+        /// A port suffix on the query side must never change the
+        /// allow/deny verdict — the matcher describes hosts, not
+        /// (host, port) pairs.
+        #[test]
+        fn port_suffix_does_not_change_verdict(
+            host in host_name(),
+            port in 1u16..=65535,
+        ) {
+            let m = HostMatcher::from_patterns([host.clone()]).unwrap();
+            let with_port = format!("{host}:{port}");
+            prop_assert_eq!(m.allows(&host), m.allows(&with_port));
+        }
+
+        /// Any pattern containing an embedded `*` (not as a leading
+        /// `*.`) must be rejected. This is the rule that stops a
+        /// typoed pattern from silently matching nothing.
+        #[test]
+        fn embedded_wildcard_always_rejected(
+            left in host_label(),
+            right in host_name(),
+        ) {
+            // Construct `<label>*.<rest>` — always has an embedded `*`.
+            let bad = format!("{left}*.{right}");
+            prop_assert!(HostMatcher::from_patterns([bad]).is_err());
+        }
+    }
 }

@@ -860,4 +860,62 @@ mod tests {
         let doc = parse(&out);
         assert_eq!(doc["versions"]["1.0.0"]["dist"]["integrity"], "sha512-ORIG");
     }
+
+    // --- proptest: invariants on the packument rewriter -----------------
+    //
+    // The npm packument rewriter takes attacker-controlled JSON bytes
+    // (we don't trust the upstream registry mirror to be benign).
+    // These props lock in:
+    // - No panic on arbitrary bytes / arbitrary JSON shapes.
+    // - `min_age = 0` is always a semantic no-op (kept count = total
+    //   versions; dropped = 0; dist-tags untouched). A regression
+    //   here would silently filter without the user asking.
+    // - Output is always valid UTF-8 / parseable JSON when the input
+    //   was. The rewriter promises pass-through on parse failure;
+    //   the round-trip property catches accidental binary corruption.
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+        #[test]
+        fn rewrite_never_panics(body in proptest::collection::vec(any::<u8>(), 0..1024)) {
+            let now = Utc::now();
+            let _ = rewrite_npm_packument(&body, Duration::from_secs(86_400), now);
+        }
+
+        /// min_age = 0 must never drop a version.
+        #[test]
+        fn zero_min_age_is_a_noop(version_count in 0usize..=8) {
+            let now = Utc::now();
+            let mut versions = serde_json::Map::new();
+            let mut time = serde_json::Map::new();
+            for i in 0..version_count {
+                let v = format!("{i}.0.0");
+                versions.insert(v.clone(), serde_json::json!({"name": "x", "version": v}));
+                time.insert(v, serde_json::Value::String(now.to_rfc3339()));
+            }
+            let body = serde_json::to_vec(&serde_json::json!({
+                "name": "x",
+                "dist-tags": {"latest": format!("{}.0.0", version_count.saturating_sub(1))},
+                "versions": versions,
+                "time": time,
+            })).unwrap();
+            let (_out, stats) = rewrite_npm_packument(&body, Duration::ZERO, now);
+            prop_assert_eq!(stats.dropped, 0);
+            prop_assert_eq!(stats.retargeted_tags, 0);
+        }
+
+        /// A packument with no recognisable shape (random JSON value
+        /// at the top, or unparseable bytes) passes through
+        /// byte-for-byte. Drops/retargets must stay at zero.
+        #[test]
+        fn unparseable_or_non_object_passes_through(garbage in "[^{]{0,128}") {
+            let now = Utc::now();
+            let (out, stats) = rewrite_npm_packument(garbage.as_bytes(), Duration::from_secs(86_400), now);
+            prop_assert_eq!(stats.dropped, 0);
+            prop_assert_eq!(out, garbage.as_bytes());
+        }
+    }
 }

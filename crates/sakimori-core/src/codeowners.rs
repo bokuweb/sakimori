@@ -509,4 +509,78 @@ mod tests {
         assert!(f.rules.is_empty());
         std::fs::remove_dir_all(&tmp).ok();
     }
+
+    // --- proptest: invariants on the parser + matcher -------------------
+
+    use proptest::prelude::*;
+
+    fn path_segment() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9_.-]{0,8}"
+    }
+
+    fn repo_path() -> impl Strategy<Value = String> {
+        proptest::collection::vec(path_segment(), 1..6).prop_map(|segs| segs.join("/"))
+    }
+
+    proptest! {
+        /// `parse` must never panic on arbitrary input. Garbage lines
+        /// are dropped — the parser is explicitly tolerant.
+        #[test]
+        fn parse_never_panics(text in ".{0,512}") {
+            let _ = parse(&text);
+        }
+
+        /// `pattern_matches` must never panic on arbitrary inputs.
+        /// (It's called from the audit path which sees both
+        /// user-authored patterns and real paths.)
+        #[test]
+        fn pattern_matches_never_panics(
+            pat in ".{0,64}",
+            path in ".{0,64}",
+        ) {
+            let _ = pattern_matches(&pat, &path);
+        }
+
+        /// Bare `*` is the documented catch-all — must match every
+        /// non-empty path.
+        #[test]
+        fn bare_star_matches_everything(path in repo_path()) {
+            prop_assert!(pattern_matches("*", &path));
+        }
+
+        /// `.github/**` must cover every path under `.github/`.
+        /// Hardcodes the rule sakimori's audit-repo command relies on.
+        #[test]
+        fn double_star_directory_covers_subtree(
+            depth in 1usize..=4,
+            tail in proptest::collection::vec(path_segment(), 1..4),
+        ) {
+            let _ = depth; // breadth is captured via `tail.len()`
+            let path = format!(".github/{}", tail.join("/"));
+            prop_assert!(pattern_matches(".github/**", &path));
+        }
+
+        /// A trailing-slash pattern must NOT match the bare directory
+        /// name (only descendants). Regressing this would cause the
+        /// audit to wrongly claim `.github/` covers itself with no
+        /// children, which is gibberish.
+        #[test]
+        fn trailing_slash_excludes_bare_dir(dir in path_segment()) {
+            let pat = format!("{dir}/");
+            prop_assert!(!pattern_matches(&pat, &dir));
+        }
+
+        /// A literal anchored path must match itself and nothing else.
+        #[test]
+        fn literal_path_matches_self_only(
+            base in repo_path(),
+            other in repo_path(),
+        ) {
+            let pat = format!("/{base}");
+            prop_assert!(pattern_matches(&pat, &base));
+            if base != other {
+                prop_assert!(!pattern_matches(&pat, &other));
+            }
+        }
+    }
 }
