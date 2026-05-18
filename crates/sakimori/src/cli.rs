@@ -727,11 +727,14 @@ pub struct ProxyStartArgs {
     /// without blocking; `block` returns 403 for those tarballs so
     /// npm never runs the scripts. `strip` is the foundation for
     /// tarball rewriting — Phase 1 dispatches to Block semantics for
-    /// the proxy path while the rewriter itself
-    /// (`lifecycle::strip_npm_tarball`) is implemented in core; the
-    /// packument-coherence orchestration lands in Phase 2 (CLAUDE.md
-    /// roadmap #15). Unset disables the gate entirely (current
-    /// default).
+    /// the proxy path. `strip` rewrites the tarball in place to
+    /// drop install-time script keys, recomputes the SRI hashes, and
+    /// the packument response is amended so npm's integrity verifier
+    /// agrees. Lockfile-pinned installs (`npm ci`, `pnpm install
+    /// --frozen-lockfile`, etc.) cannot be rewritten transparently
+    /// because the lockfile pins the original hash; for those flows
+    /// pair strip with `--lifecycle-policy block`. Unset disables the
+    /// gate entirely (current default).
     #[arg(long = "lifecycle-policy", value_name = "MODE")]
     pub lifecycle_policy: Option<String>,
     /// Per-package allow-list for the lifecycle gate. Repeatable.
@@ -741,6 +744,19 @@ pub struct ProxyStartArgs {
     /// compiles bindings.
     #[arg(long = "lifecycle-allow", value_name = "PKG")]
     pub lifecycle_allow: Vec<String>,
+    /// What `--lifecycle-policy strip` does when the tarball rewriter
+    /// itself fails (corrupt bytes, exceeded a resource cap, etc.).
+    /// `block` (default) returns 403 — the user opted into "scripts
+    /// neutralised" so shipping original bytes anyway would be a
+    /// security regression. `passthrough` returns the upstream bytes
+    /// with a warn log for the rare case install completion outweighs
+    /// the guarantee.
+    #[arg(
+        long = "lifecycle-strip-on-failure",
+        value_name = "MODE",
+        default_value = "block"
+    )]
+    pub lifecycle_strip_on_failure: String,
 }
 
 fn parse_kv(s: &str) -> std::result::Result<(String, String), String> {
@@ -1031,6 +1047,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .map(sakimori_proxy::lifecycle::LifecyclePolicy::parse)
                 .transpose()
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let lifecycle_strip_on_failure = sakimori_proxy::lifecycle::StripFailurePolicy::parse(
+                &args.lifecycle_strip_on_failure,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             let cfg = sakimori_proxy::ProxyConfig {
                 listen: args.listen,
                 min_age,
@@ -1052,6 +1072,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 otlp_headers: args.otlp_headers,
                 lifecycle_policy,
                 lifecycle_allow: args.lifecycle_allow,
+                lifecycle_strip_on_failure,
+                lifecycle_strip_limits: sakimori_proxy::lifecycle::StripLimits::default(),
             };
             sakimori_proxy::run(cfg).await?;
             Ok(())

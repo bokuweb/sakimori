@@ -677,21 +677,55 @@ of value-per-implementation-cost.
     `pnpm dlx`, `yarn dlx`, `pnpm add <new-pkg>`. CI lockfile flows
     stay on `--lifecycle-policy block`.
 
-    **Phase 1 proxy dispatch** routes `Strip` to a Block 403 with a
-    strip-specific message (`x-sakimori-deny: lifecycle-script`,
-    body explains "Phase 2 will add packument coherence"). This
-    keeps Strip honest (no silent `EINTEGRITY` surprises) while the
-    core rewriter is in place for Phase 2 to call. Phase 2 lands:
-    (a) lazy `(name, version, orig_integrity)` strip cache, (b)
-    packument rewriter walking the cache to update
-    `dist.integrity` / `dist.shasum` and drop `dist.attestations`
-    for stripped versions, (c) speculative pre-strip on
-    post-age-filter `dist-tags.latest` so cold-cache `npm install
-    <pkg>` succeeds without an `EINTEGRITY` surprise, (d) persistent
-    on-disk strip cache at `~/.sakimori/strip-cache/` so warm runs
-    on shared machines hit the cache. PyPI sdist strip stays out of
-    scope (different threat model — `setup.py` removal breaks the
-    build).
+    **Phase 2 (current) — strip works end-to-end.** Landed in this
+    slice:
+    (a) `crate::strip_cache::StripCache`, an in-memory
+    `Arc<Mutex<HashMap<(name, version, orig_integrity), StripCacheEntry>>>`
+    shared between the tarball handler and the packument rewriter.
+    Cache key includes the upstream's original SRI hash so a mirror
+    serving different bytes for the same `(name, version)` cannot
+    poison the cache.
+    (b) `rewrite_npm::apply_strip_cache_to_packument` walks every
+    surviving version after age/provenance filtering: matched
+    `Stripped` entries get `dist.integrity` / `dist.shasum`
+    overwritten with the new values and `dist.attestations` dropped
+    (the provenance signature is over the original bytes; leaving
+    it would mislead any `npm install --provenance` flow into
+    verifying a stale signature against rewritten bytes).
+    `NoStripNeeded` entries leave metadata alone.
+    (c) `speculative_pre_strip_packument` in `proxy.rs` runs after
+    the existing rewriter when policy = `Strip`. It identifies
+    `dist-tags.latest` (post-rewrite), fetches that tarball directly
+    upstream via a synchronous `ureq` request inside
+    `spawn_blocking`, runs `strip_npm_tarball`, validates the
+    fetched bytes match the advertised integrity (mirror-poisoning
+    defence), populates the cache, and re-applies the cache to the
+    packument. Bounded by a hard 10-second wall-clock timeout +
+    8-second per-request HTTP timeout; on any failure the packument
+    flows through unchanged and the lazy tarball-path strip takes
+    over.
+    (d) Tarball handler under Strip no longer 403s. It hashes the
+    upstream body, looks up `(name, version, orig_integrity)` in
+    the cache: a `Stripped` hit serves the cached rewritten bytes;
+    a `NoStripNeeded` hit (rare race condition) passes original
+    bytes through; a miss runs `strip_npm_tarball` on the fresh
+    bytes, populates the cache, and serves the rewritten bytes.
+    Rewriter failures route through
+    `--lifecycle-strip-on-failure {block,passthrough}` (default
+    `block`).
+
+    **What still doesn't work end-to-end:** explicit pinned
+    non-latest installs (`npm install pkg@1.2.3` for a version that
+    isn't `dist-tags.latest`) hit the tarball path with the
+    original packument integrity, so the first attempt fails
+    `EINTEGRITY`; a retry succeeds because the lazy strip on the
+    first attempt populated the cache. This is documented in the
+    `--lifecycle-policy strip` help text. Persistent on-disk strip
+    cache at `~/.sakimori/strip-cache/` (so warm runs across proxy
+    restarts hit cached results) is the next slice — Phase 2b.
+
+    PyPI sdist strip stays out of scope (different threat model —
+    `setup.py` removal breaks the build).
 
     Implementation: `crates/sakimori-proxy/src/lifecycle.rs`
     decodes the gzipped tarball, walks tar entries to find the

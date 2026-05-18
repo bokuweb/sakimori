@@ -58,9 +58,19 @@ pub struct NpmRewriteStats {
 /// to the age-based filter — so the resolver sees only OIDC-signed
 /// versions, neutralising the "steal-token-and-publish-fresh"
 /// attack that `minimumReleaseAge` alone can't stop.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct NpmRewriteOptions {
     pub require_provenance: bool,
+    /// Optional strip cache. When present, the rewriter walks every
+    /// surviving version after age/provenance filtering: any version
+    /// whose `(name, version, orig_integrity)` matches a `Stripped`
+    /// entry in the cache has its `dist.integrity` / `dist.shasum`
+    /// updated to the new values and `dist.attestations` dropped
+    /// (the provenance signature is over the original tarball bytes;
+    /// leaving it would mislead `npm install --provenance` after the
+    /// proxy serves the rewritten bytes). `NoStripNeeded` entries
+    /// require no packument changes.
+    pub strip_cache: Option<std::sync::Arc<crate::strip_cache::StripCache>>,
 }
 
 /// Legacy entry point: equivalent to calling
@@ -233,8 +243,75 @@ pub fn rewrite_npm_packument_with(
             .unwrap_or(0);
     }
 
+    // Apply strip cache (Phase 2): for every surviving version whose
+    // `(name, version, orig_integrity)` is in the cache as `Stripped`,
+    // replace dist.integrity / dist.shasum and drop dist.attestations.
+    // Versions with `NoStripNeeded` keep their original metadata
+    // because the upstream bytes still match. Versions absent from
+    // the cache are left untouched — the tarball handler decides what
+    // to do at fetch time (lazy strip or Block per policy).
+    if let Some(cache) = opts.strip_cache.as_ref() {
+        apply_strip_cache_to_packument(obj, cache.as_ref());
+    }
+
     let out = serde_json::to_vec(&doc).unwrap_or_else(|_| body.to_vec());
     (out, stats)
+}
+
+/// Walk `versions[*]` and consult the strip cache. Mutates the
+/// packument object in place. Pulled out so the speculative
+/// pre-strip path (proxy.rs) can call it again after populating
+/// fresh cache entries without re-running the age/provenance pass.
+pub fn apply_strip_cache_to_packument(
+    obj: &mut serde_json::Map<String, Value>,
+    cache: &crate::strip_cache::StripCache,
+) {
+    let Some(name) = obj.get("name").and_then(Value::as_str).map(String::from) else {
+        return;
+    };
+    let Some(versions) = obj.get_mut("versions").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for (ver, meta) in versions.iter_mut() {
+        let Some(meta_obj) = meta.as_object_mut() else {
+            continue;
+        };
+        let Some(dist) = meta_obj.get_mut("dist").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let orig_integrity = match dist.get("integrity").and_then(Value::as_str) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let key = crate::strip_cache::StripKey {
+            name: name.clone(),
+            version: ver.clone(),
+            orig_integrity,
+        };
+        let Some(entry) = cache.get(&key) else {
+            continue;
+        };
+        match entry {
+            crate::strip_cache::StripCacheEntry::Stripped {
+                new_integrity,
+                new_shasum,
+                ..
+            } => {
+                dist.insert("integrity".into(), Value::String(new_integrity));
+                dist.insert("shasum".into(), Value::String(new_shasum));
+                // The provenance signature is over the original
+                // tarball bytes. Dropping the whole attestations
+                // object is honest — the bytes npm receives no
+                // longer match what the publisher signed, so any
+                // verifier reading this field would (correctly)
+                // reject the install.
+                dist.remove("attestations");
+            }
+            crate::strip_cache::StripCacheEntry::NoStripNeeded => {
+                // Original metadata stays correct.
+            }
+        }
+    }
 }
 
 /// Does this per-version metadata carry a Sigstore provenance
@@ -539,6 +616,7 @@ mod tests {
             now,
             NpmRewriteOptions {
                 require_provenance: true,
+                strip_cache: None,
             },
         );
         let doc = parse(&out);
@@ -564,6 +642,7 @@ mod tests {
             now,
             NpmRewriteOptions {
                 require_provenance: false, // OFF
+                strip_cache: None,
             },
         );
         assert_eq!(stats.dropped, 0);
@@ -590,6 +669,7 @@ mod tests {
             now,
             NpmRewriteOptions {
                 require_provenance: true,
+                strip_cache: None,
             },
         );
         assert_eq!(stats.dropped, 1);
@@ -641,5 +721,143 @@ mod tests {
         assert_eq!(doc["dist-tags"]["latest"], "1.2.0");
         assert_eq!(doc["dist-tags"]["next"], "1.2.0");
         assert_eq!(stats.retargeted_tags, 2);
+    }
+
+    // --- strip cache integration ---------------------------------------
+
+    fn packument_with_dist(
+        name: &str,
+        ver: &str,
+        integrity: &str,
+        with_attestations: bool,
+    ) -> String {
+        let attest = if with_attestations {
+            r#""attestations":{"provenance":{"predicateType":"https://slsa.dev/provenance/v1"}},"#
+        } else {
+            ""
+        };
+        format!(
+            r#"{{
+                "name": "{name}",
+                "dist-tags": {{ "latest": "{ver}" }},
+                "versions": {{
+                    "{ver}": {{
+                        "dist": {{
+                            "tarball": "https://registry.npmjs.org/{name}/-/{name}-{ver}.tgz",
+                            "integrity": "{integrity}",
+                            "shasum": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                            {attest}
+                            "fileCount": 1
+                        }}
+                    }}
+                }},
+                "time": {{
+                    "created": "2024-01-01T00:00:00Z",
+                    "modified": "2024-01-01T00:00:00Z",
+                    "{ver}": "2024-01-01T00:00:00Z"
+                }}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn strip_cache_replaces_integrity_and_shasum_and_drops_attestations() {
+        let cache = std::sync::Arc::new(crate::strip_cache::StripCache::new());
+        cache.insert(
+            crate::strip_cache::StripKey {
+                name: "left-pad".into(),
+                version: "1.3.0".into(),
+                orig_integrity: "sha512-ORIG".into(),
+            },
+            crate::strip_cache::StripCacheEntry::Stripped {
+                new_integrity: "sha512-REWRITTEN".into(),
+                new_shasum: "1234567890abcdef1234567890abcdef12345678".into(),
+                bytes: std::sync::Arc::new(b"unused-in-this-test".to_vec()),
+            },
+        );
+        let body = packument_with_dist("left-pad", "1.3.0", "sha512-ORIG", true);
+        let now = utc(2025, 1, 10);
+        let (out, _stats) = rewrite_npm_packument_with(
+            body.as_bytes(),
+            min_age_hours(0), // disable age filter so the only-version survives
+            now,
+            NpmRewriteOptions {
+                require_provenance: false,
+                strip_cache: Some(cache),
+            },
+        );
+        let doc = parse(&out);
+        let dist = &doc["versions"]["1.3.0"]["dist"];
+        assert_eq!(dist["integrity"], "sha512-REWRITTEN");
+        assert_eq!(dist["shasum"], "1234567890abcdef1234567890abcdef12345678");
+        assert!(
+            dist.get("attestations").is_none(),
+            "stripped versions must drop dist.attestations so npm --provenance doesn't try to verify stale signature: {dist:#?}"
+        );
+        // Unrelated fields untouched.
+        assert_eq!(
+            dist["tarball"],
+            "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+        );
+        assert_eq!(dist["fileCount"], 1);
+    }
+
+    #[test]
+    fn strip_cache_no_strip_needed_leaves_metadata_alone() {
+        let cache = std::sync::Arc::new(crate::strip_cache::StripCache::new());
+        cache.insert(
+            crate::strip_cache::StripKey {
+                name: "boring-pkg".into(),
+                version: "1.0.0".into(),
+                orig_integrity: "sha512-ORIG".into(),
+            },
+            crate::strip_cache::StripCacheEntry::NoStripNeeded,
+        );
+        let body = packument_with_dist("boring-pkg", "1.0.0", "sha512-ORIG", true);
+        let (out, _) = rewrite_npm_packument_with(
+            body.as_bytes(),
+            min_age_hours(0),
+            utc(2025, 1, 10),
+            NpmRewriteOptions {
+                require_provenance: false,
+                strip_cache: Some(cache),
+            },
+        );
+        let doc = parse(&out);
+        let dist = &doc["versions"]["1.0.0"]["dist"];
+        // Integrity unchanged.
+        assert_eq!(dist["integrity"], "sha512-ORIG");
+        // Attestations preserved (the bytes still match what the publisher signed).
+        assert!(dist.get("attestations").is_some());
+    }
+
+    #[test]
+    fn strip_cache_miss_leaves_untouched() {
+        let cache = std::sync::Arc::new(crate::strip_cache::StripCache::new());
+        // Cache has a different orig_integrity → miss for this packument.
+        cache.insert(
+            crate::strip_cache::StripKey {
+                name: "p".into(),
+                version: "1.0.0".into(),
+                orig_integrity: "sha512-DIFFERENT".into(),
+            },
+            crate::strip_cache::StripCacheEntry::Stripped {
+                new_integrity: "sha512-REWRITTEN".into(),
+                new_shasum: "1234".into(),
+                bytes: std::sync::Arc::new(vec![]),
+            },
+        );
+        let body = packument_with_dist("p", "1.0.0", "sha512-ORIG", false);
+        let (out, _) = rewrite_npm_packument_with(
+            body.as_bytes(),
+            min_age_hours(0),
+            utc(2025, 1, 10),
+            NpmRewriteOptions {
+                require_provenance: false,
+                strip_cache: Some(cache),
+            },
+        );
+        let doc = parse(&out);
+        assert_eq!(doc["versions"]["1.0.0"]["dist"]["integrity"], "sha512-ORIG");
     }
 }

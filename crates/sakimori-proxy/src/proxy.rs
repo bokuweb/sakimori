@@ -111,6 +111,17 @@ pub struct ProxyConfig {
     /// `sharp`, `bcrypt`, `node-sass`). Patterns are exact npm names,
     /// case-sensitive; no globbing.
     pub lifecycle_allow: Vec<String>,
+    /// What `strip` mode does when the tarball rewriter itself fails
+    /// (corrupt bytes, exceeded a resource limit, timed out). Default
+    /// is `Block`: having opted into strip, the user expects scripts
+    /// neutralised, so silently shipping original bytes would be a
+    /// security regression. `Passthrough` is available for the rare
+    /// case where install completion outweighs the guarantee.
+    pub lifecycle_strip_on_failure: crate::lifecycle::StripFailurePolicy,
+    /// Hard caps for the strip rewriter (gzip-bomb / oversize / entry
+    /// count). Default sizes admit every legitimate npm package while
+    /// refusing pathological inputs that would DoS the proxy.
+    pub lifecycle_strip_limits: crate::lifecycle::StripLimits,
 }
 
 impl ProxyConfig {
@@ -136,6 +147,8 @@ impl ProxyConfig {
             otlp_headers: Vec::new(),
             lifecycle_policy: None,
             lifecycle_allow: Vec::new(),
+            lifecycle_strip_on_failure: crate::lifecycle::StripFailurePolicy::Block,
+            lifecycle_strip_limits: crate::lifecycle::StripLimits::default(),
         })
     }
 }
@@ -305,6 +318,10 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
         otlp_exporter,
         lifecycle_policy: cfg.lifecycle_policy,
         lifecycle_allow: Arc::new(cfg.lifecycle_allow.into_iter().collect()),
+        lifecycle_strip_on_failure: cfg.lifecycle_strip_on_failure,
+        lifecycle_strip_limits: cfg.lifecycle_strip_limits,
+        strip_cache: Arc::new(crate::strip_cache::StripCache::new()),
+        upstream_user_agent: cfg.user_agent.clone(),
     };
 
     // `.build()` in hudsucker 0.22 returns Proxy<…> directly; no Result.
@@ -427,6 +444,25 @@ struct SakimoriHandler {
     /// in `Arc` so cloning the handler is O(1) — hudsucker may clone
     /// the handler per connection.
     lifecycle_allow: Arc<std::collections::HashSet<String>>,
+    /// Forwarded from [`ProxyConfig::lifecycle_strip_on_failure`].
+    lifecycle_strip_on_failure: crate::lifecycle::StripFailurePolicy,
+    /// Forwarded from [`ProxyConfig::lifecycle_strip_limits`]. Pure
+    /// data so `Copy`-cloned on every strip invocation.
+    lifecycle_strip_limits: crate::lifecycle::StripLimits,
+    /// Shared in-memory cache of stripped tarballs. Indexed by
+    /// `(name, version, orig_integrity)`. Populated by the
+    /// speculative pre-strip in the packument response path and by
+    /// lazy strips in the tarball response path; read by the
+    /// packument rewriter (to inject new integrity / shasum) and the
+    /// tarball handler (to decide whether to serve cached rewritten
+    /// bytes or do a fresh strip).
+    strip_cache: Arc<crate::strip_cache::StripCache>,
+    /// User-Agent the proxy uses when it fetches tarballs upstream
+    /// itself for speculative pre-strip. Reuses the same string
+    /// configured on `ProxyConfig` so the upstream sees a consistent
+    /// caller identity (npm's registry tolerates anything but it's
+    /// useful for log triage).
+    upstream_user_agent: String,
 }
 
 impl SakimoriHandler {
@@ -514,35 +550,76 @@ impl SakimoriHandler {
                     .expect("static lifecycle deny response")
             }
             crate::lifecycle::LifecyclePolicy::Strip => {
-                // Phase 1: Strip-mode tarball dispatch falls back to
-                // Block semantics. The rewriter itself
-                // (`lifecycle::strip_npm_tarball`) is implemented and
-                // unit-tested, but the packument-coherence pipe (a
-                // strip cache shared between the tarball handler and
-                // the packument rewriter, plus speculative
-                // pre-stripping during packument fetch so npm's
-                // integrity verifier agrees with the rewritten bytes)
-                // is intentionally deferred to Phase 2 — see
-                // CLAUDE.md roadmap #15. Until that lands, returning
-                // 403 here keeps Strip honest (no silent EINTEGRITY
-                // surprises) and matches what users opted into by
-                // choosing strip over audit.
-                let reason = format!(
-                    "lifecycle(strip): blocking {name}@{version} — ships install-time script(s): {}. \
-                     Strip mode's tarball-rewrite + packument-integrity coherence is implemented \
-                     in core (lifecycle::strip_npm_tarball) but the proxy-side orchestration lands \
-                     in Phase 2. For now Strip behaves like Block; add `{name}` to the lifecycle \
-                     allow-list if this install is expected.",
-                    stages.join(", ")
+                // Phase 2: actually rewrite the tarball in place,
+                // populate the strip cache so a subsequent packument
+                // response sees the new integrity, and serve the
+                // rewritten bytes. The cache key includes the
+                // *original* SRI hash of the upstream bytes, derived
+                // here from the buffered body — this is what the
+                // packument also advertised pre-rewrite, so the
+                // tarball handler and the packument rewriter agree
+                // on the lookup key.
+                let orig_integrity = sri_sha512_of(&collected);
+                let key = crate::strip_cache::StripKey {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    orig_integrity: orig_integrity.clone(),
+                };
+                let stripped = match crate::lifecycle::strip_npm_tarball(
+                    &collected,
+                    &self.lifecycle_strip_limits,
+                ) {
+                    Ok(Some(out)) => out,
+                    Ok(None) => {
+                        // package.json carried no install-time keys
+                        // after all (rare — inspect found scripts
+                        // but strip's mutate pass disagrees — only
+                        // possible when LIFECYCLE_KEYS values are
+                        // empty strings or the JSON shape is exotic).
+                        // Pass original bytes through and remember
+                        // the verdict so the packument rewriter
+                        // doesn't try to rewrite this version.
+                        self.strip_cache
+                            .insert(key, crate::strip_cache::StripCacheEntry::NoStripNeeded);
+                        return pass_through();
+                    }
+                    Err(e) => {
+                        return strip_failure_response(
+                            &mut parts,
+                            self.lifecycle_strip_on_failure,
+                            name,
+                            version,
+                            &e,
+                            collected,
+                        );
+                    }
+                };
+                log::warn!(
+                    "lifecycle(strip): {name}@{version} removed [{}]; new integrity sha512=<…>{}",
+                    stripped.stripped_stages.join(", "),
+                    // Keep the suffix short in the warn log; full
+                    // value is available on the cache entry.
+                    &stripped.sha512_b64[..stripped.sha512_b64.len().min(8)],
                 );
-                log::warn!("{reason}");
+                let new_integrity = format!("sha512-{}", stripped.sha512_b64);
+                let new_shasum = stripped.sha1_hex.clone();
+                let bytes = std::sync::Arc::new(stripped.bytes.clone());
+                self.strip_cache.insert(
+                    key,
+                    crate::strip_cache::StripCacheEntry::Stripped {
+                        new_integrity,
+                        new_shasum,
+                        bytes: bytes.clone(),
+                    },
+                );
                 parts.headers.remove(http::header::CONTENT_LENGTH);
-                Response::builder()
-                    .status(StatusCode::FORBIDDEN)
-                    .header("content-type", "text/plain; charset=utf-8")
-                    .header("x-sakimori-deny", "lifecycle-script")
-                    .body(Body::from(format!("{reason}\n")))
-                    .expect("static lifecycle deny response")
+                parts.headers.remove(http::header::CONTENT_ENCODING);
+                Response::from_parts(
+                    parts,
+                    Body::from(http_body_util::Full::new(bytes::Bytes::from(
+                        stripped.bytes,
+                    ))),
+                )
             }
         }
     }
@@ -875,6 +952,7 @@ impl HttpHandler for SakimoriHandler {
                     now,
                     NpmRewriteOptions {
                         require_provenance: self.require_provenance,
+                        strip_cache: Some(self.strip_cache.clone()),
                     },
                 );
                 if stats.dropped > 0 {
@@ -886,7 +964,21 @@ impl HttpHandler for SakimoriHandler {
                         stats.retargeted_tags
                     );
                 }
-                out
+                if matches!(
+                    self.lifecycle_policy,
+                    Some(crate::lifecycle::LifecyclePolicy::Strip)
+                ) {
+                    speculative_pre_strip_packument(
+                        out,
+                        self.strip_cache.clone(),
+                        self.lifecycle_allow.clone(),
+                        self.lifecycle_strip_limits,
+                        self.upstream_user_agent.clone(),
+                    )
+                    .await
+                } else {
+                    out
+                }
             }
             RewriteTarget::PypiJsonApi => {
                 let (out, stats) = rewrite_pypi_json_api(&collected, self.decider.min_age, now);
@@ -991,6 +1083,219 @@ impl HttpHandler for SakimoriHandler {
             Body::from(http_body_util::Full::new(bytes::Bytes::from(rewritten))),
         )
     }
+}
+
+/// SRI string (`sha512-<base64>`) of the input bytes — matches the
+/// shape npm uses for `dist.integrity`. Used to key the strip cache
+/// off the upstream tarball's hash so a mirror serving different
+/// bytes for the same `(name, version)` cannot poison the cache.
+fn sri_sha512_of(bytes: &[u8]) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    let mut h = sha2::Sha512::new();
+    h.update(bytes);
+    format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(h.finalize())
+    )
+}
+
+/// Build the response served when the strip rewriter itself fails
+/// (corrupt bytes / exceeded a resource cap / etc.). `Block`
+/// returns 403 with a strip-specific deny header; `Passthrough`
+/// ships the original upstream bytes with a warn log.
+fn strip_failure_response(
+    parts: &mut http::response::Parts,
+    policy: crate::lifecycle::StripFailurePolicy,
+    name: &str,
+    version: &str,
+    err: &crate::lifecycle::StripError,
+    collected: bytes::Bytes,
+) -> Response<Body> {
+    match policy {
+        crate::lifecycle::StripFailurePolicy::Block => {
+            let reason = format!(
+                "lifecycle(strip): rewriter failed on {name}@{version}: {err}. \
+                 Pass --lifecycle-strip-on-failure passthrough to serve the original bytes \
+                 anyway (security regression — opt in deliberately)."
+            );
+            log::warn!("{reason}");
+            parts.headers.remove(http::header::CONTENT_LENGTH);
+            Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("content-type", "text/plain; charset=utf-8")
+                .header("x-sakimori-deny", "lifecycle-strip-failed")
+                .body(Body::from(format!("{reason}\n")))
+                .expect("static lifecycle strip-fail response")
+        }
+        crate::lifecycle::StripFailurePolicy::Passthrough => {
+            log::warn!(
+                "lifecycle(strip,passthrough): rewriter failed on {name}@{version}: {err} — serving original bytes",
+            );
+            parts.headers.remove(http::header::CONTENT_LENGTH);
+            Response::from_parts(
+                parts.clone(),
+                Body::from(http_body_util::Full::new(collected)),
+            )
+        }
+    }
+}
+
+/// Speculative pre-strip on the post-rewrite packument. Called from
+/// the npm packument response branch when `--lifecycle-policy strip`
+/// is on. Finds the version that `dist-tags.latest` resolves to,
+/// fetches its tarball directly from the upstream registry (bypassing
+/// the proxy itself to avoid a recursion), runs `strip_npm_tarball`,
+/// populates the strip cache, and reapplies the cache to the
+/// packument so npm receives integrity values that match the bytes
+/// the tarball handler will serve. Bounded by a 10-second wall-clock
+/// budget — on any failure we leave the packument unchanged and let
+/// the lazy tarball-path strip take over.
+///
+/// Only the `latest` tag is pre-stripped. Explicit pinned-version
+/// installs (`npm install pkg@1.2.3` for a non-latest version) hit
+/// the tarball handler's lazy path, populate the cache there, and
+/// then succeed on retry — the first attempt fails with EINTEGRITY
+/// because the packument advertised the original hash. Documented
+/// in CLAUDE.md roadmap #15.
+async fn speculative_pre_strip_packument(
+    rewritten: Vec<u8>,
+    strip_cache: std::sync::Arc<crate::strip_cache::StripCache>,
+    lifecycle_allow: std::sync::Arc<std::collections::HashSet<String>>,
+    strip_limits: crate::lifecycle::StripLimits,
+    user_agent: String,
+) -> Vec<u8> {
+    let mut doc: serde_json::Value = match serde_json::from_slice(&rewritten) {
+        Ok(v) => v,
+        Err(_) => return rewritten,
+    };
+    let Some(obj) = doc.as_object_mut() else {
+        return rewritten;
+    };
+    let Some(name) = obj.get("name").and_then(|v| v.as_str()).map(String::from) else {
+        return rewritten;
+    };
+    if lifecycle_allow.contains(&name) {
+        return rewritten;
+    }
+    let Some(latest) = obj
+        .get("dist-tags")
+        .and_then(|t| t.get("latest"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+    else {
+        return rewritten;
+    };
+    let (tarball_url, orig_integrity) = {
+        let Some(versions) = obj.get("versions").and_then(|v| v.as_object()) else {
+            return rewritten;
+        };
+        let Some(meta) = versions.get(&latest) else {
+            return rewritten;
+        };
+        let Some(dist) = meta.get("dist") else {
+            return rewritten;
+        };
+        let url = dist
+            .get("tarball")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let integ = dist
+            .get("integrity")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        match (url, integ) {
+            (Some(u), Some(i)) => (u, i),
+            _ => return rewritten,
+        }
+    };
+    let key = crate::strip_cache::StripKey {
+        name: name.clone(),
+        version: latest.clone(),
+        orig_integrity: orig_integrity.clone(),
+    };
+    if strip_cache.get(&key).is_none() {
+        let url = tarball_url.clone();
+        let ua = user_agent.clone();
+        let fetch = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || -> std::result::Result<Vec<u8>, String> {
+                use std::io::Read;
+                let agent = ureq::AgentBuilder::new()
+                    .user_agent(&ua)
+                    .timeout(Duration::from_secs(8))
+                    .build();
+                let resp = agent.get(&url).call().map_err(|e| e.to_string())?;
+                let mut buf = Vec::new();
+                // Cap reads so a malicious upstream cannot bleed
+                // memory by sending an unbounded body.
+                resp.into_reader()
+                    .take(128 * 1024 * 1024)
+                    .read_to_end(&mut buf)
+                    .map_err(|e| e.to_string())?;
+                Ok(buf)
+            }),
+        )
+        .await;
+        let bytes = match fetch {
+            Ok(Ok(Ok(b))) => b,
+            Ok(Ok(Err(e))) => {
+                log::warn!(
+                    "lifecycle(strip,speculative): upstream fetch failed for {name}@{latest}: {e}",
+                );
+                return rewritten;
+            }
+            Ok(Err(e)) => {
+                log::warn!(
+                    "lifecycle(strip,speculative): spawn_blocking join failed for {name}@{latest}: {e}",
+                );
+                return rewritten;
+            }
+            Err(_) => {
+                log::warn!(
+                    "lifecycle(strip,speculative): upstream fetch timed out for {name}@{latest} (10s budget)",
+                );
+                return rewritten;
+            }
+        };
+        let actual = sri_sha512_of(&bytes);
+        if actual != orig_integrity {
+            log::warn!(
+                "lifecycle(strip,speculative): {name}@{latest} bytes don't match advertised integrity (got {}, expected {}); skipping cache write",
+                actual,
+                orig_integrity,
+            );
+            return rewritten;
+        }
+        let entry = match crate::lifecycle::strip_npm_tarball(&bytes, &strip_limits) {
+            Ok(Some(out)) => {
+                log::info!(
+                    "lifecycle(strip,speculative): cached {name}@{latest} (removed [{}])",
+                    out.stripped_stages.join(", "),
+                );
+                crate::strip_cache::StripCacheEntry::Stripped {
+                    new_integrity: format!("sha512-{}", out.sha512_b64),
+                    new_shasum: out.sha1_hex,
+                    bytes: std::sync::Arc::new(out.bytes),
+                }
+            }
+            Ok(None) => {
+                log::debug!(
+                    "lifecycle(strip,speculative): {name}@{latest} carries no lifecycle scripts"
+                );
+                crate::strip_cache::StripCacheEntry::NoStripNeeded
+            }
+            Err(e) => {
+                log::warn!(
+                    "lifecycle(strip,speculative): rewriter error for {name}@{latest}: {e} — leaving packument untouched (lazy path will apply --lifecycle-strip-on-failure)",
+                );
+                return rewritten;
+            }
+        };
+        strip_cache.insert(key, entry);
+    }
+    crate::rewrite_npm::apply_strip_cache_to_packument(obj, &strip_cache);
+    serde_json::to_vec(&doc).unwrap_or(rewritten)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
