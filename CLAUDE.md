@@ -286,6 +286,69 @@ the canonical public hosts, list the internal hosts under
     list length is the only bound — so this lift only unblocks
     Linux parity, but Linux is where most CI runs anyway.
 
+4c. **Per-process file-access policy** (scope `file.*` rules to a
+    specific process, not the whole host). Today file rules are
+    path-only (`FilePolicy { default, allow: Vec<String>, deny:
+    Vec<String> }` in
+    [crates/sakimori-core/src/policy.rs](crates/sakimori-core/src/policy.rs)
+    — no `comm`/`exe`/`pid`/attribution field on the rule), and
+    enforcement is a **global** `sakimori_openat` raw tracepoint
+    ([crates/sakimori-ebpf/src/main.rs](crates/sakimori-ebpf/src/main.rs))
+    that fires for every process on the box — so a `file.deny`
+    cannot be confined to "just the supervised child" the way the
+    cgroup-scoped `connect4/6` network hooks already are. Attribution
+    (#11/#19) is userspace-after-the-fact (`/proc` PPid walk in the
+    drain task) and so can label but **cannot gate** the kernel
+    decision. The motivating use case: confine an **AI coding agent**
+    (or any single process) so it cannot read secret files —
+    "process A: deny read of `~/.ssh`, `~/.aws/credentials`, …;
+    everyone else on the host unaffected." Not expressible today.
+
+    The capability is feasible on all three platforms — none has a
+    hard blocker, only different primitives:
+    - **Linux**: move file enforcement off the global tracepoint onto
+      a **BPF-LSM `file_open` hook** (kernel ≥ 5.7,
+      `CONFIG_BPF_LSM=y`). Two wins in one: the LSM hook can `return
+      -EACCES` for a true **pre-open** deny (the clean version of #4's
+      `bpf_override_return` for files), *and* it runs with `current`
+      in context so it can filter by cgroup id / pid before deciding —
+      i.e. scope a deny to the supervised cgroup or a specific exe.
+      Resolve the "is this the target process" check kernel-side via a
+      BPF map keyed on cgroup id (populated by the supervisor at
+      attach time) rather than the userspace PPid walk. Add an
+      optional `process:` selector to the file-rule struct
+      (`comm` / `exe` basename / attribution-root); empty selector =
+      today's whole-scope behaviour, preserved. Pairs with #4
+      (pre-syscall block), #4b (LPM trie so the per-process path set
+      isn't bound by the 8-entry cap), and #19 (attribution roots
+      already recognise `code`/`cursor`/agent binaries). Fallback for
+      kernels without BPF-LSM: keep the SIGKILL tripwire but gate it
+      on a cgroup-id map check so it at least scopes to the child.
+    - **macOS**: rides roadmap #5b's Endpoint Security client.
+      `ES_EVENT_TYPE_AUTH_OPEN` is deadline-bound and carries the
+      `audit_token_t` → per-process by exe / signing id, and an AUTH
+      deny is a genuine pre-open block. ES has no per-process-count
+      limit, so the secret-file set isn't capped the way Linux's eBPF
+      array is.
+    - **Windows**: ETW is observe-only, so a true read block needs a
+      **minifilter file-system filter driver** (`IRP_MJ_CREATE`
+      pre-callback) that denies by process id / image name. Heaviest
+      of the three (signed kernel driver, WHQL/EV-signing onboarding)
+      → lowest priority, but not impossible; the Defender-Firewall
+      split in `sakimori-win` is the precedent for "Windows needs its
+      own enforcement primitive".
+
+    Honest scope: this overlaps with OS sandboxes (Linux **Landlock**,
+    macOS `sandbox-exec`/seatbelt, containers that simply don't mount
+    the secret into the agent's namespace) — those are the
+    off-the-shelf way to confine one process today. sakimori's
+    value-add is *unifying* it with the same `policy.yml` + attribution
+    + JSON-log / step-summary / HTML-report surface the rest of the
+    tool already speaks, and tying the file-confinement signal to the
+    fetch-layer + exec attribution in one report. First slice should be
+    Linux BPF-LSM + the `process:` selector; macOS follows #5b;
+    Windows is a separate driver track.
+
 5. **macOS live block** — either a Network Extension (heavy, needs
    signing) or an HTTPS proxy (see #2).
 5b. **macOS supervised mode (exec + file attribution via Endpoint
