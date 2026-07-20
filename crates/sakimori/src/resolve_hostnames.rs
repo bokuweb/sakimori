@@ -14,7 +14,8 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::TokioResolver;
+use hickory_resolver::proto::rr::RData;
 use sakimori_core::events::Event;
 use sakimori_core::stats::Stats;
 
@@ -54,8 +55,8 @@ pub async fn resolve(stats: &mut Stats) {
     //    macOS) or system config (Windows). If construction fails we
     //    just skip the whole step — the report still renders, just
     //    without hostnames.
-    let resolver = match TokioAsyncResolver::tokio_from_system_conf() {
-        Ok(r) => r,
+    let resolver = match TokioResolver::builder_tokio().and_then(|builder| builder.build()) {
+        Ok(resolver) => resolver,
         Err(e) => {
             log::debug!("resolve_hostnames: skipping, resolver init failed: {e}");
             return;
@@ -70,10 +71,10 @@ pub async fn resolve(stats: &mut Stats) {
         async move {
             let res = tokio::time::timeout(LOOKUP_TIMEOUT, resolver.reverse_lookup(ip)).await;
             let name = match res {
-                Ok(Ok(rev)) => rev
-                    .iter()
-                    .next()
-                    .map(|n| n.to_string().trim_end_matches('.').to_string()),
+                Ok(Ok(rev)) => rev.answers().iter().find_map(|record| match &record.data {
+                    RData::PTR(name) => Some(name.to_string().trim_end_matches('.').to_string()),
+                    _ => None,
+                }),
                 Ok(Err(e)) => {
                     log::debug!("PTR for {ip} failed: {e}");
                     None

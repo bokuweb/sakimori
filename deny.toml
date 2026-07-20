@@ -14,45 +14,7 @@ version = 2
 # we'd rather merge a yanked-but-still-used release than block
 # every push until lockfile refresh.
 yanked = "warn"
-# ---------------------------------------------------------------
-# Time-boxed ignores (review at the deadline noted in each
-# `reason`). Real advisories against transitive deps we can't
-# bump without a separate API-migration PR. Tracked as
-# follow-ups. `audit.toml` and `osv-scanner.toml` carry the
-# same set so all three scanners stay in sync; bumping one
-# without the others makes the gate inconsistent.
-# ---------------------------------------------------------------
-ignore = [
-  # `hudsucker 0.22 → rustls 0.22 → rustls-webpki 0.102.8`.
-  # Real risk surface: the MITM proxy validates server certs
-  # outbound, so a malicious upstream can trigger these bugs.
-  # Fix path: bump hudsucker 0.22 → 0.24 (pulls rustls 0.23 +
-  # webpki 0.103.13+). API migration required in
-  # `crates/sakimori-proxy/src/proxy.rs` (ProxyBuilder shape
-  # + rcgen::CertificateParams::from_ca_cert_pem removed).
-  { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102 via hudsucker 0.22; pin until 2026-06-30 follow-up bumps hudsucker → 0.24" },
-  { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 via hudsucker 0.22; pin until 2026-06-30 follow-up bumps hudsucker → 0.24" },
-  { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 via hudsucker 0.22; pin until 2026-06-30 follow-up bumps hudsucker → 0.24" },
-  { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 via hudsucker 0.22; pin until 2026-06-30 follow-up bumps hudsucker → 0.24" },
-  # `hickory-resolver 0.24 → hickory-proto 0.24.4`.
-  # Risk surface: the proxy uses hickory-resolver for outbound
-  # name lookups; an attacker controlling the DNS server's
-  # response can trigger O(n²) CPU exhaustion in message
-  # encoding. Fix path: bump hickory-resolver 0.24 → 0.26.x —
-  # breaking change (NameServerConfig constructor signature +
-  # ResolverConfig::from_parts removed).
-  { id = "RUSTSEC-2026-0119", reason = "hickory-proto 0.24.4 via hickory-resolver 0.24; pin until 2026-06-30 follow-up bumps to 0.26.x" },
-]
-# Removal condition (codex round-1 finding):
-#   - Remove ALL FIVE RUSTSEC-2026-{0049,0098,0099,0104,0119}
-#     entries above once `hudsucker >= 0.24` AND
-#     `hickory-resolver >= 0.26` are in Cargo.lock.
-#   - The `ignore-expiry` job in .github/workflows/security.yml
-#     hard-fails after 2026-06-30 if these IDs are still listed
-#     here, in .cargo/audit.toml, or in osv-scanner.toml.
-#     cargo-audit + cargo-deny don't support per-entry
-#     `ignoreUntil` natively (osv-scanner.toml does), so the
-#     workflow enforces a single deadline across all three.
+ignore = []
 
 [bans]
 # `multiple-versions = "warn"` is a deliberate first-cut: the

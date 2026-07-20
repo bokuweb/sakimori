@@ -24,10 +24,10 @@ sakimori-core = { path = "../sakimori-core" }
 # per-host leaf cert signing, and the request/response hook plumbing.
 # `rcgen` generates the root CA on first run.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "fs"] }
-hudsucker = { version = "0.22", default-features = false, features = ["rustls-client", "rcgen-ca"] }
-rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc_rs"] }
+hudsucker = { version = "0.24", default-features = false, features = ["rustls-client", "rcgen-ca"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 time = "0.3"
-rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "aws_lc_rs"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
@@ -51,12 +51,12 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 toml = { workspace = true }
 
 # Custom upstream TLS client for `extra_upstream_roots`. Versions
-# pinned to match what hudsucker 0.22 itself uses internally — the
+# pinned to match what hudsucker 0.24 itself uses internally — the
 # `ClientConfig` types these construct must be the same rustls
-# version hudsucker's connector expects (rustls 0.22 via
+# version hudsucker's connector expects (rustls 0.23 via
 # tokio-rustls). We reuse `hudsucker::rustls` for the rustls types
 # so we don't add a second `rustls` direct dep.
-hyper-rustls = { version = "0.26", default-features = false, features = ["http1", "logging", "ring", "tls12", "webpki-tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "aws-lc-rs", "tls12", "webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
 webpki-roots = "0.26"
 # NB: PEM parsing uses `rustls_pki_types::pem::PemObject` (reached
@@ -67,10 +67,10 @@ webpki-roots = "0.26"
 
 [dev-dependencies]
 proptest = { workspace = true }
-# Mock HTTPS upstream for proxy_https_e2e.rs. tokio-rustls 0.25
-# matches hudsucker's internal rustls 0.22 pin (same TLS types
+# Mock HTTPS upstream for proxy_https_e2e.rs. tokio-rustls 0.26
+# matches hudsucker's internal rustls 0.23 pin (same TLS types
 # both ends of the proxy must speak).
-tokio-rustls = { version = "0.25", default-features = false, features = ["logging", "tls12", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "aws_lc_rs"] }
 # Strict OTLP/HTTP JSON shape validation. The proto-generated types
 # carry the canonical OTLP field set + JSON name mapping (camelCase
 # wire names → snake_case Rust fields, int64 → decimal string, etc.).

@@ -6,7 +6,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Context, Result};
-use hickory_resolver::{TokioAsyncResolver, config::*};
+use hickory_resolver::{TokioResolver, config::*, net::runtime::TokioRuntimeProvider};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 use crate::policy::NetRule;
@@ -28,17 +28,25 @@ pub struct Endpoint {
 const MAX_CIDR_EXPANSION: usize = 65_536;
 
 pub struct Resolver {
-    inner: TokioAsyncResolver,
+    inner: TokioResolver,
 }
 
 impl Resolver {
     pub fn from_system() -> Result<Self> {
         // `from_system_conf` reads /etc/resolv.conf on unix. On hosts where it
         // fails (e.g. minimal containers) we fall back to 1.1.1.1 / 8.8.8.8.
-        let inner = TokioAsyncResolver::tokio_from_system_conf().unwrap_or_else(|err| {
-            log::debug!("system resolver unavailable ({err}); falling back to cloudflare");
-            TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default())
-        });
+        let inner = match TokioResolver::builder_tokio().and_then(|builder| builder.build()) {
+            Ok(resolver) => resolver,
+            Err(err) => {
+                log::debug!("system resolver unavailable ({err}); falling back to cloudflare");
+                TokioResolver::builder_with_config(
+                    ResolverConfig::udp_and_tcp(&CLOUDFLARE),
+                    TokioRuntimeProvider::default(),
+                )
+                .build()
+                .context("building Cloudflare fallback resolver")?
+            }
+        };
         Ok(Self { inner })
     }
 
