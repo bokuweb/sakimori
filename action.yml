@@ -64,6 +64,9 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
         INPUT_VERSION: ${{ inputs.version }}
+        INPUT_POLICY: ${{ inputs.policy }}
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_LOG: ${{ inputs.log }}
       run: |
         set -euo pipefail
 
@@ -116,9 +119,9 @@ runs:
         echo "bpf=${dest}/sakimori.bpf.o" >> "${GITHUB_OUTPUT}"
         echo "SAKIMORI_BPF_OBJ=${dest}/sakimori.bpf.o" >> "${GITHUB_ENV}"
         echo "SAKIMORI_BIN=${dest}/sakimori" >> "${GITHUB_ENV}"
-        echo "SAKIMORI_POLICY=${{ inputs.policy }}" >> "${GITHUB_ENV}"
-        echo "SAKIMORI_MODE=${{ inputs.mode }}" >> "${GITHUB_ENV}"
-        echo "SAKIMORI_LOG=${{ inputs.log }}" >> "${GITHUB_ENV}"
+        echo "SAKIMORI_POLICY=${INPUT_POLICY}" >> "${GITHUB_ENV}"
+        echo "SAKIMORI_MODE=${INPUT_MODE}" >> "${GITHUB_ENV}"
+        echo "SAKIMORI_LOG=${INPUT_LOG}" >> "${GITHUB_ENV}"
         echo "SAKIMORI_OS=linux" >> "${GITHUB_ENV}"
 
     # --------------- Windows ---------------
@@ -128,6 +131,9 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
         INPUT_VERSION: ${{ inputs.version }}
+        INPUT_POLICY: ${{ inputs.policy }}
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_LOG: ${{ inputs.log }}
       run: |
         $ErrorActionPreference = "Stop"
         $version = $env:INPUT_VERSION
@@ -173,9 +179,9 @@ runs:
         # can be written once and work on both.
         "bin=$dest\sakimori-win.exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
         "SAKIMORI_BIN=$dest\sakimori-win.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-        "SAKIMORI_POLICY=${{ inputs.policy }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-        "SAKIMORI_MODE=${{ inputs.mode }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-        "SAKIMORI_LOG=${{ inputs.log }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "SAKIMORI_POLICY=$env:INPUT_POLICY" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "SAKIMORI_MODE=$env:INPUT_MODE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "SAKIMORI_LOG=$env:INPUT_LOG" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
         "SAKIMORI_OS=windows" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
     # --------------- anything else (macOS) ---------------
