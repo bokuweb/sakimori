@@ -74,20 +74,16 @@ runs:
           local name="$1"
           local value="$2"
           local sanitized
-          # Keep CR and LF removal as separate commands. Besides making the
-          # single-line invariant explicit, CodeQL recognizes `tr -d '\n'`
-          # as the sanitizer for writes to GITHUB_ENV.
           sanitized=$(printf '%s' "${value}" | tr -d '\r' | tr -d '\n')
           if [[ "${sanitized}" != "${value}" ]]; then
             echo "::error::${name} must not contain CR or LF characters" >&2
             exit 1
           fi
-          printf '%s' "${sanitized}"
         }
 
-        safe_policy=$(sanitize_env_value policy "${INPUT_POLICY}")
-        safe_mode=$(sanitize_env_value mode "${INPUT_MODE}")
-        safe_log=$(sanitize_env_value log "${INPUT_LOG}")
+        sanitize_env_value policy "${INPUT_POLICY}"
+        sanitize_env_value mode "${INPUT_MODE}"
+        sanitize_env_value log "${INPUT_LOG}"
 
         version="${INPUT_VERSION}"
         if [[ -z "${version}" ]]; then
@@ -138,9 +134,11 @@ runs:
         echo "bpf=${dest}/sakimori.bpf.o" >> "${GITHUB_OUTPUT}"
         echo "SAKIMORI_BPF_OBJ=${dest}/sakimori.bpf.o" >> "${GITHUB_ENV}"
         echo "SAKIMORI_BIN=${dest}/sakimori" >> "${GITHUB_ENV}"
-        echo "SAKIMORI_POLICY=${safe_policy}" >> "${GITHUB_ENV}"
-        echo "SAKIMORI_MODE=${safe_mode}" >> "${GITHUB_ENV}"
-        echo "SAKIMORI_LOG=${safe_log}" >> "${GITHUB_ENV}"
+        # Keep newline removal at each write so both the shell and static
+        # analysis can prove that one input creates exactly one env record.
+        echo "SAKIMORI_POLICY=$(printf '%s' "${INPUT_POLICY}" | tr -d '\r' | tr -d '\n')" >> "${GITHUB_ENV}"
+        echo "SAKIMORI_MODE=$(printf '%s' "${INPUT_MODE}" | tr -d '\r' | tr -d '\n')" >> "${GITHUB_ENV}"
+        echo "SAKIMORI_LOG=$(printf '%s' "${INPUT_LOG}" | tr -d '\r' | tr -d '\n')" >> "${GITHUB_ENV}"
         echo "SAKIMORI_OS=linux" >> "${GITHUB_ENV}"
 
     # --------------- Windows ---------------
