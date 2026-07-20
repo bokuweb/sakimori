@@ -36,6 +36,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
+// `spawn_proxy` must release its ephemeral-port reservation before
+// hudsucker binds the same address. Serialise the two tests in this
+// binary so they cannot claim each other's briefly-unbound port.
+static PROXY_PORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -296,6 +301,8 @@ fn synthetic_packument() -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn https_packument_rewritten_when_upstream_ca_is_trusted() {
+    let _port_guard = PROXY_PORT_LOCK.lock().await;
+
     // Use `localhost` (DnsName SAN) rather than `127.0.0.1` (IP
     // SAN) because hudsucker's per-host MITM leaf-signer issues
     // certificates with a DnsName SAN derived from the CONNECT
@@ -336,6 +343,8 @@ async fn https_packument_rewritten_when_upstream_ca_is_trusted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn https_upstream_handshake_fails_without_extra_root() {
+    let _port_guard = PROXY_PORT_LOCK.lock().await;
+
     let cert = generate_self_signed_for_loopback("ca-neg");
     let upstream = spawn_mock_tls_upstream(&cert, synthetic_packument()).await;
 
