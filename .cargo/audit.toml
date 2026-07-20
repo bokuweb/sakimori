@@ -1,20 +1,8 @@
 # cargo-audit configuration. See .github/workflows/security.yml.
 #
-# This file mirrors the `ignore` list in `deny.toml` so cargo-audit
-# and cargo-deny agree on which advisories are in-flight follow-ups
-# vs new findings. Bump both files in lockstep.
-#
 # The CI workflow runs `cargo audit --deny warnings`; that flag
 # escalates `unmaintained` to a failure too. Tighten further only
 # after writing down the rationale in the same commit.
 
 [advisories]
-# See deny.toml `[advisories.ignore]` for per-id rationale.
-# `audit.toml` accepts a flat list of RUSTSEC IDs.
-ignore = [
-  "RUSTSEC-2026-0049",  # rustls-webpki 0.102 via hudsucker 0.22 — bump 0.24 (until 2026-06-30)
-  "RUSTSEC-2026-0098",  # rustls-webpki 0.102 via hudsucker 0.22 — bump 0.24 (until 2026-06-30)
-  "RUSTSEC-2026-0099",  # rustls-webpki 0.102 via hudsucker 0.22 — bump 0.24 (until 2026-06-30)
-  "RUSTSEC-2026-0104",  # rustls-webpki 0.102 via hudsucker 0.22 — bump 0.24 (until 2026-06-30)
-  "RUSTSEC-2026-0119",  # hickory-proto 0.24.4 via hickory-resolver 0.24 — bump 0.26 (until 2026-06-30)
-]
+ignore = []

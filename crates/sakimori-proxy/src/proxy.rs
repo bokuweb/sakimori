@@ -15,7 +15,8 @@ use hudsucker::{
     Body, HttpContext, HttpHandler, Proxy, RequestOrResponse,
     certificate_authority::RcgenAuthority,
     hyper::{Request, Response, StatusCode},
-    rcgen::KeyPair,
+    rcgen::{Issuer, KeyPair},
+    rustls::crypto::aws_lc_rs,
 };
 
 use sakimori_core::deps::Ecosystem;
@@ -262,8 +263,9 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
 
     let key = KeyPair::from_pem(&String::from_utf8_lossy(&key_pem))
         .context("loading CA key into rcgen")?;
-    let ca_cert = rcgen_cert_from_pem(&cert_pem)?;
-    let authority = RcgenAuthority::new(key, ca_cert, 1_000);
+    let issuer = Issuer::from_ca_cert_pem(&String::from_utf8_lossy(&cert_pem), key)
+        .context("loading CA certificate into rcgen")?;
+    let authority = RcgenAuthority::new(issuer, 1_000, aws_lc_rs::default_provider());
 
     let oracle: Box<dyn AgeOracle> = cfg
         .oracle
@@ -454,11 +456,9 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
         upstream_user_agent: cfg.user_agent.clone(),
     };
 
-    // `.build()` in hudsucker 0.22 returns Proxy<…> directly; no Result.
-    //
     // Branch on whether the user supplied any extra upstream roots.
     // The empty path stays on hudsucker's built-in
-    // `with_rustls_client()` so we don't perturb the default code
+    // `with_rustls_connector()` so we don't perturb the default code
     // path. With extras, we build the same connector shape
     // (`https_or_http()` + `enable_http1()` +
     // `http1_title_case_headers(true)` +
@@ -470,20 +470,22 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
     if cfg.extra_upstream_roots.is_empty() {
         let proxy = Proxy::builder()
             .with_addr(cfg.listen)
-            .with_rustls_client()
             .with_ca(authority)
+            .with_rustls_connector(aws_lc_rs::default_provider())
             .with_http_handler(handler)
-            .build();
+            .build()
+            .context("building proxy")?;
         log::info!("sakimori-proxy listening on {}", cfg.listen);
         proxy.start().await.context("proxy.start()")
     } else {
-        let client = build_upstream_client_with_extra_roots(&cfg.extra_upstream_roots)?;
+        let connector = build_upstream_connector_with_extra_roots(&cfg.extra_upstream_roots)?;
         let proxy = Proxy::builder()
             .with_addr(cfg.listen)
-            .with_client(client)
             .with_ca(authority)
+            .with_http_connector(connector)
             .with_http_handler(handler)
-            .build();
+            .build()
+            .context("building proxy")?;
         log::info!(
             "sakimori-proxy listening on {} (with {} extra upstream root(s))",
             cfg.listen,
@@ -497,20 +499,15 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
 /// webpki-roots PLUS each PEM file in `extras`. Used by `run()`
 /// when `ProxyConfig.extra_upstream_roots` is non-empty.
 ///
-/// Mirrors hudsucker 0.22's `with_rustls_client()` connector
+/// Mirrors hudsucker 0.24's `with_rustls_connector()` connector
 /// shape (HTTP/1 only, title-case + preserve-case headers) so the
 /// only behavioural delta vs the default path is the root store.
-fn build_upstream_client_with_extra_roots(
+fn build_upstream_connector_with_extra_roots(
     extras: &[std::path::PathBuf],
-) -> Result<
-    hyper_util::client::legacy::Client<
-        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-        hudsucker::Body,
-    >,
-> {
-    // hudsucker re-exports rustls 0.22 via tokio-rustls. Using
+) -> Result<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>> {
+    // hudsucker re-exports rustls 0.23 via tokio-rustls. Using
     // that re-export keeps us off the workspace's direct
-    // `rustls 0.23` dep — `hyper-rustls 0.26` won't accept types
+    // `rustls 0.23` dep — `hyper-rustls 0.27` won't accept types
     // from a different rustls crate compilation unit.
     use hudsucker::rustls::pki_types::CertificateDer;
     use hudsucker::rustls::pki_types::pem::PemObject;
@@ -555,7 +552,9 @@ fn build_upstream_client_with_extra_roots(
         extras.len(),
     );
 
-    let tls = ClientConfig::builder()
+    let tls = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .context("selecting upstream TLS protocol versions")?
         .with_root_certificates(roots)
         .with_no_client_auth();
 
@@ -565,21 +564,7 @@ fn build_upstream_client_with_extra_roots(
         .enable_http1()
         .build();
 
-    Ok(
-        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .http1_title_case_headers(true)
-            .http1_preserve_header_case(true)
-            .build(https),
-    )
-}
-
-fn rcgen_cert_from_pem(pem: &[u8]) -> Result<rcgen::Certificate> {
-    let text = String::from_utf8_lossy(pem).to_string();
-    let params =
-        rcgen::CertificateParams::from_ca_cert_pem(&text).context("parsing CA cert PEM")?;
-    let key = rcgen::KeyPair::generate().context("regen keypair for rcgen cert")?;
-    let cert = params.self_signed(&key).context("re-sign CA cert")?;
-    Ok(cert)
+    Ok(https)
 }
 
 /// Only MITM traffic bound for hosts we care about. Everything else

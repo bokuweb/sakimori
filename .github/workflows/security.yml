@@ -62,68 +62,6 @@ jobs:
   # Rust supply chain
   # -------------------------------------------------------------
 
-  # -------------------------------------------------------------
-  # Hard-deadline enforcement on time-boxed advisory ignores.
-  # -------------------------------------------------------------
-  #
-  # `osv-scanner.toml` carries `ignoreUntil` natively — osv-scanner
-  # silently drops the ignore after the date. cargo-audit and
-  # cargo-deny do NOT support per-entry expiry, so the ignore
-  # lists in `.cargo/audit.toml` + `deny.toml` would otherwise
-  # remain in effect forever (codex round-1 finding: the deadline
-  # isn't enforced symmetrically across scanners).
-  #
-  # This job is the symmetry: hard-fail after `IGNORE_DEADLINE`
-  # if any of the time-boxed RUSTSEC IDs are still listed in
-  # either file. Forces the maintainer to actually do the
-  # hudsucker / hickory bump (or, in a worst case, write down
-  # why the deadline needs to slide and update the date in all
-  # three files together).
-
-  ignore-expiry:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      IGNORE_DEADLINE: "2026-06-30"
-      # IDs to sweep for. Update this list in lockstep with the
-      # entries in `.cargo/audit.toml` + `deny.toml` +
-      # `osv-scanner.toml`.
-      WATCHED_IDS: "RUSTSEC-2026-0049|RUSTSEC-2026-0098|RUSTSEC-2026-0099|RUSTSEC-2026-0104|RUSTSEC-2026-0119"
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Enforce ignore expiry
-        shell: bash
-        run: |
-          set -euo pipefail
-          today=$(date -u +%Y-%m-%d)
-          if [[ "$today" > "$IGNORE_DEADLINE" ]]; then
-            offenders=()
-            for f in .cargo/audit.toml deny.toml osv-scanner.toml; do
-              if [ -f "$f" ] && grep -qE "$WATCHED_IDS" "$f"; then
-                offenders+=("$f")
-              fi
-            done
-            if [ "${#offenders[@]}" -gt 0 ]; then
-              echo "::error::Time-boxed advisory ignores past their deadline $IGNORE_DEADLINE"
-              echo ""
-              echo "Files still listing the time-boxed RUSTSEC IDs:"
-              printf '  - %s\n' "${offenders[@]}"
-              echo ""
-              echo "By the deadline the workspace should have bumped:"
-              echo "  - hudsucker        0.22 -> 0.24 (closes RUSTSEC-2026-{0049,0098,0099,0104})"
-              echo "  - hickory-resolver 0.24 -> 0.26 (closes RUSTSEC-2026-0119)"
-              echo ""
-              echo "Remove the IDs from the listed files, or — if the bump is"
-              echo "genuinely blocked — open a PR sliding the deadline in ALL"
-              echo "THREE config files AND the IGNORE_DEADLINE env above."
-              exit 1
-            fi
-            echo "deadline passed but no offending IDs remain — ok"
-          else
-            echo "today=$today  deadline=$IGNORE_DEADLINE  ignores still in effect"
-          fi
-
   cargo-audit:
     runs-on: ubuntu-latest
     permissions:

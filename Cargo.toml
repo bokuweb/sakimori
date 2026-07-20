@@ -43,7 +43,7 @@ ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
 toml = "0.8"
 notify = "6"
-hickory-resolver = "0.24"
+hickory-resolver = "0.26.1"
 uuid = { version = "1", features = ["v4"] }
 nix = { version = "0.29", features = ["sched", "process", "user", "fs"] }
 bytes = "1"

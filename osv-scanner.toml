@@ -1,35 +1,4 @@
 # osv-scanner configuration. See .github/workflows/security.yml.
 #
-# This file mirrors the `ignore` list in `deny.toml` /
-# `audit.toml` so all three scanners agree on which advisories
-# are in-flight follow-ups vs new findings.
-#
-# osv-scanner uses OSV ids (GHSA / CVE / RUSTSEC accepted), and
-# the `ignoreUntil` field is the hard deadline. After that date
-# the entry is ignored as if absent and the gate re-fails — the
-# bump becomes blocking.
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0049"
-ignoreUntil = "2026-06-30T00:00:00Z"
-reason = "rustls-webpki 0.102 via hudsucker 0.22 → CRL Distribution Point matching. Bump hudsucker 0.22 → 0.24 (API migration in sakimori-proxy/src/proxy.rs)."
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0098"
-ignoreUntil = "2026-06-30T00:00:00Z"
-reason = "rustls-webpki 0.102 via hudsucker 0.22 → URI name constraints. Same fix as 0049."
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0099"
-ignoreUntil = "2026-06-30T00:00:00Z"
-reason = "rustls-webpki 0.102 via hudsucker 0.22 → wildcard name constraints. Same fix as 0049."
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0104"
-ignoreUntil = "2026-06-30T00:00:00Z"
-reason = "rustls-webpki 0.102 via hudsucker 0.22 → reachable panic in CRL parsing. Same fix as 0049."
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0119"
-ignoreUntil = "2026-06-30T00:00:00Z"
-reason = "hickory-proto 0.24.4 via hickory-resolver 0.24 → O(n²) message-encoding CPU exhaustion. Bump hickory-resolver 0.24 → 0.26 (NameServerConfig constructor + ResolverConfig::from_parts API broke)."
+# No ignored vulnerabilities. Keep this file so local and CI
+# osv-scanner invocations share an explicit repository config.

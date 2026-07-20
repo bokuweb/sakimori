@@ -137,10 +137,14 @@ async fn spawn_mock_tarball_upstream(cert: &SelfSigned, body: Vec<u8>) -> std::n
     use hud_rustls::pki_types::{CertificateDer, PrivateKeyDer};
     let cert_chain = vec![CertificateDer::from(cert.cert_der.clone())];
     let key = PrivateKeyDer::try_from(cert.key_der.clone()).unwrap();
-    let server_config = hud_rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, key)
-        .unwrap();
+    let server_config = hud_rustls::ServerConfig::builder_with_provider(Arc::new(
+        hud_rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(cert_chain, key)
+    .unwrap();
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -250,9 +254,13 @@ fn https_get(
         let cert = cert.map_err(|e| e.to_string())?;
         roots.add(cert).map_err(|e| e.to_string())?;
     }
-    let tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| e.to_string())?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
 
     let proxy_spec = format!("http://{proxy_addr}");
     let agent = ureq::AgentBuilder::new()

@@ -97,7 +97,7 @@ fn generate_self_signed_for_loopback(tag: &str) -> SelfSigned {
 
 /// Spawn a TLS mock upstream on a random `127.0.0.1` port that
 /// serves the given JSON body for every request. Uses
-/// `tokio-rustls 0.25` + `hudsucker::rustls` (0.22) so the cert
+/// `tokio-rustls 0.26` + `hudsucker::rustls` (0.23) so the cert
 /// types match the proxy side.
 async fn spawn_mock_tls_upstream(cert: &SelfSigned, body: Vec<u8>) -> std::net::SocketAddr {
     use hud_rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -106,10 +106,14 @@ async fn spawn_mock_tls_upstream(cert: &SelfSigned, body: Vec<u8>) -> std::net::
     let key =
         PrivateKeyDer::try_from(cert.key_der.clone()).expect("PrivateKeyDer accepts PKCS#8 DER");
 
-    let server_config = hud_rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, key)
-        .expect("rustls server config");
+    let server_config = hud_rustls::ServerConfig::builder_with_provider(Arc::new(
+        hud_rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("rustls protocol versions")
+    .with_no_client_auth()
+    .with_single_cert(cert_chain, key)
+    .expect("rustls server config");
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -233,9 +237,13 @@ fn https_get_through_proxy(
         roots.add(cert).map_err(|e| e.to_string())?;
     }
 
-    let tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| e.to_string())?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
 
     let proxy_spec = format!("http://{proxy_addr}");
     let agent = ureq::AgentBuilder::new()
