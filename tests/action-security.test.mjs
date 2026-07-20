@@ -50,7 +50,11 @@ test("action inputs cannot inject extra GITHUB_ENV records", () => {
   assert.match(scripts, /safe_policy=.*sanitize_env_value.*INPUT_POLICY/);
   assert.match(scripts, /safe_mode=.*sanitize_env_value.*INPUT_MODE/);
   assert.match(scripts, /safe_log=.*sanitize_env_value.*INPUT_LOG/);
-  assert.match(scripts, /tr -d ['"]\\r\\n['"]/);
+  assert.match(
+    scripts,
+    /tr -d ['"]\\r['"]\s*\|\s*tr -d ['"]\\n['"]/,
+    "Linux sanitization must expose the newline-removal command to CodeQL",
+  );
 
   assert.match(scripts, /\$safePolicy\s*=\s*Get-SingleLineEnvValue.*INPUT_POLICY/);
   assert.match(scripts, /\$safeMode\s*=\s*Get-SingleLineEnvValue.*INPUT_MODE/);

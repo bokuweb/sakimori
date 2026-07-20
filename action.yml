@@ -74,7 +74,10 @@ runs:
           local name="$1"
           local value="$2"
           local sanitized
-          sanitized=$(printf '%s' "${value}" | tr -d '\r\n')
+          # Keep CR and LF removal as separate commands. Besides making the
+          # single-line invariant explicit, CodeQL recognizes `tr -d '\n'`
+          # as the sanitizer for writes to GITHUB_ENV.
+          sanitized=$(printf '%s' "${value}" | tr -d '\r' | tr -d '\n')
           if [[ "${sanitized}" != "${value}" ]]; then
             echo "::error::${name} must not contain CR or LF characters" >&2
             exit 1
