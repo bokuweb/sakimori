@@ -70,6 +70,22 @@ runs:
       run: |
         set -euo pipefail
 
+        sanitize_env_value() {
+          local name="$1"
+          local value="$2"
+          local sanitized
+          sanitized=$(printf '%s' "${value}" | tr -d '\r\n')
+          if [[ "${sanitized}" != "${value}" ]]; then
+            echo "::error::${name} must not contain CR or LF characters" >&2
+            exit 1
+          fi
+          printf '%s' "${sanitized}"
+        }
+
+        safe_policy=$(sanitize_env_value policy "${INPUT_POLICY}")
+        safe_mode=$(sanitize_env_value mode "${INPUT_MODE}")
+        safe_log=$(sanitize_env_value log "${INPUT_LOG}")
+
         version="${INPUT_VERSION}"
         if [[ -z "${version}" ]]; then
           version="${GITHUB_ACTION_REF:-}"
@@ -119,9 +135,9 @@ runs:
         echo "bpf=${dest}/sakimori.bpf.o" >> "${GITHUB_OUTPUT}"
         echo "SAKIMORI_BPF_OBJ=${dest}/sakimori.bpf.o" >> "${GITHUB_ENV}"
         echo "SAKIMORI_BIN=${dest}/sakimori" >> "${GITHUB_ENV}"
-        echo "SAKIMORI_POLICY=${INPUT_POLICY}" >> "${GITHUB_ENV}"
-        echo "SAKIMORI_MODE=${INPUT_MODE}" >> "${GITHUB_ENV}"
-        echo "SAKIMORI_LOG=${INPUT_LOG}" >> "${GITHUB_ENV}"
+        echo "SAKIMORI_POLICY=${safe_policy}" >> "${GITHUB_ENV}"
+        echo "SAKIMORI_MODE=${safe_mode}" >> "${GITHUB_ENV}"
+        echo "SAKIMORI_LOG=${safe_log}" >> "${GITHUB_ENV}"
         echo "SAKIMORI_OS=linux" >> "${GITHUB_ENV}"
 
     # --------------- Windows ---------------
@@ -136,6 +152,20 @@ runs:
         INPUT_LOG: ${{ inputs.log }}
       run: |
         $ErrorActionPreference = "Stop"
+
+        function Get-SingleLineEnvValue {
+          param([string]$Name, [string]$Value)
+          $sanitized = $Value -replace '[\r\n]', ''
+          if ($sanitized -ne $Value) {
+            throw "$Name must not contain CR or LF characters"
+          }
+          return $sanitized
+        }
+
+        $safePolicy = Get-SingleLineEnvValue "policy" $env:INPUT_POLICY
+        $safeMode = Get-SingleLineEnvValue "mode" $env:INPUT_MODE
+        $safeLog = Get-SingleLineEnvValue "log" $env:INPUT_LOG
+
         $version = $env:INPUT_VERSION
         if ([string]::IsNullOrEmpty($version)) { $version = $env:GITHUB_ACTION_REF }
         if ([string]::IsNullOrEmpty($version) -or $version -eq "main" -or $version -eq "latest") {
@@ -179,9 +209,9 @@ runs:
         # can be written once and work on both.
         "bin=$dest\sakimori-win.exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
         "SAKIMORI_BIN=$dest\sakimori-win.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-        "SAKIMORI_POLICY=$env:INPUT_POLICY" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-        "SAKIMORI_MODE=$env:INPUT_MODE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-        "SAKIMORI_LOG=$env:INPUT_LOG" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "SAKIMORI_POLICY=$safePolicy" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "SAKIMORI_MODE=$safeMode" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "SAKIMORI_LOG=$safeLog" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
         "SAKIMORI_OS=windows" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
     # --------------- anything else (macOS) ---------------
