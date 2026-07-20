@@ -1,6 +1,6 @@
 name: consumer-smoke
 
-# Proves the published release is consumable as `bokuweb/sakimori@v0`.
+# Proves the published v0 release is consumable through the action.
 # Runs after a release is published, on manual dispatch, and on PRs
 # (so we exercise the PR-comment sub-action end-to-end).
 
@@ -18,12 +18,14 @@ jobs:
   use-as-action:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      # The exact pattern third-party consumers will write.
-      - uses: bokuweb/sakimori@v0
+      # Keep action code immutable while `version: v0` exercises the same
+      # floating release resolution that consumers get from `@v0`.
+      - uses: bokuweb/sakimori@8491d10e50cf65e438bedb87cd6f4e496140ac29 # v0
         with:
           mode: audit
+          version: v0
 
       - name: Run supervised command
         run: |
@@ -89,7 +91,7 @@ jobs:
           test -f sakimori-report.html
 
       # Upload both so the comment's one-liner can pull the HTML.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sakimori-report
           path: |
@@ -98,7 +100,7 @@ jobs:
 
       # Only meaningful on pull_request events — on release/dispatch this
       # step no-ops (the sub-action bails early).
-      - uses: bokuweb/sakimori/comment@v0
+      - uses: bokuweb/sakimori/comment@8491d10e50cf65e438bedb87cd6f4e496140ac29 # v0
         if: github.event_name == 'pull_request'
         with:
           log: sakimori.log.json
@@ -123,10 +125,11 @@ jobs:
     # happens. Runs alongside use-as-action (doesn't need its results).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: bokuweb/sakimori@v0
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: bokuweb/sakimori@8491d10e50cf65e438bedb87cd6f4e496140ac29 # v0
         with:
           mode: block
+          version: v0
       - name: Block-mode run should fail with a denied connect
         run: |
           cat > /tmp/block.yml <<'EOF'
@@ -159,10 +162,11 @@ jobs:
     # the same inputs / env contract as the Linux job above.
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: bokuweb/sakimori@v0
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: bokuweb/sakimori@8491d10e50cf65e438bedb87cd6f4e496140ac29 # v0
         with:
           mode: audit
+          version: v0
       - name: Run supervised command (Windows)
         shell: pwsh
         run: |

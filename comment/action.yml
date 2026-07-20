@@ -38,6 +38,9 @@ runs:
         MARKER: ${{ inputs.marker }}
         FAIL_ON_DENIED: ${{ inputs.fail-on-denied }}
         TITLE: ${{ inputs.title }}
+        ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        HTML_FILENAME: ${{ inputs.html-filename }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
       run: |
         set -euo pipefail
 
@@ -55,13 +58,18 @@ runs:
         # Build the one-liner that downloads the HTML artifact and opens it
         # locally. Only emitted when the caller tells us the artifact name.
         oneliner=""
-        if [[ -n "${{ inputs.artifact-name }}" ]]; then
+        if [[ -n "${ARTIFACT_NAME}" ]]; then
           # Scope destination by run-id so re-runs / parallel PRs don't clobber
           # each other, and `rm -rf` first so `gh run download` (which refuses
           # to overwrite existing files) works on the second+ invocation.
           dir="/tmp/sakimori-${GITHUB_RUN_ID}"
-          html="${dir}/${{ inputs.html-filename }}"
-          oneliner="rm -rf ${dir} && gh run download ${GITHUB_RUN_ID} -R ${GITHUB_REPOSITORY} -n ${{ inputs.artifact-name }} -D ${dir} && (open ${html} 2>/dev/null || xdg-open ${html} 2>/dev/null || echo \"open file://${html}\")"
+          html="${dir}/${HTML_FILENAME}"
+          printf -v q_dir '%q' "${dir}"
+          printf -v q_html '%q' "${html}"
+          printf -v q_run_id '%q' "${GITHUB_RUN_ID}"
+          printf -v q_repo '%q' "${GITHUB_REPOSITORY}"
+          printf -v q_artifact '%q' "${ARTIFACT_NAME}"
+          oneliner="rm -rf -- ${q_dir} && gh run download ${q_run_id} -R ${q_repo} -n ${q_artifact} -D ${q_dir} && (open ${q_html} 2>/dev/null || xdg-open ${q_html} 2>/dev/null || echo file://${q_html})"
         fi
 
         body=$(ONELINER="${oneliner}" python3 - "${LOG}" "${MARKER}" "${TITLE}" <<'PY'
@@ -131,7 +139,11 @@ runs:
 
         # Upsert by marker: if a previous comment on this PR contains the
         # marker, edit it; otherwise create a new one.
-        pr_number="${{ github.event.pull_request.number }}"
+        pr_number="${PR_NUMBER}"
+        if [[ ! "${pr_number}" =~ ^[0-9]+$ ]]; then
+          echo "::error::invalid pull request number"
+          exit 1
+        fi
         repo="${GITHUB_REPOSITORY}"
         existing=$(gh api -X GET "repos/${repo}/issues/${pr_number}/comments" --paginate \
           --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -n1)
