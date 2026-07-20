@@ -47,27 +47,29 @@ test("composite actions keep untrusted expressions out of run scripts", () => {
 test("action inputs cannot inject extra GITHUB_ENV records", () => {
   const scripts = runBodies(read("action.yml")).join("\n");
 
-  assert.match(scripts, /safe_policy=.*sanitize_env_value.*INPUT_POLICY/);
-  assert.match(scripts, /safe_mode=.*sanitize_env_value.*INPUT_MODE/);
-  assert.match(scripts, /safe_log=.*sanitize_env_value.*INPUT_LOG/);
-  assert.match(
-    scripts,
-    /tr -d ['"]\\r['"]\s*\|\s*tr -d ['"]\\n['"]/,
-    "Linux sanitization must expose the newline-removal command to CodeQL",
-  );
+  assert.match(scripts, /^\s*sanitize_env_value policy "\$\{INPUT_POLICY\}"\s*$/m);
+  assert.match(scripts, /^\s*sanitize_env_value mode "\$\{INPUT_MODE\}"\s*$/m);
+  assert.match(scripts, /^\s*sanitize_env_value log "\$\{INPUT_LOG\}"\s*$/m);
+
+  for (const name of ["POLICY", "MODE", "LOG"]) {
+    const write = scripts
+      .split("\n")
+      .find((line) => line.includes("GITHUB_ENV") && line.includes(`INPUT_${name}`));
+    assert.ok(write, `Linux must sanitize INPUT_${name} at the GITHUB_ENV write`);
+    assert.match(write, /\$\(printf '%s'/);
+    assert.match(
+      write,
+      /tr -d ['"]\\r['"]\s*\|\s*tr -d ['"]\\n['"]/,
+      `INPUT_${name} must use CodeQL-recognized newline removal`,
+    );
+  }
 
   assert.match(scripts, /\$safePolicy\s*=\s*Get-SingleLineEnvValue.*INPUT_POLICY/);
   assert.match(scripts, /\$safeMode\s*=\s*Get-SingleLineEnvValue.*INPUT_MODE/);
   assert.match(scripts, /\$safeLog\s*=\s*Get-SingleLineEnvValue.*INPUT_LOG/);
   assert.match(scripts, /-replace ['"]\[\\r\\n\]['"],\s*['"]/);
 
-  for (const line of scripts.split("\n").filter((candidate) => candidate.includes("GITHUB_ENV"))) {
-    assert.doesNotMatch(
-      line,
-      /(?:\$\{INPUT_|\$env:INPUT_)(?:POLICY|MODE|LOG)/,
-      `unsanitized action input reaches GITHUB_ENV: ${line.trim()}`,
-    );
-  }
+  assert.doesNotMatch(scripts, /\$env:INPUT_(?:POLICY|MODE|LOG).*GITHUB_ENV/);
 });
 
 test("security-sensitive workflows pin every external action by commit SHA", () => {
