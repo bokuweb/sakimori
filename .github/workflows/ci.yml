@@ -1183,7 +1183,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - run: node --test proxy/test/main.test.mjs
+      - run: node --test job/test/pre.test.mjs proxy/test/main.test.mjs
 
   proxy-action-smoke:
     # Verifies that `bokuweb/sakimori/proxy@v0` (the JS-action wrapper

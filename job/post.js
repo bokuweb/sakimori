@@ -14,15 +14,26 @@ if (process.platform !== "linux") {
 }
 
 const runnerTemp = process.env.RUNNER_TEMP || os.tmpdir();
-const pidFile =
-  process.env.SAKIMORI_JOB_PIDFILE || path.join(runnerTemp, "sakimori-job.pid");
-const binPath =
-  process.env.SAKIMORI_BIN || path.join(runnerTemp, "sakimori", "sakimori");
+const runtimeDir = process.env.SAKIMORI_JOB_TMP || "";
+const pidFile = process.env.SAKIMORI_JOB_PIDFILE || "";
+const binPath = process.env.SAKIMORI_BIN || "";
+
+function cleanupRuntime() {
+  if (!runtimeDir) return;
+  const resolved = path.resolve(runtimeDir);
+  if (
+    path.dirname(resolved) === path.resolve(runnerTemp) &&
+    path.basename(resolved).startsWith("sakimori-job-")
+  ) {
+    fs.rmSync(resolved, { recursive: true, force: true });
+  }
+}
 
 if (!fs.existsSync(pidFile)) {
   console.log(
     `sakimori daemon stop: no pid-file at ${pidFile} — pre-step likely failed before the daemon started; nothing to flush.`,
   );
+  cleanupRuntime();
   process.exit(0);
 }
 
@@ -41,9 +52,9 @@ const stopResult = spawnSync(
 
 // Drain the daemon's stderr log so late warnings (ringbuf overflow,
 // block-mode `::error::` annotations) show up on the run page.
-const daemonStderr = path.join(runnerTemp, "sakimori-daemon.stderr.log");
+const daemonStderr = process.env.SAKIMORI_JOB_STDERR || "";
 try {
-  const text = fs.readFileSync(daemonStderr, "utf8");
+  const text = daemonStderr ? fs.readFileSync(daemonStderr, "utf8") : "";
   if (text.trim().length > 0) {
     process.stderr.write("---- sakimori daemon stderr ----\n");
     process.stderr.write(text);
@@ -55,6 +66,7 @@ try {
 
 // daemon stop failed (timeout / pid-file unreadable) → surface that.
 if (stopResult.status != null && stopResult.status !== 0) {
+  cleanupRuntime();
   process.exit(stopResult.status);
 }
 
@@ -78,6 +90,7 @@ if (mode === "block" && logPath && logPath !== "-" && fs.existsSync(logPath)) {
       process.stderr.write(
         `::error title=sakimori::policy violation: ${stats.denied} events denied in block mode\n`,
       );
+      cleanupRuntime();
       process.exit(1);
     }
   } catch (e) {
@@ -87,4 +100,5 @@ if (mode === "block" && logPath && logPath !== "-" && fs.existsSync(logPath)) {
   }
 }
 
+cleanupRuntime();
 process.exit(0);

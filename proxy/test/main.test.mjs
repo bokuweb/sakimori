@@ -20,6 +20,27 @@ const proxyDir = path.resolve(here, "..");
 const actionYml = fs.readFileSync(path.join(proxyDir, "action.yml"), "utf8");
 const mainJs = fs.readFileSync(path.join(proxyDir, "main.js"), "utf8");
 
+test("main.js creates a private unpredictable runtime directory", () => {
+  assert.match(mainJs, /fs\.mkdtempSync\(/);
+  assert.match(mainJs, /fs\.chmodSync\([^,]+,\s*0o700\)/);
+  assert.doesNotMatch(
+    mainJs,
+    /path\.join\(runnerTemp,\s*["']sakimori-proxy-action["']\)/,
+  );
+});
+
+test("main.js creates logs and pid file exclusively with owner-only permissions", () => {
+  assert.match(mainJs, /O_CREAT[\s\S]*O_EXCL/);
+  assert.match(mainJs, /openSync\([^\n]+0o600\)/);
+  assert.match(mainJs, /writeFileSync\([^\n]+flag:\s*["']wx["']/);
+});
+
+test("main.js reads startup diagnostics from its open descriptor", () => {
+  assert.match(mainJs, /fs\.readSync\(\s*fd\b/);
+  assert.match(mainJs, /readFdUtf8\(\s*stderrFd\s*\)/);
+  assert.doesNotMatch(mainJs, /fs\.readFileSync\(\s*stderrLog\b/);
+});
+
 // ---------------------------------------------------------------
 // action.yml input declarations
 // ---------------------------------------------------------------
