@@ -66,6 +66,19 @@ function setOutput(name, value) {
   fs.appendFileSync(f, `${name}=${value}\n`);
 }
 
+function openPrivateFile(file) {
+  const flags = fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR;
+  return fs.openSync(file, flags, 0o600);
+}
+
+function readFdUtf8(fd) {
+  const size = fs.fstatSync(fd).size;
+  if (size === 0) return "";
+  const buffer = Buffer.alloc(size);
+  const bytesRead = fs.readSync(fd, buffer, 0, size, 0);
+  return buffer.subarray(0, bytesRead).toString("utf8");
+}
+
 // Resolve (triple, binName) for the current OS/arch. Matches the
 // release-artefact naming in release.yml.
 //
@@ -225,8 +238,8 @@ async function waitForListen(host, port, deadlineMs) {
   }
 
   const runnerTemp = process.env.RUNNER_TEMP || os.tmpdir();
-  const tmpDir = path.join(runnerTemp, "sakimori-proxy-action");
-  fs.mkdirSync(tmpDir, { recursive: true });
+  const tmpDir = fs.mkdtempSync(path.join(runnerTemp, "sakimori-proxy-action-"));
+  fs.chmodSync(tmpDir, 0o700);
   // Explicit --config-dir means we know where the CA lands without
   // having to guess at the platform's XDG-equivalent.
   const configDir = path.join(tmpDir, "config");
@@ -268,8 +281,8 @@ async function waitForListen(host, port, deadlineMs) {
 
   const stdoutLog = path.join(tmpDir, "proxy.stdout.log");
   const stderrLog = path.join(tmpDir, "proxy.stderr.log");
-  const stdoutFd = fs.openSync(stdoutLog, "w");
-  const stderrFd = fs.openSync(stderrLog, "w");
+  const stdoutFd = openPrivateFile(stdoutLog);
+  const stderrFd = openPrivateFile(stderrLog);
 
   const proxyArgs = [
     "proxy",
@@ -321,7 +334,7 @@ async function waitForListen(host, port, deadlineMs) {
 
   // Stash PID so the post step can kill it.
   const pidFile = path.join(tmpDir, "proxy.pid");
-  fs.writeFileSync(pidFile, String(child.pid));
+  fs.writeFileSync(pidFile, String(child.pid), { encoding: "utf8", mode: 0o600, flag: "wx" });
 
   // Wait for the listener.
   const [host, portStr] = listen.split(":");
@@ -332,7 +345,7 @@ async function waitForListen(host, port, deadlineMs) {
   const up = await waitForListen(host, port, 15000);
   if (!up) {
     try {
-      const errText = fs.readFileSync(stderrLog, "utf8");
+      const errText = readFdUtf8(stderrFd);
       if (errText.trim()) {
         process.stderr.write("---- proxy stderr ----\n");
         process.stderr.write(errText);
@@ -341,8 +354,13 @@ async function waitForListen(host, port, deadlineMs) {
     } catch {
       /* ignore */
     }
+    fs.closeSync(stdoutFd);
+    fs.closeSync(stderrFd);
     fail(`proxy did not open ${listen} within 15s`);
   }
+
+  fs.closeSync(stdoutFd);
+  fs.closeSync(stderrFd);
 
   const caPath = path.join(configDir, "sakimori", "ca.pem");
   if (!fs.existsSync(caPath)) {

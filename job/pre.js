@@ -8,6 +8,7 @@
 "use strict";
 
 const { spawn, spawnSync } = require("child_process");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -95,7 +96,9 @@ if (container) {
 
 const runnerTemp = process.env.RUNNER_TEMP || os.tmpdir();
 const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
-const installDir = path.join(runnerTemp, "sakimori");
+const runtimeDir = fs.mkdtempSync(path.join(runnerTemp, "sakimori-job-"));
+fs.chmodSync(runtimeDir, 0o700);
+const installDir = path.join(runtimeDir, "install");
 
 // Honour pre-installed binaries — primarily so our own CI can exercise
 // the action against a locally-built sakimori, but also useful for
@@ -114,9 +117,71 @@ const binPath = preInstalled ? presetBin : path.join(installDir, "sakimori");
 const bpfPath = preInstalled
   ? presetBpf
   : path.join(installDir, "sakimori.bpf.o");
-const pidFile = path.join(runnerTemp, "sakimori-job.pid");
-const daemonStdout = path.join(runnerTemp, "sakimori-daemon.stdout.log");
-const daemonStderr = path.join(runnerTemp, "sakimori-daemon.stderr.log");
+const pidFile = path.join(runtimeDir, "daemon.pid");
+const daemonStdout = path.join(runtimeDir, "daemon.stdout.log");
+const daemonStderr = path.join(runtimeDir, "daemon.stderr.log");
+
+function run(command, args, options = {}) {
+  const result = spawnSync(command, args, { stdio: "inherit", ...options });
+  if (result.status !== 0) {
+    fail(`${command} failed (exit ${result.status ?? result.signal})`);
+  }
+  return result;
+}
+
+function resolveVersion(versionExpr, token) {
+  const env = { ...process.env, GH_TOKEN: token };
+  if (!versionExpr || versionExpr === "main" || versionExpr === "latest") {
+    const result = spawnSync(
+      "gh",
+      ["release", "view", "--repo", "bokuweb/sakimori", "--json", "tagName", "-q", ".tagName"],
+      { encoding: "utf8", env },
+    );
+    if (result.status !== 0) {
+      fail(`gh release view failed: ${(result.stderr || "").trim() || result.error?.message}`);
+    }
+    return result.stdout.trim();
+  }
+  if (/^v[0-9]+$/.test(versionExpr)) {
+    const major = versionExpr.slice(1);
+    const result = spawnSync(
+      "gh",
+      [
+        "api",
+        "repos/bokuweb/sakimori/releases",
+        "--jq",
+        `[.[] | select(.tag_name | startswith("v${major}.")) | .tag_name] | first`,
+      ],
+      { encoding: "utf8", env },
+    );
+    if (result.status !== 0) {
+      fail(`gh api failed: ${(result.stderr || "").trim() || result.error?.message}`);
+    }
+    const version = result.stdout.trim();
+    if (!version || version === "null") {
+      fail(`no v${major}.* release found on bokuweb/sakimori`);
+    }
+    return version;
+  }
+  return versionExpr;
+}
+
+function sha256File(file) {
+  return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+function openPrivateFile(file) {
+  const flags = fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR;
+  return fs.openSync(file, flags, 0o600);
+}
+
+function readFdUtf8(fd) {
+  const size = fs.fstatSync(fd).size;
+  if (size === 0) return "";
+  const buffer = Buffer.alloc(size);
+  const bytesRead = fs.readSync(fd, buffer, 0, size, 0);
+  return buffer.subarray(0, bytesRead).toString("utf8");
+}
 
 function resolveOutput(p) {
   if (!p) return "";
@@ -134,61 +199,47 @@ function installBinary() {
   const target = `${arch}-unknown-linux-musl`;
   const asset = `sakimori-${target}.tar.gz`;
 
-  // Bash for the heavy lifting — sha256sum + tar + gh are all available
-  // on the standard GitHub-hosted runner image, and replicating them in
-  // node would be 50 lines of boilerplate for no win.
-  //
-  // Version resolution handles three flavours of ${GITHUB_ACTION_REF}:
-  //   empty / "main" / "latest"   → newest release overall
-  //   "v<MAJOR>" (e.g. "v0")      → newest "v<MAJOR>.*" release. This is
-  //                                 the floating tag a `uses: bokuweb/
-  //                                 sakimori/job@v0` reference resolves
-  //                                 to; the moving git tag exists but
-  //                                 there's no Release object with that
-  //                                 literal name, so `gh release download
-  //                                 v0` 404s. Map to latest-in-major.
-  //   anything else               → used verbatim (concrete release tag).
-  const script = `
-set -euo pipefail
-version="${versionExpr}"
-if [[ -z "$version" || "$version" == "main" || "$version" == "latest" ]]; then
-  version=$(gh release view --repo bokuweb/sakimori --json tagName -q .tagName)
-elif [[ "$version" =~ ^v[0-9]+$ ]]; then
-  # "v0", "v1", ... moving tags don't have matching Release objects
-  # (release.yml's moving-tag job only force-pushes the git ref).
-  # Walk the release list and pick the newest entry whose tag starts
-  # with "v<MAJOR>." — this is what users mean when they pin to @v<MAJOR>.
-  major="\${version#v}"
-  version=$(gh api "repos/bokuweb/sakimori/releases" \\
-    --jq "[.[] | select(.tag_name | startswith(\\"v\${major}.\\")) | .tag_name] | first")
-  if [[ -z "$version" || "$version" == "null" ]]; then
-    echo "::error::no v\${major}.* release found on bokuweb/sakimori" >&2
-    exit 1
-  fi
-fi
-echo "Installing sakimori $version ($target) into ${installDir}"
-workdir=$(mktemp -d)
-cd "$workdir"
-gh release download "$version" \\
-  --repo bokuweb/sakimori \\
-  --pattern "${asset}" \\
-  --pattern "${asset}.sha256"
-sha256sum -c "${asset}.sha256"
-tar -xzf "${asset}"
-mkdir -p "${installDir}"
-mv "sakimori-${target}/sakimori" "${binPath}"
-mv "sakimori-${target}/sakimori.bpf.o" "${bpfPath}"
-chmod +x "${binPath}"
-`;
 
   const token = input("token");
-  const r = spawnSync("bash", ["-c", script], {
-    stdio: "inherit",
-    env: { ...process.env, GH_TOKEN: token, target, asset, installDir, binPath, bpfPath },
-  });
-  if (r.status !== 0) {
-    fail(`sakimori install failed (bash exited ${r.status ?? r.signal})`);
+  const version = resolveVersion(versionExpr, token);
+  const workdir = fs.mkdtempSync(path.join(runtimeDir, "download-"));
+  fs.chmodSync(workdir, 0o700);
+  console.log(`Installing sakimori ${version} (${target}) into ${installDir}`);
+
+  run(
+    "gh",
+    [
+      "release",
+      "download",
+      version,
+      "--repo",
+      "bokuweb/sakimori",
+      "--pattern",
+      asset,
+      "--pattern",
+      `${asset}.sha256`,
+      "--dir",
+      workdir,
+    ],
+    { env: { ...process.env, GH_TOKEN: token } },
+  );
+
+  const archive = path.join(workdir, asset);
+  const expected = fs
+    .readFileSync(`${archive}.sha256`, "utf8")
+    .trim()
+    .split(/\s+/)[0]
+    .toLowerCase();
+  const actual = sha256File(archive);
+  if (!/^[0-9a-f]{64}$/.test(expected) || actual !== expected) {
+    fail(`checksum mismatch for ${asset}`);
   }
+
+  run("tar", ["-xzf", archive, "-C", workdir]);
+  fs.mkdirSync(installDir, { recursive: true, mode: 0o700 });
+  fs.renameSync(path.join(workdir, `sakimori-${target}`, "sakimori"), binPath);
+  fs.renameSync(path.join(workdir, `sakimori-${target}`, "sakimori.bpf.o"), bpfPath);
+  fs.chmodSync(binPath, 0o755);
 }
 
 function startDaemon() {
@@ -211,7 +262,7 @@ function startDaemon() {
   const snapshotDirIn = input("snapshot-workspace");
   const snapshotDir = snapshotDirIn ? resolveOutput(snapshotDirIn) : "";
   const baselinePath = snapshotDir
-    ? path.join(runnerTemp, "sakimori-workspace-baseline.json")
+    ? path.join(runtimeDir, "workspace-baseline.json")
     : "";
   const snapshotSkip = (input("snapshot-skip") || "")
     .split(/[\n,]/)
@@ -271,8 +322,8 @@ function startDaemon() {
   // Fresh log files each run — append would mix stale daemon output
   // from a previous job that ran on this same runner image (rare on
   // hosted runners, common on self-hosted).
-  const stdoutFd = fs.openSync(daemonStdout, "w");
-  const stderrFd = fs.openSync(daemonStderr, "w");
+  const stdoutFd = openPrivateFile(daemonStdout);
+  const stderrFd = openPrivateFile(daemonStderr);
 
   const child = spawn("sudo", daemonArgs, {
     detached: true,
@@ -297,6 +348,8 @@ function startDaemon() {
       setEnv("SAKIMORI_BIN", binPath);
       setEnv("SAKIMORI_BPF_OBJ", bpfPath);
       setEnv("SAKIMORI_JOB_PIDFILE", pidFile);
+      setEnv("SAKIMORI_JOB_STDERR", daemonStderr);
+      setEnv("SAKIMORI_JOB_TMP", runtimeDir);
       // post.js needs these to decide whether to fail the job when the
       // daemon flagged denied events in block mode.
       setEnv("SAKIMORI_JOB_LOG", log);
@@ -315,6 +368,8 @@ function startDaemon() {
       setOutput("bin", binPath);
       setOutput("log", log);
       setOutput("pidfile", pidFile);
+      fs.closeSync(stdoutFd);
+      fs.closeSync(stderrFd);
       return;
     }
     // 200 ms busy-wait via spawnSync — pre.js is short-lived and a
@@ -324,7 +379,7 @@ function startDaemon() {
 
   // Surface whatever stderr the daemon wrote so the caller can see why.
   try {
-    const stderr = fs.readFileSync(daemonStderr, "utf8");
+    const stderr = readFdUtf8(stderrFd);
     if (stderr.trim().length > 0) {
       process.stderr.write("---- sakimori daemon stderr ----\n");
       process.stderr.write(stderr);
@@ -333,6 +388,8 @@ function startDaemon() {
   } catch {
     // ignore — stderr file may not exist if spawn itself failed
   }
+  fs.closeSync(stdoutFd);
+  fs.closeSync(stderrFd);
   fail(
     "sakimori daemon did not become ready within 20s. " +
       "Common causes: sudo prompts for a password (unsupported), kernel " +
