@@ -44,6 +44,28 @@ test("composite actions keep untrusted expressions out of run scripts", () => {
   }
 });
 
+test("action inputs cannot inject extra GITHUB_ENV records", () => {
+  const scripts = runBodies(read("action.yml")).join("\n");
+
+  assert.match(scripts, /safe_policy=.*sanitize_env_value.*INPUT_POLICY/);
+  assert.match(scripts, /safe_mode=.*sanitize_env_value.*INPUT_MODE/);
+  assert.match(scripts, /safe_log=.*sanitize_env_value.*INPUT_LOG/);
+  assert.match(scripts, /tr -d ['"]\\r\\n['"]/);
+
+  assert.match(scripts, /\$safePolicy\s*=\s*Get-SingleLineEnvValue.*INPUT_POLICY/);
+  assert.match(scripts, /\$safeMode\s*=\s*Get-SingleLineEnvValue.*INPUT_MODE/);
+  assert.match(scripts, /\$safeLog\s*=\s*Get-SingleLineEnvValue.*INPUT_LOG/);
+  assert.match(scripts, /-replace ['"]\[\\r\\n\]['"],\s*['"]/);
+
+  for (const line of scripts.split("\n").filter((candidate) => candidate.includes("GITHUB_ENV"))) {
+    assert.doesNotMatch(
+      line,
+      /(?:\$\{INPUT_|\$env:INPUT_)(?:POLICY|MODE|LOG)/,
+      `unsanitized action input reaches GITHUB_ENV: ${line.trim()}`,
+    );
+  }
+});
+
 test("security-sensitive workflows pin every external action by commit SHA", () => {
   for (const file of [".github/workflows/consumer-smoke.yml", ".github/workflows/docker.yml"]) {
     const refs = [...read(file).matchAll(/^\s*-?\s*uses:\s*([^\s#]+)/gm)].map((m) => m[1]);
