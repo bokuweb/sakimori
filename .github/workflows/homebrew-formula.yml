@@ -2,12 +2,22 @@ name: homebrew-formula
 
 # Runs after `release.yml` has published a new GitHub Release. We
 # download each platform's .tar.gz.sha256 sidecar, rewrite the
-# `version`, `url`, and `sha256` lines in
-# `HomebrewFormula/sakimori.rb`, and commit to main.
+# `version`, `url`, and `sha256` lines in the tap repo's
+# `Formula/sakimori.rb`, and push to the tap repo
+# (bokuweb/homebrew-sakimori) — NOT this repo. `brew install
+# bokuweb/sakimori/sakimori` resolves the tap `bokuweb/sakimori` to
+# the GitHub repo `bokuweb/homebrew-sakimori` (Homebrew always
+# prepends `homebrew-`), so that is where the consumed formula must
+# live.
 #
 # Separated from release.yml so a broken formula update doesn't
 # cancel the binary release itself, and so we can manually
 # re-run it against an already-published tag.
+#
+# Requires a `HOMEBREW_TAP_TOKEN` secret: a PAT (classic: `repo`
+# scope, or fine-grained: Contents read+write on
+# bokuweb/homebrew-sakimori) so the job can push to the tap repo.
+# The default GITHUB_TOKEN only has access to this repo.
 
 on:
   release:
@@ -20,7 +30,7 @@ on:
         default: ''
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: homebrew-formula
@@ -30,11 +40,19 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout sakimori (for the update script)
+        uses: actions/checkout@v4
         with:
-          ref: main
-          # Need enough history to push a fresh commit; shallow is fine.
+          path: sakimori
           fetch-depth: 1
+
+      - name: Checkout tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: bokuweb/homebrew-sakimori
+          ref: main
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
 
       - name: Resolve tag
         id: tag
@@ -46,7 +64,7 @@ jobs:
           fi
           if [ -z "$tag" ]; then
             # workflow_dispatch with no input → latest release
-            tag=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName')
           fi
           # Version without leading 'v' for the Homebrew `version`
           # field. `brew` normalises both but the convention is bare.
@@ -78,8 +96,8 @@ jobs:
       - name: Rewrite formula
         run: |
           set -euo pipefail
-          python3 scripts/update-homebrew-formula.py \
-              --file HomebrewFormula/sakimori.rb \
+          python3 sakimori/scripts/update-homebrew-formula.py \
+              --file tap/Formula/sakimori.rb \
               --version '${{ steps.tag.outputs.ver }}' \
               --tag '${{ steps.tag.outputs.tag }}' \
               --sha-aarch64-apple-darwin        '${{ steps.sha.outputs.aarch64_apple_darwin }}' \
@@ -88,19 +106,18 @@ jobs:
               --sha-x86_64-unknown-linux-musl   '${{ steps.sha.outputs.x86_64_unknown_linux_musl }}'
 
           echo "--- rewritten formula ---"
-          cat HomebrewFormula/sakimori.rb
+          cat tap/Formula/sakimori.rb
 
-      - name: Commit if changed
+      - name: Commit and push to tap
+        working-directory: tap
         run: |
           set -euo pipefail
           git config user.name 'sakimori-homebrew-bot'
           git config user.email 'homebrew-bot@users.noreply.github.com'
-          git add HomebrewFormula/sakimori.rb
+          git add Formula/sakimori.rb
           if git diff --cached --quiet; then
             echo "Formula already at ${{ steps.tag.outputs.tag }}; nothing to commit."
             exit 0
           fi
-          git commit -s -m "chore(homebrew): bump formula to ${{ steps.tag.outputs.tag }}"
-          # Push straight to main. The formula is data-only; no CI
-          # impact beyond the fmt/clippy jobs which don't touch it.
+          git commit -s -m "chore: bump formula to ${{ steps.tag.outputs.tag }}"
           git push origin HEAD:main

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Rewrite `HomebrewFormula/sakimori.rb` to point at a new release
-tag. Called from `.github/workflows/homebrew-formula.yml` after a
-`v*` release is published; the workflow computes the sha256 of
-each platform's tarball and passes them in via flags.
+Rewrite the tap repo's `Formula/sakimori.rb` (in
+bokuweb/homebrew-sakimori) to point at a new release tag. Called
+from `.github/workflows/homebrew-formula.yml` after a `v*` release
+is published; the workflow checks out the tap repo, computes the
+sha256 of each platform's tarball, and passes them in via flags.
+The `--file` arg is the path to the formula in the tap checkout.
 
 Pure-Python, no external deps — runs on any stock GH runner.
 

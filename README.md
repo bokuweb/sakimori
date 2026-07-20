@@ -235,13 +235,13 @@ Pick whichever fits your setup.
 
 ```bash
 brew install bokuweb/sakimori/sakimori
-# ↑ the repo-is-its-own-tap convention; no separate `brew tap` needed.
+# ↑ resolves to the tap repo github.com/bokuweb/homebrew-sakimori.
 ```
 
-Auto-updated on every release via the `homebrew-formula.yml`
-workflow — the formula lives at
-[`HomebrewFormula/sakimori.rb`](HomebrewFormula/sakimori.rb)
-in this repo.
+The formula lives in the tap repo
+[`bokuweb/homebrew-sakimori`](https://github.com/bokuweb/homebrew-sakimori)
+(`Formula/sakimori.rb`) and is auto-updated on every release by the
+`homebrew-formula.yml` workflow in this repo.
 
 ### Pre-built binary (macOS / Linux / Windows)
 
