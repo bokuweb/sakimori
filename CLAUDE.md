@@ -1461,6 +1461,115 @@ and lights up the most existing detection for free.
       `npm pack`-style bundled-deps tree means there is no #25
       analogue to chain.
 
+### SBOM surface (observed-not-declared — the moat)
+
+Plain SBOM generation (lockfile → CycloneDX/SPDX) is **deliberately
+not** a goal: Syft / Trivy / `npm sbom` / `cargo-cyclonedx` / GitHub's
+dependency graph already commoditise it, and they are all
+*lockfile-scoped* — i.e. the exact gap sakimori is positioned
+against. Re-implementing that adds no differentiation. The SBOM
+entries below instead all hang off sakimori's unique vantage point:
+it observes what was **actually fetched and executed** at the fetch
+layer, including the ephemeral runs (`npx` / `pnpm dlx` / `uvx` /
+`pipx run` / `cargo install` / `go run <remote>`), git-direct
+fetches, `.vsix` bundled deps, and editor-extension installs that
+never land in any lockfile. Listed in implementation order; #29 is
+the cheapest and the prerequisite for the rest.
+
+29. **Observed (runtime) SBOM export** *(priority: medium)* —
+    `sakimori sbom export` reads the install inventory
+    (`~/.sakimori/installs.jsonl`, and/or a hub `GET /installs`
+    pull) and emits a **CycloneDX 1.6 JSON** (default) / **SPDX 2.3**
+    document. Unlike every commodity SBOM tool the component set is
+    "what this machine/CI actually pulled", so it carries components
+    no lockfile-derived SBOM can: ephemeral one-shot runs
+    (`execution_mode: ephemeral` → CycloneDX `property
+    sakimori:execution_mode`), git-source components with the
+    `GitProvenance { url, resolved_commit, commit_source }` block
+    mapped to CycloneDX `externalReferences` + `pedigree.commits`,
+    `vscode-extension` components (publisher.name + version), and
+    `.vsix` bundled `node_modules` (roadmap #25) as nested
+    `components[].components`. `resolved_at` → `properties`. Scope
+    knobs: `--since`, `--ecosystem`, `--execution-mode`,
+    `--project-path`. Honest framing in the help text: this is an
+    *observed* SBOM ("what ran"), **not** a declared dependency
+    manifest — don't hand it to a procurement process expecting the
+    lockfile tree. Foundation the next three entries read from.
+
+30. **Declared-vs-observed SBOM diff** *(priority: high — strongest
+    differentiator)* — `sakimori sbom diff <declared.sbom.json>`
+    (or `--from-lockfile <path>` to derive the declared set via the
+    existing `deps::lockfile` parsers) computes the set difference
+    against the observed SBOM from #29 and reports three buckets:
+    - **observed-but-not-declared** — components fetched/executed
+      that no manifest references. This is the high-signal bucket:
+      `npx`/`uvx` one-shots, a postinstall that `curl`ed a second
+      package, a git-direct dep, a transitive pull that bypassed the
+      lockfile. **No other tool can compute this** because no other
+      tool observes the fetch layer — Dependabot/Snyk/Socket/Syft
+      all start from the manifest and so are blind to exactly the
+      components an attacker adds out-of-band.
+    - **declared-but-not-observed** — manifest entries that never
+      actually got fetched in the window (dead deps / optional deps
+      not exercised). Lower security signal, useful for hygiene.
+    - **version drift** — same `(eco, name)`, declared version ≠
+      observed version (cache poisoning, mirror substitution, the
+      TanStack-class content half from #13/#14).
+    Exits non-zero on any observed-but-not-declared High-severity
+    correlation (cross-referenced with the IOC catalog #18 +
+    cloud-secret-egress #17 + persistence-write #16 observations
+    for the same pid/attribution). Surfaces in the step summary +
+    HTML report as an "SBOM drift" section. This is the SBOM feature
+    that *is* a moat: it reframes "generate an SBOM" (commodity) as
+    "prove the manifest matches reality" (only the fetch-layer agent
+    can).
+
+31. **VEX generation from execution mode + behavioural context**
+    *(priority: high)* — `sakimori advisories scan` already JOINs
+    the install inventory against OSV. Extend it with
+    `--emit-vex <out.json>` to produce **CycloneDX VEX** (and/or
+    OpenVEX) statements that assert *exploitability* using context
+    only sakimori has:
+    - a vulnerable component seen **only** as `execution_mode:
+      ephemeral` that ran once on a date → VEX
+      `analysis.state: in_triage` with a `detail` noting "executed
+      <date>, not a persistent dependency — investigate compromise,
+      not 'bump the lockfile'" (mirrors the CLAUDE.md ephemeral
+      framing — the remediation is different, so the VEX must say
+      so).
+    - a vulnerable install-time hook (postinstall / `setup.py` /
+      build-backend) whose lifecycle gate (#15) observed **no**
+      script execution, or whose attribution shows the affected
+      code path never opened a socket / touched the deny paths →
+      `analysis.state: not_affected`,
+      `justification: vulnerable_code_not_in_execute_path`, backed
+      by the actual syscall observation rather than a human guess.
+    - persistent, in-lockfile, hook fired → `affected` +
+      `response: update`.
+    No static SCA tool can populate `not_affected` with
+    syscall-level evidence — they emit the raw advisory list and
+    leave triage to humans. sakimori turning its run-time
+    observations into machine-readable VEX is a genuinely novel
+    artefact and directly attacks SCA alert-fatigue.
+
+32. **Attested SBOM tied to the supervised run** *(priority:
+    medium)* — when `sakimori run` / `daemon` produced the SBOM
+    from observation (not post-hoc from a manifest), wrap it as an
+    **in-toto / SLSA provenance attestation** (`predicateType:
+    https://cyclonedx.org/bom` or the SLSA provenance predicate)
+    referencing the run's JSON-log digest, then optionally sign it
+    (sigstore/cosige keyless, or the ed25519 key the hub already
+    uses). The pitch other SBOM tooling can't make: "this SBOM was
+    generated by an agent that watched the build at the syscall
+    layer, and here's the signed evidence linking the component list
+    to the observed fetches" — provenance for the SBOM itself, not
+    just for the artefacts. Pairs with the workspace-snapshot (#9) +
+    IOC (#18) sections already in the run report so a single attested
+    bundle answers "what was fetched, what ran, what it touched, and
+    is the component list trustworthy". Out of scope for the first
+    slice: full SLSA build-L3 hermeticity claims (we observe, we
+    don't isolate the builder).
+
 Explicitly **out of scope** (different product philosophy, not
 a missing feature):
 
@@ -1469,6 +1578,12 @@ a missing feature):
 - Automatic runner hardening (sudo disabling, immutable rootfs).
   We don't take destructive actions on the runner without an
   explicit opt-in.
+- Plain lockfile→SBOM generation (CycloneDX/SPDX from a manifest).
+  Commoditised by Syft / Trivy / `npm sbom` / `cargo-cyclonedx` /
+  GitHub dependency graph, and lockfile-scoped — the exact gap
+  sakimori is positioned against. We only emit SBOM from *observed*
+  fetch-layer data (roadmap #29–#32), never re-implement the
+  static-manifest path.
 
 ## Crate layout
 
