@@ -286,8 +286,10 @@ cargo install --git https://github.com/bokuweb/sakimori sakimori
 ```
 
 The Linux eBPF supervised-run mode additionally needs
-`rustup toolchain install nightly --component rust-src` +
-`cargo install bpf-linker`. Not required for proxy / deps / install-gate.
+`rustup toolchain install nightly --component rust-src` + bpf-linker
+(`cargo binstall bpf-linker`, or a release tarball from
+https://github.com/aya-rs/bpf-linker/releases — building it from source
+needs a system LLVM since 0.11). Not required for proxy / deps / install-gate.
 
 ---
 
@@ -1584,7 +1586,7 @@ cargo fmt --all -- --check
 
 # Build the eBPF object (Linux only, requires nightly + bpf-linker)
 rustup toolchain install nightly --component rust-src
-cargo install bpf-linker
+cargo binstall bpf-linker   # or download a release tarball; see aya-rs/bpf-linker
 cd crates/sakimori-ebpf
 RUSTUP_TOOLCHAIN=nightly cargo build --release \
     --target bpfel-unknown-none -Z build-std=core

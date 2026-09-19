@@ -856,10 +856,10 @@ fn decode_cargo_checksum(s: &str) -> Result<Vec<u8>, String> {
         ));
     }
     let mut out = Vec::with_capacity(32);
-    let mut iter = s.as_bytes().chunks_exact(2);
-    for pair in iter.by_ref() {
-        let hi = hex_digit(pair[0]).ok_or_else(|| format!("non-hex char in `{s}`"))?;
-        let lo = hex_digit(pair[1]).ok_or_else(|| format!("non-hex char in `{s}`"))?;
+    let (pairs, _) = s.as_bytes().as_chunks::<2>();
+    for [hi, lo] in pairs {
+        let hi = hex_digit(*hi).ok_or_else(|| format!("non-hex char in `{s}`"))?;
+        let lo = hex_digit(*lo).ok_or_else(|| format!("non-hex char in `{s}`"))?;
         out.push((hi << 4) | lo);
     }
     Ok(out)
