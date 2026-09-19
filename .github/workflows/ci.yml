@@ -503,11 +503,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
           components: rust-src
-      - name: Install bpf-linker
+      # bpf-linker >= 0.11 dropped the `rust-llvm-*` features that let
+      # `cargo install` link against rustc's bundled LLVM; building from
+      # source now needs a system LLVM 21-23. Use the static musl release
+      # binary instead, pinned + checksum-verified like osv-scanner.
+      - name: Install bpf-linker (pinned release binary, verified SHA-256)
+        env:
+          BPF_LINKER_VERSION: v0.11.1
+          BPF_LINKER_SHA256: e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y llvm-19-dev libclang-19-dev
-          cargo install bpf-linker --locked
+          curl -fsSL -o /tmp/bpf-linker.tar.zst \
+            "https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          echo "${BPF_LINKER_SHA256}  /tmp/bpf-linker.tar.zst" | sha256sum --check --status
+          mkdir -p "$HOME/.local/bin"
+          tar --zstd -xf /tmp/bpf-linker.tar.zst -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/bpf-linker" --version
       - name: Build eBPF object
         working-directory: crates/sakimori-ebpf
         env:

@@ -15,8 +15,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
+            bpf_linker_sha256: e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
+            bpf_linker_sha256: 341ec1c595496877cae2b073544c2226d78a922739632b5732dbaa48507f1380
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -35,10 +37,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
           components: rust-src
-      - name: Install bpf-linker
+      # See ci.yml: bpf-linker >= 0.11 needs a system LLVM to build from
+      # source, so use the pinned static release binary for this runner's
+      # arch instead.
+      - name: Install bpf-linker (pinned release binary, verified SHA-256)
+        env:
+          BPF_LINKER_VERSION: v0.11.1
+          BPF_LINKER_SHA256: ${{ matrix.bpf_linker_sha256 }}
         run: |
-          sudo apt-get install -y llvm-19-dev libclang-19-dev
-          cargo install bpf-linker --locked
+          curl -fsSL -o /tmp/bpf-linker.tar.zst \
+            "https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-$(uname -m)-unknown-linux-musl.tar.zst"
+          echo "${BPF_LINKER_SHA256}  /tmp/bpf-linker.tar.zst" | sha256sum --check --status
+          mkdir -p "$HOME/.local/bin"
+          tar --zstd -xf /tmp/bpf-linker.tar.zst -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/bpf-linker" --version
       - name: Build eBPF object
         working-directory: crates/sakimori-ebpf
         env:
