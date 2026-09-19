@@ -27,6 +27,14 @@ inputs:
     description: "File name of the HTML report inside the artifact."
     required: false
     default: "sakimori-report.html"
+  pr-number:
+    description: "Pull request to comment on. Defaults to the PR of the current pull_request event. Required when running from a workflow_run trigger (e.g. to comment on PRs from forks)."
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  run-id:
+    description: "Workflow run that uploaded the report artifact. Defaults to the current run. Set this to github.event.workflow_run.id when running from a workflow_run trigger."
+    required: false
+    default: ${{ github.run_id }}
 
 runs:
   using: composite
@@ -40,13 +48,34 @@ runs:
         TITLE: ${{ inputs.title }}
         ARTIFACT_NAME: ${{ inputs.artifact-name }}
         HTML_FILENAME: ${{ inputs.html-filename }}
-        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        RUN_ID: ${{ inputs.run-id }}
       run: |
         set -euo pipefail
 
-        if [[ "${GITHUB_EVENT_NAME}" != "pull_request" && "${GITHUB_EVENT_NAME}" != "pull_request_target" ]]; then
-          echo "::notice::not a pull_request event (${GITHUB_EVENT_NAME}); skipping comment"
-          exit 0
+        # `workflow_run` is how callers comment on PRs from forks: the
+        # pull_request job has a read-only token, so it uploads the log
+        # as an artifact and a follow-up workflow_run job (which runs in
+        # the base repo with write access) downloads it and calls us.
+        case "${GITHUB_EVENT_NAME}" in
+          pull_request|pull_request_target|workflow_run) ;;
+          *)
+            echo "::notice::not a pull_request/workflow_run event (${GITHUB_EVENT_NAME}); skipping comment"
+            exit 0
+            ;;
+        esac
+
+        # Validate untrusted-ish numeric inputs up front. PR_NUMBER may
+        # come from a caller that derived it from an artifact / API call.
+        pr_number="${PR_NUMBER}"
+        if [[ ! "${pr_number}" =~ ^[0-9]+$ ]]; then
+          echo "::error::invalid pull request number '${pr_number}' — pass pr-number when not on a pull_request event"
+          exit 1
+        fi
+        run_id="${RUN_ID}"
+        if [[ ! "${run_id}" =~ ^[0-9]+$ ]]; then
+          echo "::error::invalid run-id '${run_id}'"
+          exit 1
         fi
 
         if [[ ! -f "${LOG}" ]]; then
@@ -62,11 +91,11 @@ runs:
           # Scope destination by run-id so re-runs / parallel PRs don't clobber
           # each other, and `rm -rf` first so `gh run download` (which refuses
           # to overwrite existing files) works on the second+ invocation.
-          dir="/tmp/sakimori-${GITHUB_RUN_ID}"
+          dir="/tmp/sakimori-${run_id}"
           html="${dir}/${HTML_FILENAME}"
           printf -v q_dir '%q' "${dir}"
           printf -v q_html '%q' "${html}"
-          printf -v q_run_id '%q' "${GITHUB_RUN_ID}"
+          printf -v q_run_id '%q' "${run_id}"
           printf -v q_repo '%q' "${GITHUB_REPOSITORY}"
           printf -v q_artifact '%q' "${ARTIFACT_NAME}"
           oneliner="rm -rf -- ${q_dir} && gh run download ${q_run_id} -R ${q_repo} -n ${q_artifact} -D ${q_dir} && (open ${q_html} 2>/dev/null || xdg-open ${q_html} 2>/dev/null || echo file://${q_html})"
@@ -139,11 +168,6 @@ runs:
 
         # Upsert by marker: if a previous comment on this PR contains the
         # marker, edit it; otherwise create a new one.
-        pr_number="${PR_NUMBER}"
-        if [[ ! "${pr_number}" =~ ^[0-9]+$ ]]; then
-          echo "::error::invalid pull request number"
-          exit 1
-        fi
         repo="${GITHUB_REPOSITORY}"
         existing=$(gh api -X GET "repos/${repo}/issues/${pr_number}/comments" --paginate \
           --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -n1)

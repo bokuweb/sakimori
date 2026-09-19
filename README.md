@@ -1384,6 +1384,73 @@ machine.
     # fail-on-denied: "true"                # optional
 ```
 
+#### Commenting on PRs from forks
+
+On `pull_request` events from a fork, `GITHUB_TOKEN` is read-only and
+the comment step fails with `Resource not accessible by integration`
+— `permissions: pull-requests: write` does not help. The usual fix is
+to split the work: the untrusted job only uploads the log as an
+artifact, and a separate `workflow_run` job (which runs in the base
+repo with a write token) downloads it and posts the comment.
+
+In the CI workflow, keep the upload and drop the comment step:
+
+```yaml
+- uses: actions/upload-artifact@v4
+  if: always()
+  with:
+    name: sakimori-report
+    path: |
+      sakimori-report.html
+      sakimori.log.json
+```
+
+Then add a second workflow:
+
+```yaml
+name: sakimori comment
+on:
+  workflow_run:
+    workflows: [CI]            # name of the workflow above
+    types: [completed]
+
+permissions:
+  actions: read                # download the artifact
+  pull-requests: write         # post the comment
+
+jobs:
+  comment:
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      # workflow_run.pull_requests is empty for fork PRs, so look the
+      # PR up by head SHA instead.
+      - id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          n=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/pulls" --jq '.[0].number')
+          echo "number=${n}" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: sakimori-report
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - uses: bokuweb/sakimori/comment@v0
+        with:
+          log: sakimori.log.json
+          artifact-name: sakimori-report
+          html-filename: sakimori-report.html
+          pr-number: ${{ steps.pr.outputs.number }}
+          run-id: ${{ github.event.workflow_run.id }}
+```
+
+`run-id` keeps the "open the full HTML report" one-liner pointing at
+the run that actually holds the artifact. The action only reads the
+JSON log and never executes anything from the artifact, so the
+untrusted upload can't gain the write token.
+
 ### Runner support matrix
 
 | runner | proxy | supervised run | notes |
