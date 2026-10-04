@@ -56,9 +56,12 @@ jobs:
       # non-immutable Action". Update via the same workflow that
       # bumps `security.yml`.
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: jdx/mr-boxington-action@d0825fbaf3cc36ca2609aa38e71046265a1f1e37 # v1
+        with:
+          cache-key-suffix: ${{ github.job }}
 
       - name: Build sakimori (release)
-        run: cargo build --release -p sakimori
+        run: mbx build --release -p sakimori
 
       - name: Show runner identity
         run: |

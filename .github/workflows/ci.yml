@@ -45,10 +45,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy, rustfmt
+      - uses: jdx/mr-boxington-action@d0825fbaf3cc36ca2609aa38e71046265a1f1e37 # v1
+        with:
+          cache-key-suffix: ${{ github.job }}
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo build --workspace --release
-      - run: cargo test --workspace
+      - run: mbx clippy --workspace --all-targets -- -D warnings
+      - run: mbx build --workspace --release
+      - run: mbx test --workspace
 
       - name: deps check (should pass — our Cargo.lock is old enough)
         run: |
@@ -163,7 +166,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - run: cargo build --release -p sakimori
+      - uses: jdx/mr-boxington-action@d0825fbaf3cc36ca2609aa38e71046265a1f1e37 # v1
+        with:
+          cache-key-suffix: ${{ github.job }}
+      - run: mbx build --release -p sakimori
       - name: Generate CA + start proxy in background
         run: |
           set -euo pipefail
@@ -1049,8 +1055,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: jdx/mr-boxington-action@d0825fbaf3cc36ca2609aa38e71046265a1f1e37 # v1
+        with:
+          cache-key-suffix: ${{ github.job }}
       - name: Build sakimori
-        run: cargo build --release -p sakimori
+        run: mbx build --release -p sakimori
       - name: Resolve sakimori binary path
         run: |
           set -euxo pipefail
@@ -1067,8 +1076,8 @@ jobs:
         # crates exercised on macOS / Windows too, especially the
         # filesystem append path in `installs`.
         run: |
-          cargo test -p sakimori-core installs::
-          cargo test -p sakimori-core advisories::
+          mbx test -p sakimori-core installs::
+          mbx test -p sakimori-core advisories::
 
       - name: Hand-craft an installs.jsonl with one known-malicious entry
         run: |
