@@ -347,11 +347,13 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: jdx/mr-boxington-action@d0825fbaf3cc36ca2609aa38e71046265a1f1e37 # v1
+        with:
+          cache-key-suffix: ${{ github.job }}
       - name: Build sakimori (release, default features)
         # Build only the `sakimori` bin — skip the eBPF + Windows
         # crates to keep the dogfood job under 5 min once cached.
-        run: cargo build -p sakimori --release --bin sakimori
+        run: mbx build -p sakimori --release --bin sakimori
       - name: Audit our own workflows (non-strict, JSON for log)
         # JSON output makes per-workflow findings greppable in the
         # action log. Plain-text output goes to the step summary
