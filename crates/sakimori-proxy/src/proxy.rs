@@ -120,6 +120,8 @@ pub struct ProxyConfig {
     /// [`crate::hub_ingest::SakimoriToken`]. `None` disables the
     /// exporter.
     pub hub_ingest_token: Option<crate::hub_ingest::SakimoriToken>,
+    /// Optional Access service credentials in addition to the Hub bearer.
+    pub hub_access: Option<crate::hub_ingest::HubAccessCredentials>,
     /// Lifecycle-script policy for npm tarballs. `None` disables the
     /// gate (current default). `Some(Audit)` logs script bodies for
     /// every fetched tarball that ships an `install` / `preinstall` /
@@ -197,6 +199,7 @@ impl ProxyConfig {
             otlp_headers: Vec::new(),
             hub_ingest_endpoint: None,
             hub_ingest_token: None,
+            hub_access: None,
             lifecycle_policy: None,
             lifecycle_allow: Vec::new(),
             lifecycle_strip_on_failure: crate::lifecycle::StripFailurePolicy::Block,
@@ -381,11 +384,15 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
                     // control-char-free, so logging it verbatim
                     // is safe.
                     log::info!("hub ingest → {endpoint}");
-                    Some(Arc::new(crate::hub_ingest::HubIngestExporter::new(
+                    let mut exporter = crate::hub_ingest::HubIngestExporter::new(
                         endpoint.clone(),
                         token.clone(),
                         cfg.user_agent.clone(),
-                    )))
+                    );
+                    if let Some(access) = cfg.hub_access.clone() {
+                        exporter = exporter.with_access(access)?;
+                    }
+                    Some(Arc::new(exporter))
                 }
                 Err(why) => {
                     // Diagnostic is a constant `&'static str`;
@@ -1422,7 +1429,10 @@ impl HttpHandler for SakimoriHandler {
             && let Some((publisher, ext_name, version)) = parse_vsix_download_path(&path)
         {
             let ext_id = format!("{publisher}.{ext_name}");
-            if self.install_logger.is_some() || self.otlp_exporter.is_some() {
+            if self.install_logger.is_some()
+                || self.otlp_exporter.is_some()
+                || self.hub_ingest_exporter.is_some()
+            {
                 let mode = classify_execution_mode(&user_agent);
                 let mut ev = InstallEvent::new(
                     sakimori_core::deps::Ecosystem::VscodeExtension,
@@ -1439,6 +1449,9 @@ impl HttpHandler for SakimoriHandler {
                     log::warn!("install log write failed (vsix): {e:#}");
                 }
                 if let Some(exporter) = self.otlp_exporter.as_ref() {
+                    exporter.dispatch(&ev);
+                }
+                if let Some(exporter) = self.hub_ingest_exporter.as_ref() {
                     exporter.dispatch(&ev);
                 }
             }

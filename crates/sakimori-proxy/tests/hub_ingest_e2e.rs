@@ -20,11 +20,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Utc};
 use sakimori_core::deps::Ecosystem;
 use sakimori_core::installs::{ExecutionMode, InstallEvent};
-use sakimori_proxy::hub_ingest::{HubIngestExporter, SakimoriToken};
+use sakimori_proxy::hub_ingest::{HubAccessCredentials, HubIngestExporter, SakimoriToken};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// Minimal HTTP/1.1 capturing server. Returns 200 on every
+/// Minimal HTTP/1.1 capturing server. Returns a valid 202 receipt on every
 /// request and stores the raw bytes (request line + headers +
 /// body) in a shared Vec for assertions.
 async fn spawn_capturing_http_server() -> (std::net::SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
@@ -83,7 +83,7 @@ async fn spawn_capturing_http_server() -> (std::net::SocketAddr, Arc<Mutex<Vec<V
                     g.push(buf.clone());
                 }
                 let _ = sock
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: 28\r\nConnection: close\r\n\r\n{\"accepted\":1,\"rejected\":[]}")
                     .await;
                 let _ = sock.shutdown().await;
             });
@@ -101,7 +101,14 @@ fn redact_auth(headers: &str) -> String {
         .lines()
         .map(|line| {
             let trimmed = line.trim_start();
-            if trimmed.to_ascii_lowercase().starts_with("authorization:") {
+            if [
+                "authorization:",
+                "cf-access-client-id:",
+                "cf-access-client-secret:",
+            ]
+            .iter()
+            .any(|name| trimmed.to_ascii_lowercase().starts_with(name))
+            {
                 "Authorization: <redacted>".to_string()
             } else {
                 line.to_string()
@@ -226,5 +233,46 @@ async fn dispatch_drops_unsupported_ecosystem_silently() {
         g.is_empty(),
         "git ecosystem must not produce a POST; got {} request(s)",
         g.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn access_credentials_are_separate_headers_and_ci_reaches_the_payload() {
+    let (addr, captured) = spawn_capturing_http_server().await;
+    let access =
+        HubAccessCredentials::new("access-test-id".into(), "access-test-secret".into()).unwrap();
+    assert!(!format!("{access:?}").contains("access-test-secret"));
+    let exporter = Arc::new(
+        HubIngestExporter::new(
+            format!("http://{addr}/v1/acme/_team/events"),
+            SakimoriToken::new("hub-test-token"),
+            "sakimori-test ci=github-actions".into(),
+        )
+        .with_access(access)
+        .unwrap(),
+    );
+    exporter.dispatch(&sample_event());
+    let record = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let record = captured.lock().unwrap().first().cloned();
+            if let Some(record) = record {
+                break record;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (headers, body) = split_request(&record);
+    let headers = headers.to_ascii_lowercase();
+    assert!(headers.contains("cf-access-client-id: access-test-id"));
+    assert!(headers.contains("cf-access-client-secret: access-test-secret"));
+    assert!(headers.contains("authorization: bearer hub-test-token"));
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        payload[0]["user_agent"]
+            .as_str()
+            .unwrap()
+            .ends_with(" ci=github-actions")
     );
 }
