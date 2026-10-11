@@ -6,6 +6,11 @@ name: consumer-smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: Release tag for the proxy Hub consumer test
+        default: v0
+        type: string
   pull_request:
   release:
     types: [published]
@@ -15,6 +20,23 @@ permissions:
   pull-requests: write
 
 jobs:
+  published-proxy-hub:
+    # Real gh download + checksum + Action startup. PR builds use the
+    # candidate gate in release.yml; they cannot make old releases gain flags.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.sha }}
+      - name: Verify published archive delivers Hub events through the Action
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.version || 'v0' }}
+        run: python3 scripts/smoke-proxy-hub.py --version "$RELEASE_TAG"
+
   use-as-action:
     runs-on: ubuntu-latest
     steps:

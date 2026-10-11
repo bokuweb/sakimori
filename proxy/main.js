@@ -16,12 +16,15 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const net = require("net");
+const crypto = require("crypto");
 
 // -------- helpers --------
 
 function input(name, dflt = "") {
-  const key = "INPUT_" + name.toUpperCase().replace(/-/g, "_");
-  const v = process.env[key];
+  // GitHub's runner preserves hyphens in INPUT_* keys. Keep the
+  // underscore spelling as a fallback for existing local harnesses.
+  const key = "INPUT_" + name.toUpperCase().replace(/ /g, "_");
+  const v = process.env[key] ?? process.env[key.replace(/-/g, "_")];
   return v == null ? dflt : v;
 }
 
@@ -105,7 +108,7 @@ function platformAsset() {
 }
 
 // Resolve the install version. Handles three flavours:
-//   empty / "main" / "latest"  → newest release overall
+//   empty / "main" / "latest"  → newest published stable release
 //   "v<MAJOR>" (e.g. "v0")     → newest "v<MAJOR>.*" release (moving
 //                                git tag has no matching Release
 //                                object; resolve via the API).
@@ -129,19 +132,26 @@ function resolveVersion(versionExpr, token) {
       [
         "api",
         "repos/bokuweb/sakimori/releases",
-        "--jq",
-        `[.[] | select(.tag_name | startswith("v${major}.")) | .tag_name] | first`,
       ],
       { encoding: "utf8", env: { ...process.env, GH_TOKEN: token } },
     );
     if (r.status !== 0) {
       fail(`gh api failed: ${(r.stderr || "").trim() || r.error?.message}`);
     }
-    const v = r.stdout.trim();
-    if (!v || v === "null") {
-      fail(`no v${major}.* release found on bokuweb/sakimori`);
+    let releases;
+    try {
+      releases = JSON.parse(r.stdout);
+    } catch {
+      fail("gh api returned invalid release metadata; retry the release lookup");
     }
-    return v;
+    if (!Array.isArray(releases)) fail("gh api returned invalid release metadata");
+    const stableTag = new RegExp(`^v${major}\\.[0-9]+\\.[0-9]+(?:\\+[0-9A-Za-z.-]+)?$`);
+    const release = releases.find(row => row && row.draft === false && row.prerelease === false &&
+      typeof row.tag_name === "string" && stableTag.test(row.tag_name));
+    if (!release) {
+      fail(`no published stable v${major}.* release found on bokuweb/sakimori`);
+    }
+    return release.tag_name;
   }
   return versionExpr;
 }
@@ -169,6 +179,15 @@ function downloadAndExtract(version, triple, tmpDir, token) {
   );
   if (dl.status !== 0) {
     fail(`gh release download failed for ${asset} of ${version}`);
+  }
+
+  // Check the downloaded sidecar before executing tar or the binary.
+  // This detects corrupted/mismatched assets, not a compromised publisher.
+  const fields = fs.readFileSync(path.join(tmpDir, `${asset}.sha256`), "utf8").trim().split(/\s+/);
+  const actual = crypto.createHash("sha256").update(fs.readFileSync(path.join(tmpDir, asset))).digest("hex");
+  if (fields.length !== 2 || !/^[a-fA-F0-9]{64}$/.test(fields[0]) ||
+      fields[1].replace(/^\*/, "") !== asset || fields[0].toLowerCase() !== actual) {
+    fail(`release archive checksum verification failed for ${asset}; retry the download or select a valid release`);
   }
 
   // tar.exe is available out of the box on Windows 10 / 2019+, on
@@ -207,7 +226,8 @@ async function waitForListen(host, port, deadlineMs) {
 
 (async () => {
   const { triple, binName } = platformAsset();
-  const token = input("token") || process.env.GITHUB_TOKEN || "";
+  const token = input("token") || process.env.GH_TOKEN || process.env.GITHUB_TOKEN || "";
+  addMask(token);
   const listen = input("listen", "127.0.0.1:8910");
   const minAge = input("min-age", "7d");
   const failOnMissing = input("fail-on-missing") === "true";
@@ -217,10 +237,20 @@ async function waitForListen(host, port, deadlineMs) {
   // in sakimori-proxy). Mask the token IMMEDIATELY — before any
   // later code can echo it via `set -x`-style traces or a
   // spawn-error path that includes the env block.
-  const ingestUrl = input("ingest-url");
-  const ingestToken = input("ingest-token");
+  const ingestUrl = input("ingest-url") || process.env.SAKIMORI_INGEST_URL || "";
+  const ingestToken = input("ingest-token") || process.env.SAKIMORI_TOKEN || "";
+  const accessId = input("cf-access-client-id") || process.env.SAKIMORI_CF_ACCESS_CLIENT_ID || "";
+  const accessSecret = input("cf-access-client-secret") || process.env.SAKIMORI_CF_ACCESS_CLIENT_SECRET || "";
   if (ingestToken) {
     addMask(ingestToken);
+  }
+  addMask(accessId);
+  addMask(accessSecret);
+  if (Boolean(accessId) !== Boolean(accessSecret)) {
+    fail("set both `cf-access-client-id` and `cf-access-client-secret` for Cloudflare Access");
+  }
+  if (accessId && !(ingestUrl && ingestToken)) {
+    fail("Cloudflare Access delivery requires both `ingest-url` and `ingest-token`");
   }
   // Endpoint/token presence are dependent: either both or neither.
   // The proxy logs a warn at startup if only one is set; surface
@@ -279,6 +309,22 @@ async function waitForListen(host, port, deadlineMs) {
     fs.chmodSync(binPath, 0o755);
   }
 
+  // Old releases silently ignore unknown environment variables. Refuse
+  // opted-in delivery when the downloaded binary has no matching flags.
+  if (ingestUrl && ingestToken) {
+    const probeEnv = { ...process.env };
+    for (const key of Object.keys(probeEnv)) {
+      if (key.startsWith("INPUT_") || key === "SAKIMORI_TOKEN" ||
+          key === "SAKIMORI_INGEST_URL" || key.startsWith("SAKIMORI_CF_ACCESS_")) delete probeEnv[key];
+    }
+    const probe = spawnSync(binPath, ["proxy", "start", "--help"], { encoding: "utf8", env: probeEnv });
+    const flags = ["--hub-ingest-url", "--hub-ingest-token"];
+    if (accessId) flags.push("--hub-access-client-id", "--hub-access-client-secret");
+    if (probe.status !== 0 || !flags.every(flag => (probe.stdout || "").includes(flag))) {
+      fail("selected sakimori release does not support the requested Hub delivery; select a release with Hub/Access support or supply a current SAKIMORI_BIN");
+    }
+  }
+
   const stdoutLog = path.join(tmpDir, "proxy.stdout.log");
   const stderrLog = path.join(tmpDir, "proxy.stderr.log");
   const stdoutFd = openPrivateFile(stdoutLog);
@@ -321,6 +367,10 @@ async function waitForListen(host, port, deadlineMs) {
   if (ingestUrl && ingestToken) {
     childEnv.SAKIMORI_INGEST_URL = ingestUrl;
     childEnv.SAKIMORI_TOKEN = ingestToken;
+  }
+  if (accessId && accessSecret) {
+    childEnv.SAKIMORI_CF_ACCESS_CLIENT_ID = accessId;
+    childEnv.SAKIMORI_CF_ACCESS_CLIENT_SECRET = accessSecret;
   }
   const child = spawn(binPath, proxyArgs, {
     detached: true,
