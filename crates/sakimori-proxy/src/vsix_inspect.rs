@@ -257,8 +257,11 @@ pub fn inspect_vsix(body: &[u8]) -> Result<VsixInspection, VsixInspectError> {
     let mut ioc_truncated = false;
 
     for i in 0..archive.len() {
-        let raw_name = match archive.by_index_raw(i) {
-            Ok(f) => f.name().to_string(),
+        let raw_name = match archive
+            .by_index_raw(i)
+            .and_then(|f| f.name().map(|n| n.into_owned()))
+        {
+            Ok(name) => name,
             Err(_) => continue,
         };
         if raw_name == "extension/package.json" {

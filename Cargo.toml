@@ -34,7 +34,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "syn
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-serde_yaml = "0.9"
+# API-compatible maintained fork; serde_yaml's unsafe-libyaml is
+# archived (RUSTSEC-2024-0449). Keep the alias for existing call sites.
+serde_yaml = { package = "serde_norway", version = "0.9.42" }
 bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"

@@ -27,7 +27,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 hudsucker = { version = "0.24", default-features = false, features = ["rustls-client", "rcgen-ca"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 time = "0.3"
-rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "aws_lc_rs"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "logging", "tls12", "aws_lc_rs"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
@@ -46,8 +46,9 @@ flate2 = "1"
 # `extension/package.json` root manifest. `zip` is the standard
 # Rust crate for the format. `default-features = false` drops the
 # bzip2 / lzma / zstd / aes features we don't need; the deflate
-# default is enabled via the `_deflate-flate2` feature.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# default is enabled via the `deflate` feature. 9.x includes the
+# extraction fixes for RUSTSEC-2026-0367/0368/0369.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 toml = { workspace = true }
 
 # Custom upstream TLS client for `extra_upstream_roots`. Versions
