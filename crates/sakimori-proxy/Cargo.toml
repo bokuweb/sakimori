@@ -58,7 +58,10 @@ toml = { workspace = true }
 # so we don't add a second `rustls` direct dep.
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "aws-lc-rs", "tls12", "webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
-webpki-roots = "0.26"
+# 1.0.10 removes the emSign ECC root after the October 2026 eMudhra
+# compromise. Keep Cargo.lock's rustls-webpki >= 0.103.16 too: its SPKI
+# distrust list also covers cross-signs and explicitly added roots.
+webpki-roots = "1.0.10"
 # NB: PEM parsing uses `rustls_pki_types::pem::PemObject` (reached
 # via `hudsucker::rustls::pki_types`). The `rustls-pemfile` crate
 # would be the obvious dep but it was archived in August 2025

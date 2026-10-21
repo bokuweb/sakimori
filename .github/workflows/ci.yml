@@ -1226,6 +1226,9 @@ jobs:
       - name: Build sakimori (main binary; cross-OS via cfg-gated eBPF deps)
         run: cargo build --release -p sakimori
 
+      - name: Reject compromised eMudhra certificate chains (offline)
+        run: cargo test -p sakimori-proxy --test emudhra_distrust --locked
+
       - name: Prepare SAKIMORI_BIN env
         run: |
           set -euxo pipefail

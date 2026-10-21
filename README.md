@@ -494,6 +494,15 @@ sakimori proxy start \
     --upstream-ca-file /etc/ssl/intermediate.pem
 ```
 
+Upstream TLS verification includes the October 2026
+[eMudhra compromise](https://emudhra.we-have-a-problem.com/) remediation:
+`rustls-webpki` 0.103.16 rejects the compromised intermediate keys,
+including cross-signs and chains using `--upstream-ca-file`, and
+`webpki-roots` 1.0.10 removes the emSign ECC root. Upgrade or rebuild
+sakimori and restart running proxies to pick up these bundled updates.
+Opaque CONNECT tunnels use the calling client's TLS verification;
+update that client's runtime and trust store too.
+
 **Non-goals** (intentionally not done):
 - **Path-shape rewriting.** The custom host must serve the canonical
   registry's URL shape (npm packument + `/<pkg>/-/<pkg>-<ver>.tgz`;
