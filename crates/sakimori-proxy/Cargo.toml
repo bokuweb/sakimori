@@ -47,7 +47,7 @@ flate2 = "1"
 # Rust crate for the format. `default-features = false` drops the
 # bzip2 / lzma / zstd / aes features we don't need; the deflate
 # default is enabled via the `_deflate-flate2` feature.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 toml = { workspace = true }
 
 # Custom upstream TLS client for `extra_upstream_roots`. Versions
