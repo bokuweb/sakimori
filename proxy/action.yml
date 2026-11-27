@@ -73,6 +73,20 @@ inputs:
       into the workflow YAML stays in git history regardless.
     required: false
     default: ""
+  cf-access-client-id:
+    description: |
+      Cloudflare Access service-token client ID for a protected Hub.
+      Pair with cf-access-client-secret and the Hub ingest inputs.
+      Pass from GitHub Actions secrets. Kept in the proxy environment.
+    required: false
+    default: ""
+  cf-access-client-secret:
+    description: |
+      Cloudflare Access service-token client secret. Both Access inputs
+      must be set together; this is separate from the Hub bearer token.
+      Pass from GitHub Actions secrets. Never passed as a CLI argument.
+    required: false
+    default: ""
 
 outputs:
   ca-cert:

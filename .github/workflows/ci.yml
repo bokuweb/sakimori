@@ -190,6 +190,8 @@ jobs:
           done
           ss -ltn | grep -q ':18910' || { echo "::error::proxy never opened the port"; cat "$RUNNER_TEMP/proxy.log"; exit 1; }
           echo "CA=$XDG_CONFIG_HOME/sakimori/ca.pem" >>"$GITHUB_ENV"
+      - name: Cargo — cold artifact record and warm-index pinned deny
+        run: python3 scripts/smoke-cargo-download.py ./target/release/sakimori
       - name: crates.io sparse index — rewrite drops recent versions
         run: |
           set -euo pipefail
@@ -1166,6 +1168,9 @@ jobs:
           "$SAKIMORI_BIN" proxy start --help > "$RUNNER_TEMP/proxy-help.txt"
           grep -q -- "--no-install-log" "$RUNNER_TEMP/proxy-help.txt"
           grep -q -- "--install-log" "$RUNNER_TEMP/proxy-help.txt"
+          grep -q -- "--hub-ingest-url" "$RUNNER_TEMP/proxy-help.txt"
+          grep -q -- "--hub-access-client-id" "$RUNNER_TEMP/proxy-help.txt"
+          grep -q -- "--hub-access-client-secret" "$RUNNER_TEMP/proxy-help.txt"
           echo "ok: install-log flags exposed on $RUNNER_OS"
 
       - name: Upload scan outputs
@@ -1194,7 +1199,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - run: node --test job/test/pre.test.mjs proxy/test/main.test.mjs
+      - run: node --test job/test/pre.test.mjs proxy/test/*.test.mjs
+      - run: python3 scripts/test-release-licenses.py
 
   proxy-action-smoke:
     # Verifies that `bokuweb/sakimori/proxy@v0` (the JS-action wrapper

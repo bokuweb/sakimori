@@ -2,7 +2,7 @@
 //!
 //! By default the proxy MITMs the canonical public hosts
 //! (`registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`,
-//! `api.nuget.org`, `crates.io`, `index.crates.io`). Teams that route
+//! `api.nuget.org`, `crates.io`, `static.crates.io`, `index.crates.io`). Teams that route
 //! installs through an internal mirror (Verdaccio, GitHub Packages,
 //! Artifactory, Takumi Guard, etc.) need to teach the proxy about
 //! those hosts so the same rewriters / lifecycle gate fire. This
@@ -33,7 +33,8 @@ pub struct RegistryHosts {
     /// `files.pythonhosted.org`.
     pub pypi_files: Vec<String>,
     /// crates.io API host(s) — the `api/v1/crates/<n>/<v>/download`
-    /// endpoint. Default: `crates.io`.
+    /// endpoint and static artifact paths. Defaults: `crates.io`,
+    /// `static.crates.io`.
     pub crates: Vec<String>,
     /// crates.io sparse-index host(s). Default: `index.crates.io`.
     pub crates_sparse: Vec<String>,
@@ -53,7 +54,7 @@ impl Default for RegistryHosts {
             npm: vec!["registry.npmjs.org".into()],
             pypi_index: vec!["pypi.org".into()],
             pypi_files: vec!["files.pythonhosted.org".into()],
-            crates: vec!["crates.io".into()],
+            crates: vec!["crates.io".into(), "static.crates.io".into()],
             crates_sparse: vec!["index.crates.io".into()],
             nuget: vec!["api.nuget.org".into()],
             vscode_marketplace: vec!["marketplace.visualstudio.com".into(), "open-vsx.org".into()],

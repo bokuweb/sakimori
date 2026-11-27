@@ -39,17 +39,16 @@ pub trait RegistryParser: Send + Sync {
     fn parse(&self, path: &str) -> ParseResult;
 }
 
-/// Parser for `crates.io` + its sparse index host.
+/// Parser for crates.io API and static download hosts.
 ///
 /// URL shapes we handle:
 /// - `GET /api/v1/crates/<name>/<version>/download` — the tarball fetch.
 ///   This is the one we actually need to 403.
-/// - `GET <shard>/<name>` (sparse index at index.crates.io) — returns
-///   a newline-delimited JSON stream of ALL versions. The client uses
-///   this for resolution. We currently treat it as Metadata and let it
-///   through; we'll rewrite this to omit too-young versions in a
-///   follow-up (that's the pnpm-style auto-fallback story).
+/// - `GET /crates/<name>/<version>/download` — Cargo's current `dl` URL.
+/// - `GET /crates/<name>/<name>-<version>.crate` — static artifact URL.
 /// - anything else → Unknown, pass through.
+///
+/// Sparse-index metadata has its own parser and response rewriter.
 pub struct CratesIoParser {
     hosts: Vec<String>,
 }
@@ -62,7 +61,7 @@ impl CratesIoParser {
 
 impl Default for CratesIoParser {
     fn default() -> Self {
-        Self::new(vec!["crates.io".into()])
+        Self::new(RegistryHosts::default().crates)
     }
 }
 
@@ -73,6 +72,37 @@ impl RegistryParser for CratesIoParser {
     fn parse(&self, path: &str) -> ParseResult {
         // Strip query string.
         let path = path.split('?').next().unwrap_or(path);
+        if let Some(tail) = path.strip_prefix("/crates/") {
+            let parts: Vec<&str> = tail.split('/').collect();
+            let (name, version) = match parts.as_slice() {
+                [name, version, "download"] => (*name, *version),
+                [name, filename] => {
+                    let Some(version) = filename
+                        .strip_prefix(name)
+                        .and_then(|s| s.strip_prefix('-'))
+                        .and_then(|s| s.strip_suffix(".crate"))
+                    else {
+                        return ParseResult::Unknown;
+                    };
+                    (*name, version)
+                }
+                _ => return ParseResult::Unknown,
+            };
+            if name.is_empty()
+                || name.len() > 64
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                || semver::Version::parse(version).is_err()
+            {
+                return ParseResult::Unknown;
+            }
+            return ParseResult::Pinned {
+                ecosystem: Ecosystem::Crates,
+                name: name.into(),
+                version: version.into(),
+            };
+        }
         let mut segs = path.trim_start_matches('/').split('/');
         match (segs.next(), segs.next(), segs.next()) {
             (Some("api"), Some("v1"), Some("crates")) => {
@@ -422,6 +452,46 @@ pub fn parse_for_host(parsers: &[Box<dyn RegistryParser>], host: &str, path: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cargo_static_downloads_reach_the_pinned_gate() {
+        let parsers = default_parsers();
+        for path in [
+            "/crates/itoa/1.0.15/download",
+            "/crates/itoa/itoa-1.0.15.crate",
+            "/crates/my-crate/my-crate-1.2.3-beta.1+build.crate?download=1",
+        ] {
+            let (name, version) = if path.contains("my-crate") {
+                ("my-crate", "1.2.3-beta.1+build")
+            } else {
+                ("itoa", "1.0.15")
+            };
+            assert_eq!(
+                parse_for_host(&parsers, "static.crates.io", path),
+                ParseResult::Pinned {
+                    ecosystem: Ecosystem::Crates,
+                    name: name.into(),
+                    version: version.into(),
+                },
+                "{path}",
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_static_parser_does_not_guess_malformed_downloads() {
+        let parser = CratesIoParser::default();
+        for path in [
+            "/crates/itoa/other-1.0.15.crate",
+            "/crates/itoa/itoa-not-a-version.crate",
+            "/crates/itoa/1.0.15/download/extra",
+            "/crates//1.0.15/download",
+            "/crates/../1.0.15/download",
+            "/crates/itoa/itoa-1.0.15.crate/extra",
+        ] {
+            assert_eq!(parser.parse(path), ParseResult::Unknown, "{path}");
+        }
+    }
 
     #[test]
     fn crates_download_url_is_pinned() {

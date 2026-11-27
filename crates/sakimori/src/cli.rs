@@ -868,6 +868,24 @@ pub struct ProxyStartArgs {
         hide_env_values = true
     )]
     pub hub_ingest_token: Option<String>,
+    /// Cloudflare Access service-token ID. Pair with the client secret
+    /// and a Hub bearer token. Prefer the environment to shell arguments.
+    #[arg(
+        long = "hub-access-client-id",
+        env = "SAKIMORI_CF_ACCESS_CLIENT_ID",
+        hide_env_values = true,
+        requires = "hub_access_client_secret"
+    )]
+    pub hub_access_client_id: Option<String>,
+    /// Cloudflare Access service-token secret. Never forwarded to a
+    /// redirect target. Prefer SAKIMORI_CF_ACCESS_CLIENT_SECRET.
+    #[arg(
+        long = "hub-access-client-secret",
+        env = "SAKIMORI_CF_ACCESS_CLIENT_SECRET",
+        hide_env_values = true,
+        requires = "hub_access_client_id"
+    )]
+    pub hub_access_client_secret: Option<String>,
     /// Lifecycle-script gate for npm tarballs (Shai-Hulud-class
     /// defence). `audit` logs every fetched tarball that ships
     /// `install` / `preinstall` / `postinstall` / `prepare` scripts
@@ -1351,6 +1369,18 @@ pub async fn run(cli: Cli) -> Result<()> {
             // 4xx's the run command.
             let (hub_ingest_url, hub_ingest_token) =
                 resolve_hub_creds(args.hub_ingest_url.clone(), args.hub_ingest_token.clone());
+            let hub_access = match (args.hub_access_client_id, args.hub_access_client_secret) {
+                (Some(id), Some(secret)) => Some(
+                    sakimori_proxy::hub_ingest::HubAccessCredentials::new(id, secret)?,
+                ),
+                (None, None) => None,
+                _ => anyhow::bail!("set both Cloudflare Access service-token credentials"),
+            };
+            let ci_marker = if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+                " ci=github-actions"
+            } else {
+                ""
+            };
             let cfg = sakimori_proxy::ProxyConfig {
                 listen: args.listen,
                 min_age,
@@ -1363,7 +1393,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 typosquat_mirror: args.typosquat_mirror,
                 typosquat_mirror_url: args.typosquat_mirror_url,
                 ca_files,
-                user_agent: format!("sakimori-proxy/{}", env!("CARGO_PKG_VERSION")),
+                user_agent: format!("sakimori-proxy/{}{ci_marker}", env!("CARGO_PKG_VERSION")),
                 oracle: None,
                 network_allow,
                 install_log_path: args.install_log,
@@ -1373,6 +1403,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 hub_ingest_endpoint: hub_ingest_url,
                 hub_ingest_token: hub_ingest_token
                     .map(sakimori_proxy::hub_ingest::SakimoriToken::new),
+                hub_access,
                 lifecycle_policy,
                 lifecycle_allow: args.lifecycle_allow,
                 lifecycle_strip_on_failure,
@@ -3006,6 +3037,30 @@ fn resolve_hub_creds(
 mod proxy_start_registries_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn hub_access_credentials_parse_as_a_pair() {
+        let result = Cli::try_parse_from([
+            "sakimori",
+            "proxy",
+            "start",
+            "--hub-access-client-id",
+            "test-id",
+            "--hub-access-client-secret",
+            "test-secret",
+        ]);
+        assert!(result.is_ok(), "Access credentials must be configurable");
+        assert!(
+            Cli::try_parse_from([
+                "sakimori",
+                "proxy",
+                "start",
+                "--hub-access-client-id",
+                "test-id",
+            ])
+            .is_err()
+        );
+    }
 
     fn parse_start(args: &[&str]) -> ProxyStartArgs {
         let mut argv = vec!["sakimori", "proxy", "start"];

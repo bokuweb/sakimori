@@ -66,9 +66,17 @@ jobs:
           mkdir -p "${staging}"
           cp target/${{ matrix.target }}/release/sakimori "${staging}/sakimori"
           cp crates/sakimori-ebpf/target/bpfel-unknown-none/release/sakimori "${staging}/sakimori.bpf.o"
-          cp README.md LICENSE-MIT LICENSE-APACHE "${staging}/" 2>/dev/null || true
+          cp README.md LICENSE-MIT LICENSE-APACHE "${staging}/"
           tar -czf "${name}.tar.gz" -C staging "${name}"
           sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+
+      - name: Verify complete release licenses (Linux)
+        run: python3 scripts/check-release-licenses.py sakimori-${{ matrix.target }}.tar.gz
+
+      - name: Verify packaged proxy Hub delivery before publishing (Linux)
+        env:
+          CANDIDATE_TARGET: ${{ matrix.target }}
+        run: python3 scripts/smoke-proxy-hub.py --archive "sakimori-${CANDIDATE_TARGET}.tar.gz"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -104,12 +112,22 @@ jobs:
             staging="staging/${name}"
             mkdir -p "${staging}"
             cp "target/${target}/release/sakimori" "${staging}/sakimori"
-            cp README.md "${staging}/" 2>/dev/null || true
+            cp README.md LICENSE-MIT LICENSE-APACHE "${staging}/"
             cp packaging/macos/dev.sakimori.watch.plist "${staging}/" 2>/dev/null || true
             cp packaging/macos/README.md "${staging}/macos-README.md" 2>/dev/null || true
             tar -czf "${name}.tar.gz" -C staging "${name}"
             shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
           done
+      - name: Verify complete release licenses (both macOS targets)
+        run: python3 scripts/check-release-licenses.py sakimori-*-apple-darwin.tar.gz
+
+      - name: Verify packaged proxy Hub delivery before publishing (native macOS)
+        run: |
+          case "$(uname -m)" in
+            arm64) target=aarch64-apple-darwin ;;
+            *) target=x86_64-apple-darwin ;;
+          esac
+          python3 scripts/smoke-proxy-hub.py --archive "sakimori-${target}.tar.gz"
       - uses: actions/upload-artifact@v4
         with:
           name: release-macos
@@ -142,11 +160,19 @@ jobs:
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
           Copy-Item "crates\sakimori-win\target\release\sakimori-win.exe" "$staging\sakimori-win.exe"
           Copy-Item "target\release\sakimori.exe" "$staging\sakimori.exe"
-          Copy-Item README.md "$staging\" -ErrorAction SilentlyContinue
+          Copy-Item README.md,LICENSE-MIT,LICENSE-APACHE "$staging\" -ErrorAction Stop
           tar -czf "$name.tar.gz" -C staging $name
           $hash = (Get-FileHash "$name.tar.gz" -Algorithm SHA256).Hash.ToLower()
           # Match `sha256sum` format so the same verify line works cross-arch.
           "$hash  $name.tar.gz" | Out-File -Encoding ascii "$name.tar.gz.sha256"
+
+      - name: Verify complete release licenses (Windows)
+        shell: pwsh
+        run: python scripts/check-release-licenses.py "sakimori-$env:TARGET.tar.gz"
+
+      - name: Verify packaged proxy Hub delivery before publishing (Windows)
+        shell: pwsh
+        run: python scripts/smoke-proxy-hub.py --archive "sakimori-$env:TARGET.tar.gz"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -166,22 +192,38 @@ jobs:
           merge-multiple: true
       - name: List artifacts
         run: ls -la dist
-      - name: Create GitHub Release
+      - name: Create draft GitHub Release for authenticated consumer verification
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           notes="Release ${TAG}. Assets: Linux (sakimori + sakimori.bpf.o) and Windows (sakimori-win.exe) per target."
+          release_flags=(--draft)
+          if [[ "${TAG%%+*}" == *-* ]]; then release_flags+=(--prerelease); fi
           gh release create "${TAG}" \
+            "${release_flags[@]}" \
             --title "${TAG}" \
             --notes "${notes}" \
             dist/*.tar.gz dist/*.sha256
 
+      # GITHUB_TOKEN does not trigger the separate release-event workflow.
+      # Download the authenticated draft before making it publicly consumable.
+      - name: Verify draft proxy Hub consumer before publishing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 scripts/smoke-proxy-hub.py --version "$RELEASE_TAG"
+
+      - name: Publish verified GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release edit "$RELEASE_TAG" --draft=false
+
   moving-tag:
     needs: publish
     runs-on: ubuntu-latest
-    if: "!contains(github.ref_name, '-')"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -192,6 +234,10 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          if [[ "${TAG%%+*}" == *-* ]]; then
+            echo "Prerelease: retain the existing moving major tag"
+            exit 0
+          fi
           major=$(echo "${TAG}" | sed -E 's/^v([0-9]+).*/v\1/')
           echo "Updating moving tag ${major} -> ${TAG}"
           git config user.name "github-actions[bot]"

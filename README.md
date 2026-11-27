@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/bokuweb/sakimori/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/bokuweb/sakimori/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/bokuweb/sakimori?sort=semver)](https://github.com/bokuweb/sakimori/releases/latest)
-[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 
 🚧Work In Progress🚧
 
@@ -72,7 +72,7 @@ your package manifests.
                                                   ▼
                                          rewrites metadata:
                                          - drop versions < --min-age
-                                         - drop unsigned versions (--require-provenance)
+                                         - drop versions without provenance metadata (--require-provenance)
                                          - retarget npm dist-tags.latest
                                          - returns 403 for pinned tarball fetches
                                            to too-young versions
@@ -389,12 +389,13 @@ sakimori proxy start [OPTIONS]
 |---|---|---|
 | **Networking** | `--listen <ADDR>` (default `127.0.0.1:8910`), `--config-dir <PATH>` | Where the proxy listens; where its CA / config files live. |
 | **Release-age gate** | `--min-age <DURATION>` (default `7d`), `--fail-on-missing` | Versions younger than `--min-age` are silently dropped from the metadata response the client sees. `--fail-on-missing` treats unknown publish dates as deny (default: fail-open). |
-| **Provenance gate** (npm only) | `--require-provenance` | Drop every npm version that doesn't carry a Sigstore provenance claim. Closes the "stolen publish token" hole `--min-age` alone can't cover — a thief can publish immediately, but without an OIDC-authenticated CI run can't attach valid provenance. |
+| **Provenance gate** (npm only) | `--require-provenance` | Drop npm versions without provenance metadata. This checks attestation metadata presence; it does not fetch or cryptographically verify the bundle. |
 | **Known-malicious gate** | `--osv`, `--osv-mirror`, `--osv-mirror-url <URL>` | Consult OSV.dev (live) and/or the sakimori-hosted pre-filtered mirror; hard-deny versions tagged MAL-* / known-malicious regardless of `--min-age`. |
 | **Typosquat detection** | `--typosquat {warn,block}`, `--typosquat-mirror`, `--typosquat-mirror-url <URL>` | Compare incoming package names against a top-N-per-ecosystem list (lodash, requests, tokio, Newtonsoft.Json, …) and warn or block close-distance candidates. |
 | **Lifecycle-script gate** (Shai-Hulud-class defence) | `--lifecycle-policy {audit,block,strip}`, `--lifecycle-allow <PKG>` (repeatable), `--lifecycle-strip-on-failure {block,passthrough}`, `--lifecycle-strip-cache-dir <DIR>`, `--lifecycle-no-strip-cache` | `audit` logs install-time scripts; `block` 403s tarballs that ship them; `strip` rewrites the tarball in place to drop the script keys + recompute the SRI hash + amend the packument so npm's integrity verifier agrees. Same policy also drives the `.vsix` gate: startup-autorun denials carry `x-sakimori-deny: lifecycle-vsix`, bundled-dep known-bad denials carry `lifecycle-vsix-bundled-known-bad`, and in-archive IOC denials carry `lifecycle-vsix-ioc`. See CLAUDE.md Roadmap #15 / #21 / #25 / #26 for the threat models. |
 | **Egress allow-list** | `--network-allow <HOST>` (repeatable), `--network-allow-file <PATH>` | Default-deny hostname filter. Patterns: `host.example.com` (exact) or `*.example.com` (any subdomain, excludes apex). Off by default. |
 | **Install log + advisories** | `--no-install-log`, `--install-log <PATH>` | The local-first append-only audit log feeding `sakimori advisories scan`. On by default at `~/.sakimori/installs.jsonl`. |
+| **Optional Hub delivery** | `--hub-ingest-url`, `--hub-ingest-token` | Sends acquisition observations to a self-hosted Hub. Only a complete 202 JSON receipt counts as accepted; redirects and login HTML fail with a warning. |
 | **OTLP fan-out** | `--otlp-endpoint <URL>`, `--otlp-header <K=V>` (repeatable) | Mirror every allowed install as an OTLP/HTTP `LogRecord` to Datadog / Honeycomb / Loki / a self-run otel-collector. The **wire envelope** is spec-compliant OTLP/HTTP JSON (any collector parses it); the **`package.*` attribute keys** are sakimori-specific, not OpenTelemetry semantic conventions — OTel has no "package install" semconv yet. See [OTLP semantic conventions](#otlp-semantic-conventions) below. |
 | **Custom registries** | `--npm-registry`, `--pypi-registry`, `--pypi-files-host`, `--cargo-registry-host`, `--cargo-sparse-host`, `--nuget-registry` (all repeatable), `--registries-config <FILE>`, `--upstream-ca-file <PATH>` (repeatable) | Teach the proxy about internal mirrors / replacement registries so the rewriters + lifecycle gate fire on their traffic too. `--upstream-ca-file` adds a PEM CA to the upstream rustls trust store for mirrors behind a private CA. See the [Custom registries](#custom--internal-registries) subsection below. |
 
@@ -1586,6 +1587,55 @@ export CARGO_HTTP_CAINFO=/etc/sakimori/ca.pem  # copy from the proxy container
 
 ---
 
+## Optional sakimori-hub integration
+
+The source build supports `SAKIMORI_INGEST_URL` and `SAKIMORI_TOKEN`,
+plus the equivalent `--hub-ingest-url` and `--hub-ingest-token` flags.
+The published v0.34.4 binary does not contain these flags; use a source
+build until a tested release candidate is published.
+
+For a Hub behind Cloudflare Access, configure a Service Auth policy and
+provide the service-token pair via `SAKIMORI_CF_ACCESS_CLIENT_ID` and
+`SAKIMORI_CF_ACCESS_CLIENT_SECRET`. These produce separate Access headers;
+the Hub token still supplies authorization inside the application.
+Access credentials require HTTPS (loopback HTTP is allowed for testing).
+The same environment variables can be supplied from GitHub Actions secrets.
+Do not put credentials in the endpoint URL. No authentication redirect is followed.
+
+The source Action also accepts `ingest-url`, `ingest-token`,
+`cf-access-client-id`, and `cf-access-client-secret` inputs. Pass credentials
+from Actions secrets. Access inputs must be paired; the Action masks them
+and passes them only in the proxy's environment. It checks binary support
+before starting, so an older release cannot silently ignore Hub delivery.
+These Action changes still need a release before they are available at `@v0`.
+
+Release builds test the packaged binary through the Action against a local
+receiver before uploading. The release job then downloads its authenticated
+draft archive and verifies checksum, acquisition delivery, CI marker, Access
+headers, and rejection of redirects/login HTML before publishing or moving
+the major tag. Floating major versions exclude drafts and prereleases.
+The separate consumer workflow can repeat this on a published release.
+To run the candidate
+check locally (downloads a harmless npm archive, without executing it):
+
+```bash
+python3 scripts/smoke-proxy-hub.py --archive sakimori-<target>.tar.gz
+```
+
+The check requires a matching `.sha256` sidecar, Node.js and Python 3.9+.
+It confirms HTTP delivery; real Cloudflare Access, Queue/D1/R2 persistence,
+and Linux/Windows runtime protection require separate integration checks.
+
+Cargo's standard `static.crates.io` download URLs are inspected alongside
+`crates.io` and the sparse index. `GITHUB_ACTIONS=true` preserves the CI
+marker even when a package manager supplies its own user-agent.
+
+Records describe an observed acquisition request. They are emitted before
+upstream completion and some response-time gates, so they do not prove a
+successful installation. Cached artifacts and traffic outside the proxy
+are not recorded. Hub export is best effort with no durable retry queue;
+a 202 confirms ingestion acceptance, not eventual D1/R2 persistence.
+
 ## Known limitations
 
 Honest assessment. Full details in [CLAUDE.md](CLAUDE.md).
@@ -1598,10 +1648,9 @@ Honest assessment. Full details in [CLAUDE.md](CLAUDE.md).
      here anymore. -->
 - **Sigstore bundle verification** (not just claim presence) is a
   roadmap item. `--require-provenance` currently checks that the
-  `dist.attestations.provenance.predicateType` field is non-empty,
-  which is already meaningful (npm refuses to attach it unless
-  the publish came from OIDC-authenticated CI) but the bundle
-  itself isn't cryptographically verified.
+  `dist.attestations.provenance.predicateType` field is non-empty.
+  The bundle itself is not fetched or cryptographically verified;
+  this is not a verified-signature guarantee.
 - **CDN IP rotation across long runs**: handled by
   `sakimori run --dns-refresh-interval <secs>`, which re-resolves
   `network.allow` / `network.deny` hostnames every N seconds and
@@ -1701,4 +1750,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). All commits must be signed off
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT OR Apache-2.0, at your option. See [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE).

@@ -307,3 +307,57 @@ async fn vsix_on_lifecycle_allow_list_bypasses_block() {
     assert!(deny.is_none());
     assert_eq!(body, vsix);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vsix_reaches_hub_when_local_logging_is_disabled() {
+    let vsix = build_vsix(
+        r#"{"name":"ok-ext","publisher":"trusted","version":"2.5.0","activationEvents":["onCommand:foo.bar"]}"#,
+    );
+    let upstream = spawn_mock_upstream(vsix, "application/octet-stream").await;
+    let hub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/events", hub.local_addr().unwrap());
+    let (send, receive) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut sock, _) = hub.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0];
+        while !request.ends_with(b"\r\n\r\n") {
+            sock.read_exact(&mut byte).await.unwrap();
+            request.push(byte[0]);
+        }
+        let headers = String::from_utf8(request).unwrap();
+        let len: usize = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().unwrap())
+            })
+            .unwrap();
+        let mut body = vec![0; len];
+        sock.read_exact(&mut body).await.unwrap();
+        sock.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: 28\r\nConnection: close\r\n\r\n{\"accepted\":1,\"rejected\":[]}").await.unwrap();
+        send.send(body).unwrap();
+    });
+    let proxy = spawn_proxy(move |cfg| {
+        cfg.lifecycle_policy = None;
+        cfg.hub_ingest_endpoint = Some(endpoint);
+        cfg.hub_ingest_token = Some(sakimori_proxy::hub_ingest::SakimoriToken::new("test"));
+    })
+    .await;
+    let url = format!(
+        "http://{upstream}/_apis/public/gallery/publishers/trusted/vsextensions/ok-ext/2.5.0/vspackage"
+    );
+    let (status, _, _) = tokio::task::spawn_blocking(move || http_get_through_proxy(proxy, &url))
+        .await
+        .unwrap();
+    assert_eq!(status, 200);
+    let body = tokio::time::timeout(Duration::from_secs(3), receive)
+        .await
+        .expect("VSIX never reached Hub")
+        .unwrap();
+    let events: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(events[0]["ecosystem"], "vscode");
+    assert_eq!(events[0]["name"], "trusted.ok-ext");
+    assert_eq!(events[0]["version"], "2.5.0");
+}
